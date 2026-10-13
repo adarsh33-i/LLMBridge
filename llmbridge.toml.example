@@ -1,0 +1,22 @@
+[models.nemotron-local]
+base_url = "http://127.0.0.1:11434/v1"
+model = "nemotron"
+
+[models.qwen-local]
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3:8b"
+
+[models.hosted-free]
+base_url = "https://your-openai-compatible-provider.example/v1"
+model = "provider/model-id"
+api_key_env = "HOSTED_MODEL_API_KEY"
+
+[models.claude-sonnet-4-5]
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/nemotron-3-ultra-550b-a55b"
+api_key_env = "NVIDIA_API_KEY"
+
+[models.claude-haiku-4-5]
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+api_key_env = "NVIDIA_API_KEY"
