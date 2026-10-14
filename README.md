@@ -140,3 +140,7 @@ formatting, or structured citations.
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

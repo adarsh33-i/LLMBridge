@@ -7,6 +7,7 @@ name = "llmbridge"
 version = "0.1.0"
 description = "A local Anthropic-to-OpenAI-compatible LLM gateway"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = ["pypdf>=5"]
 
