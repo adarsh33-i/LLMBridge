@@ -112,6 +112,7 @@ OpenAI-compatible Chat Completions calls. This is not full Anthropic API parity.
 | Tools | Tool definitions, tool choices, tool results, and upstream tool calls are translated to/from function-calling format. Provider/model behavior may differ. |
 | Streaming | Basic OpenAI-style SSE chunks are translated into Anthropic-style events. Unknown upstream finish reasons are rejected; this is not full Anthropic streaming parity. |
 | Token counting | `/v1/messages/count_tokens` returns an estimate using a route-configured tiktoken encoding or a character-based fallback. It may differ from the upstream model's exact count. |
+| Other request fields | Only fields with explicit translations are sent upstream. Unrecognized Anthropic fields are not forwarded. |
 | Unknown content blocks | Unsupported block types are rejected. Assistant `thinking`, `redacted_thinking`, and `signature` blocks are explicitly rejected because generic chat-completions routes cannot represent them. Citation details and tool-result errors are rendered as readable text. |
 
 Routes may set `supports_images = false` or `supports_tools = false` to reject
@@ -126,35 +127,12 @@ HTTP(S), resolve only to public IP addresses, and are revalidated and pinned
 to the validated address at each redirect. Avoid allowing untrusted clients
 to submit document references.
 
-### Partially supported or limited
-
-- **Documents:** DOCX paragraph and table row/cell boundaries, HTML headings
-  and table cells, XLSX row/cell separation, PPTX slide boundaries, and PDF
-  page labels are represented as text. Optional OCR can read up to 10
-  textless scanned PDF pages per document when PyMuPDF and Tesseract are
-  installed and `LLMBRIDGE_ENABLE_OCR=1` is set. Text extraction does not
-  preserve page layout, embedded images, spreadsheet formatting, document
-  references, footnotes, or complex Office formatting. Citation metadata is
-  rendered as inline text rather than preserved as structured citations.
-  Office archive extraction is capped at 25 MiB of expanded content.
-- **Reasoning and caching:** Enabled Anthropic thinking can map to a
-  route-configured OpenAI `reasoning_effort` (`low`, `medium`, or `high`); the
-  Anthropic token budget is not preserved. Assistant thinking/signature blocks
-  are rejected explicitly. Anthropic `cache_control` metadata is rejected
-  because generic upstream routes have no equivalent configured.
-- **Model-dependent behavior:** Image understanding, tool calling, and other
-  translated features depend on the selected upstream model's capabilities.
-
-### Not implemented
-
-- Full Anthropic API parity and general support for Anthropic-only file
-  behavior beyond the supported Files API ID retrieval.
-- OCR by default; it requires the optional PyMuPDF package and external
-  Tesseract executable.
-- Equivalent Anthropic prompt-caching behavior.
-- General support for Anthropic-specific content blocks, beta features, and
-  newer API fields with no explicit translation. Some unsupported fields are
-  omitted; unsupported content-block types are rejected.
+**Note:** Remaining compatibility work includes Anthropic prompt caching,
+provider-specific beta and newer API features, broader content-block support,
+and richer document fidelity. Full Anthropic API parity is not currently
+provided. OCR is optional and requires PyMuPDF and Tesseract; document
+conversion to text does not preserve full layout, embedded images, formatting,
+or structured citations.
 
 ## Tests
 
