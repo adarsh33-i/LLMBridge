@@ -225,33 +225,100 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             anthropic_to_openai({"model": "nemotron", "messages": []})
 
-    def test_rejects_cache_control_metadata(self):
-        for cache_control in (
-            {"cache_control": {"type": "ephemeral"}},
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Question",
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ],
-                    }
-                ]
-            },
-        ):
-            request = {
-                "model": "client-model",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "Question"}],
-                **cache_control,
-            }
-            with self.subTest(cache_control=cache_control):
-                with self.assertRaisesRegex(ProtocolError, "cache_control"):
-                    anthropic_to_openai(request)
+    def test_ignores_cache_control_metadata_with_warning(self):
+        request = {
+            "model": "client-model",
+            "max_tokens": 100,
+            "cache_control": {"type": "ephemeral"},
+            "system": [
+                {"type": "text", "text": "Rules", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Question",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Tool output",
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "cache_control": {"type": "ephemeral"},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cache_control": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+
+        with self.assertLogs("llmbridge.protocol", level="WARNING") as logs:
+            translated = anthropic_to_openai(request)
+
+        self.assertIn("prompt caching is disabled", logs.output[0])
+        self.assertNotIn("cache_control", translated)
+        self.assertNotIn("cache_control", translated["messages"][0]["content"][0])
+        tool_message = next(
+            message for message in translated["messages"] if message["role"] == "tool"
+        )
+        self.assertNotIn("cache_control", json.dumps(tool_message))
+        self.assertNotIn("cache_control", translated["tools"][0])
+        self.assertEqual(
+            translated["tools"][0]["function"]["parameters"]["properties"][
+                "cache_control"
+            ],
+            {"type": "string"},
+        )
+        self.assertIn(
+            "cache_control",
+            request["messages"][0]["content"][0],
+            "Converting a request must not mutate the caller's object",
+        )
+
+    def test_does_not_warn_when_cache_control_is_a_schema_property(self):
+        request = {
+            "model": "client-model",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Question"}],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cache_control": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+
+        with self.assertNoLogs("llmbridge.protocol", level="WARNING"):
+            translated = anthropic_to_openai(request)
+
+        self.assertIn(
+            "cache_control",
+            translated["tools"][0]["function"]["parameters"]["properties"],
+        )
 
     def test_accepts_cache_control_property_inside_tool_schema(self):
         request = anthropic_to_openai(

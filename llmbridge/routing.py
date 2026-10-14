@@ -1,9 +1,20 @@
 import os
-import tomllib
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+try:
+    import tomllib
+except ImportError:
+    # Python < 3.11 fallback
+    try:
+        import tomli as tomllib  # type: ignore[assignment]
+    except ImportError:  # pragma: no cover
+        raise ImportError(
+            "Cannot parse TOML config: install `tomli` or use Python 3.11+"
+        )
 
 
 class RoutingError(ValueError):
@@ -129,7 +140,13 @@ def load_model_routes(config_path: str | None = None) -> dict[str, ModelRoute]:
 def resolve_model_route(
     client_model: str, routes: dict[str, ModelRoute]
 ) -> tuple[ModelRoute, str]:
-    route = routes.get(client_model) or routes.get("*")
+    # Explicit alias takes priority; "*" is the catch-all fallback
+    if client_model in routes:
+        route = routes[client_model]
+    elif "*" in routes:
+        route = routes["*"]
+    else:
+        route = None
     if route is None:
         available = ", ".join(sorted(routes))
         raise RoutingError(

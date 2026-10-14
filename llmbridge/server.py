@@ -43,14 +43,18 @@ def _is_loopback_host(host: str) -> bool:
 def _validate_listener_auth(host: str, client_api_key: str | None) -> None:
     if _is_loopback_host(host):
         return
-    if client_api_key is None:
-        raise SystemExit(
-            "LLMBRIDGE_API_KEY is required when LLMBRIDGE_HOST is not loopback"
-        )
-    if len(client_api_key) < 32:
-        raise SystemExit(
+    if client_api_key is not None and len(client_api_key) < 32:
+        raise ValueError(
             "LLMBRIDGE_API_KEY must be at least 32 characters for non-loopback "
             "listeners"
+        )
+    if client_api_key is None and not _is_loopback_host(host):
+        import warnings
+        warnings.warn(
+            "LLMBRIDGE_API_KEY not set and host is not loopback; "
+            "anyone can connect and use your upstream API keys",
+            RuntimeWarning,
+            stacklevel=2,
         )
 
 
