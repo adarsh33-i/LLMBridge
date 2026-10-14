@@ -17,44 +17,66 @@ an MCP server.
 
 Requires Python 3.11 or newer.
 
+Install the project and its dependencies:
+
+```sh
+python -m pip install -e .
+```
+
 Copy `llmbridge.toml.example` to `llmbridge.toml`, edit the model aliases and
 endpoints, and set any required upstream API keys in environment variables:
 
 ```sh
 cp llmbridge.toml.example llmbridge.toml
-export HOSTED_MODEL_API_KEY="..."
+export NVIDIA_API_KEY="your-provider-key"
 python -m llmbridge
 ```
 
 Each `[models.<alias>]` entry has a `base_url` and may specify an upstream
-`model` and an `api_key_env` name. Add one entry for each model; aliases can
-target different models and providers. The alias is what Claude Code sends;
-`model` is the ID understood by the upstream. Routes may point to local Ollama,
-vLLM, or compatible hosted services. Hosted free-tier availability, quotas,
-model support, and API compatibility depend on the provider and can change;
-LLMBridge does not make a paid provider free.
+`model`, an `api_key_env` environment-variable name, and (for providers that
+support it) a `reasoning_effort` of `low`, `medium`, or `high`. You can declare
+`supports_images` or `supports_tools` as `true` or `false` to reject requests
+using a capability known to be unsupported by the endpoint. Set
+`tokenizer_encoding` to a supported tiktoken encoding (`cl100k_base`,
+`o200k_base`, `p50k_base`, or `r50k_base`) to use tokenizer-based input
+estimates for that alias. The alias is what Claude Code sends; `model` is the
+ID understood by the upstream. Routes can target local Ollama, vLLM, or
+compatible hosted services.
 
-Install the project and its PDF text-extraction dependency with
-`python -m pip install -e .`.
+Anthropic requests that enable thinking are accepted only on a route configured
+with `reasoning_effort`; the configured level is sent upstream. This does not
+preserve Anthropic's `budget_tokens` value.
+
+To resolve Anthropic Files API document IDs, set
+`LLMBRIDGE_ANTHROPIC_FILES_API_KEY` in the LLMBridge terminal. Anyone able to
+submit requests to a bridge using this key may be able to retrieve files
+accessible to it.
+
+Optional scanned-PDF OCR requires Tesseract on `PATH` and the PyMuPDF extra:
+
+```sh
+python -m pip install -e ".[ocr]"
+export LLMBRIDGE_ENABLE_OCR=1
+```
+
+OCR is limited to 10 scanned pages and 90 seconds per document. To use
+tokenizer-based counts, install the optional tokenizer package:
+
+```sh
+python -m pip install -e ".[token-count]"
+```
 
 Without `llmbridge.toml`, the legacy single-endpoint environment variables
 `LLMBRIDGE_UPSTREAM_BASE_URL`, `LLMBRIDGE_UPSTREAM_MODEL`, and
 `LLMBRIDGE_UPSTREAM_API_KEY` remain supported.
 
-The server binds to `127.0.0.1:8787` by default. To use a different port, set
-`LLMBRIDGE_PORT`. For local use, incoming API requests are unauthenticated
-unless `LLMBRIDGE_API_KEY` is set. When configured, clients must send the same
-secret as `Authorization: Bearer <key>` or in the `x-api-key` header. Health
-checks remain public.
-Binding to a non-loopback address requires an `LLMBRIDGE_API_KEY` of at least
-32 characters; the server refuses to start without one. Generate a key with:
-
-```sh
-export LLMBRIDGE_API_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-```
-
-Use TLS or a trusted TLS-terminating reverse proxy for network access; the
-built-in server does not provide TLS.
+The server binds to `127.0.0.1:8787` by default. For local use, incoming API
+requests are unauthenticated unless `LLMBRIDGE_API_KEY` is set. When configured,
+clients must send the same secret as a bearer token or in the `x-api-key`
+header. Health checks remain public. Binding to a non-loopback address requires
+an `LLMBRIDGE_API_KEY` of at least 32 characters. Use TLS or a trusted
+TLS-terminating reverse proxy for network access; the built-in server does not
+provide TLS.
 
 Point Claude Code at LLMBridge and select a configured alias:
 
@@ -65,10 +87,8 @@ claude --model nemotron-local
 ```
 
 If `LLMBRIDGE_API_KEY` is configured, set `ANTHROPIC_AUTH_TOKEN` to the same
-secret before launching Claude Code.
-
-Set `ANTHROPIC_MODEL` to the desired alias instead if that is how your Claude
-Code setup selects a model. `GET /v1/models` returns configured aliases.
+secret before launching Claude Code. `GET /v1/models` returns configured
+aliases.
 
 ## Endpoints
 
@@ -76,20 +96,65 @@ Code setup selects a model. `GET /v1/models` returns configured aliases.
 - `GET` or `HEAD /api/hello` — gateway connection check.
 - `GET /v1/models` — configured model aliases.
 - `POST /v1/messages` — Anthropic Messages API-compatible request.
-- `POST /v1/messages/count_tokens` — approximate input-token estimate for
-  compatibility; it is not the upstream model's exact tokenizer count.
+- `POST /v1/messages/count_tokens` — approximate input-token estimate; it is
+  not the upstream model's exact tokenizer count.
 
-Other Anthropic-specific features not described above are not implemented yet.
-Document blocks with plain-text or UTF-8 text sources are sent as text. Base64
-PDFs are converted to extracted page text; DOCX, XLSX, and PPTX are converted
-to their readable text. HTML markup and RTF formatting are stripped. Scanned
-PDFs need OCR; document layout, embedded images, spreadsheet formatting, and
-citations are not preserved. Office archive extraction is capped at 25 MiB of
-expanded content. Legacy binary Office formats, URL documents,
-Anthropic file IDs, and other unlisted binary formats cannot be passed through
-generic OpenAI-compatible chat routes. Convert unsupported files to text or a
-supported format before sending. Model behavior and tool calling still depend
-on the capabilities of the selected upstream model.
+## Compatibility and limitations
+
+LLMBridge translates a subset of Anthropic Messages API requests into
+OpenAI-compatible Chat Completions calls. This is not full Anthropic API parity.
+
+| Area | Current behavior |
+| --- | --- |
+| Messages | System text, user/assistant text, and supported content blocks are translated. |
+| Images | URL and base64 image blocks are translated to OpenAI image content; actual support depends on the upstream provider and model. |
+| Documents | Text, base64, public HTTP(S) URL sources, local file references, and Anthropic Files API IDs are converted to text. Remote downloads are limited to 10 MiB. File IDs require an Anthropic API key; local paths require configured allowlisted roots. |
+| Tools | Tool definitions, tool choices, tool results, and upstream tool calls are translated to/from function-calling format. Provider/model behavior may differ. |
+| Streaming | Basic OpenAI-style SSE chunks are translated into Anthropic-style events. Unknown upstream finish reasons are rejected; this is not full Anthropic streaming parity. |
+| Token counting | `/v1/messages/count_tokens` returns an estimate using a route-configured tiktoken encoding or a character-based fallback. It may differ from the upstream model's exact count. |
+| Unknown content blocks | Unsupported block types are rejected. Assistant `thinking`, `redacted_thinking`, and `signature` blocks are explicitly rejected because generic chat-completions routes cannot represent them. Citation details and tool-result errors are rendered as readable text. |
+
+Routes may set `supports_images = false` or `supports_tools = false` to reject
+requests using capabilities known to be unsupported. LLMBridge does not
+automatically discover route capabilities.
+
+Local file references are disabled unless one or more trusted directories are
+configured in `LLMBRIDGE_DOCUMENT_ROOTS`, separated by the platform path
+separator (`:` on macOS/Linux, `;` on Windows). Resolved paths must remain
+within those roots, including after symlink resolution. URL documents must use
+HTTP(S), resolve only to public IP addresses, and are revalidated and pinned
+to the validated address at each redirect. Avoid allowing untrusted clients
+to submit document references.
+
+### Partially supported or limited
+
+- **Documents:** DOCX paragraph and table row/cell boundaries, HTML headings
+  and table cells, XLSX row/cell separation, PPTX slide boundaries, and PDF
+  page labels are represented as text. Optional OCR can read up to 10
+  textless scanned PDF pages per document when PyMuPDF and Tesseract are
+  installed and `LLMBRIDGE_ENABLE_OCR=1` is set. Text extraction does not
+  preserve page layout, embedded images, spreadsheet formatting, document
+  references, footnotes, or complex Office formatting. Citation metadata is
+  rendered as inline text rather than preserved as structured citations.
+  Office archive extraction is capped at 25 MiB of expanded content.
+- **Reasoning and caching:** Enabled Anthropic thinking can map to a
+  route-configured OpenAI `reasoning_effort` (`low`, `medium`, or `high`); the
+  Anthropic token budget is not preserved. Assistant thinking/signature blocks
+  are rejected explicitly. Anthropic `cache_control` metadata is rejected
+  because generic upstream routes have no equivalent configured.
+- **Model-dependent behavior:** Image understanding, tool calling, and other
+  translated features depend on the selected upstream model's capabilities.
+
+### Not implemented
+
+- Full Anthropic API parity and general support for Anthropic-only file
+  behavior beyond the supported Files API ID retrieval.
+- OCR by default; it requires the optional PyMuPDF package and external
+  Tesseract executable.
+- Equivalent Anthropic prompt-caching behavior.
+- General support for Anthropic-specific content blocks, beta features, and
+  newer API fields with no explicit translation. Some unsupported fields are
+  omitted; unsupported content-block types are rejected.
 
 ## Tests
 

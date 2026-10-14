@@ -3,7 +3,7 @@ import json
 import os
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -188,6 +188,31 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(response.status, 200)
         self.assertGreater(result["input_tokens"], 0)
+
+    def test_count_tokens_uses_route_configured_tiktoken_encoding(self):
+        self.server.model_routes["nemotron"] = ModelRoute(
+            "http://upstream.test/v1",
+            model="nvidia/nemotron",
+            tokenizer_encoding="cl100k_base",
+        )
+        body = {
+            "model": "nemotron",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        request = Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/messages/count_tokens",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        tokenizer = MagicMock()
+        tokenizer.get_encoding.return_value.encode.return_value = [1, 2, 3, 4]
+        with patch.dict("sys.modules", {"tiktoken": tokenizer}):
+            with urlopen(request) as response:
+                result = json.loads(response.read())
+
+        self.assertEqual(result["input_tokens"], 4)
+        tokenizer.get_encoding.assert_called_once_with("cl100k_base")
 
     def test_messages_route_accepts_beta_query(self):
         upstream_response = _UpstreamResponse(

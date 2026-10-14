@@ -15,6 +15,10 @@ class ModelRoute:
     base_url: str
     model: str | None = None
     api_key_env: str | None = None
+    reasoning_effort: str | None = None
+    supports_images: bool | None = None
+    supports_tools: bool | None = None
+    tokenizer_encoding: str | None = None
 
     @property
     def completions_url(self) -> str:
@@ -51,7 +55,39 @@ def _parse_route(alias: str, value: Any) -> ModelRoute:
         not isinstance(api_key_env, str) or not api_key_env
     ):
         raise RoutingError(f"Route {alias!r} api_key_env must be a non-empty string")
-    return ModelRoute(base_url=base_url.rstrip("/"), model=model, api_key_env=api_key_env)
+    reasoning_effort = value.get("reasoning_effort")
+    if reasoning_effort is not None and reasoning_effort not in (
+        "low",
+        "medium",
+        "high",
+    ):
+        raise RoutingError(
+            f"Route {alias!r} reasoning_effort must be low, medium, or high"
+        )
+    capabilities: dict[str, bool | None] = {}
+    for capability in ("supports_images", "supports_tools"):
+        configured = value.get(capability)
+        if configured is not None and not isinstance(configured, bool):
+            raise RoutingError(f"Route {alias!r} {capability} must be true or false")
+        capabilities[capability] = configured
+    tokenizer_encoding = value.get("tokenizer_encoding")
+    if tokenizer_encoding is not None and tokenizer_encoding not in (
+        "cl100k_base",
+        "o200k_base",
+        "p50k_base",
+        "r50k_base",
+    ):
+        raise RoutingError(
+            f"Route {alias!r} tokenizer_encoding must be a supported tiktoken encoding"
+        )
+    return ModelRoute(
+        base_url=base_url.rstrip("/"),
+        model=model,
+        api_key_env=api_key_env,
+        reasoning_effort=reasoning_effort,
+        tokenizer_encoding=tokenizer_encoding,
+        **capabilities,
+    )
 
 
 def load_model_routes(config_path: str | None = None) -> dict[str, ModelRoute]:

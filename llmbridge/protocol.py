@@ -1,10 +1,22 @@
 import base64
 import binascii
 import html.parser
+import http.client
+import ipaddress
 import io
 import json
+import mimetypes
+import os
 import re
+import ssl
+import socket
+import subprocess
+import time
+from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
@@ -15,6 +27,61 @@ from xml.etree import ElementTree
 
 class ProtocolError(ValueError):
     pass
+
+
+def _reject_cache_control_on_blocks(blocks: Any) -> None:
+    if not isinstance(blocks, list):
+        return
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if "cache_control" in block:
+            raise ProtocolError(
+                "Anthropic cache_control is not supported by the configured "
+                "OpenAI-compatible route"
+            )
+        if block.get("type") == "tool_result":
+            _reject_cache_control_on_blocks(block.get("content"))
+
+
+def _reject_unsupported_cache_control(request: dict[str, Any]) -> None:
+    if "cache_control" in request:
+        raise ProtocolError(
+            "Anthropic cache_control is not supported by the configured "
+            "OpenAI-compatible route"
+        )
+    _reject_cache_control_on_blocks(request.get("system"))
+    messages = request.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    _reject_cache_control_on_blocks(content)
+    tools = request.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and "cache_control" in tool:
+                raise ProtocolError(
+                    "Anthropic cache_control is not supported by the configured "
+                    "OpenAI-compatible route"
+                )
+
+
+def _contains_content_type(value: Any, content_types: set[str]) -> bool:
+    if isinstance(value, dict):
+        block_type = value.get("type")
+        if isinstance(block_type, str) and block_type in content_types:
+            return True
+        return any(
+            _contains_content_type(nested_value, content_types)
+            for nested_value in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _contains_content_type(nested_value, content_types) for nested_value in value
+        )
+    return False
 
 
 _OFFICE_DOCUMENT_TYPES = {
@@ -31,6 +98,114 @@ _TEXT_DOCUMENT_TYPES = {
     "application/rtf",
 }
 _MAX_OFFICE_DOCUMENT_BYTES = 25 * 1024 * 1024
+_MAX_REMOTE_DOCUMENT_BYTES = 10 * 1024 * 1024
+_MAX_URL_REDIRECTS = 5
+_MAX_OCR_PAGES = 10
+_MAX_OCR_PIXELS = 20_000_000
+_OCR_PAGE_TIMEOUT_SECONDS = 20
+_OCR_DOCUMENT_TIMEOUT_SECONDS = 90
+
+
+def _validate_public_http_url(url: str) -> tuple[Any, str, int]:
+    try:
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as error:
+        raise ProtocolError("URL documents must use a valid HTTP(S) URL") from error
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ProtocolError("URL documents must use an HTTP(S) URL without credentials")
+    try:
+        addresses = [
+            ipaddress.ip_address(result[4][0])
+            for result in socket.getaddrinfo(
+                parsed.hostname,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        ]
+    except (OSError, ValueError) as error:
+        raise ProtocolError("Could not resolve the URL document host") from error
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ProtocolError("URL documents may only target public internet addresses")
+    return parsed, str(addresses[0]), port
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, address: str) -> None:
+        super().__init__(host, port, timeout=30)
+        self.address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self.address, self.port), self.timeout, self.source_address
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, address: str) -> None:
+        super().__init__(host, port, timeout=30, context=ssl.create_default_context())
+        self.address = address
+
+    def connect(self) -> None:
+        raw_socket = socket.create_connection(
+            (self.address, self.port), self.timeout, self.source_address
+        )
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def _fetch_remote_document(url: str) -> tuple[bytes, str | None]:
+    for redirect_count in range(_MAX_URL_REDIRECTS + 1):
+        parsed, address, port = _validate_public_http_url(url)
+        connection_type = (
+            _PinnedHTTPSConnection
+            if parsed.scheme == "https"
+            else _PinnedHTTPConnection
+        )
+        connection = connection_type(parsed.hostname, port, address)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += f"?{parsed.query}"
+        try:
+            connection.request(
+                "GET", path, headers={"Host": parsed.netloc, "Connection": "close"}
+            )
+            response = connection.getresponse()
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.getheader("Location")
+                response.close()
+                if not location:
+                    raise ProtocolError("URL document redirect has no location")
+                if redirect_count == _MAX_URL_REDIRECTS:
+                    raise ProtocolError("URL document exceeded the redirect limit")
+                url = urljoin(url, location)
+                continue
+            if response.status >= 400:
+                raise ProtocolError(
+                    f"URL document server returned HTTP {response.status}"
+                )
+            content_length = response.getheader("Content-Length")
+            if content_length and int(content_length) > _MAX_REMOTE_DOCUMENT_BYTES:
+                raise ProtocolError(
+                    "Remote document exceeds the 10 MiB download limit"
+                )
+            data = response.read(_MAX_REMOTE_DOCUMENT_BYTES + 1)
+            if len(data) > _MAX_REMOTE_DOCUMENT_BYTES:
+                raise ProtocolError(
+                    "Remote document exceeds the 10 MiB download limit"
+                )
+            return data, response.getheader("Content-Type", "").split(";", 1)[0] or None
+        except ProtocolError:
+            raise
+        except (http.client.HTTPException, OSError, TimeoutError, ValueError) as error:
+            raise ProtocolError("Could not fetch the URL document") from error
+        finally:
+            connection.close()
+    raise ProtocolError("URL document exceeded the redirect limit")
 
 
 class _HTMLTextExtractor(html.parser.HTMLParser):
@@ -45,6 +220,12 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         elif not self._ignored_depth and tag in (
             "br",
             "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
             "li",
             "p",
             "tr",
@@ -54,7 +235,20 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag in ("script", "style") and self._ignored_depth:
             self._ignored_depth -= 1
-        elif not self._ignored_depth and tag in ("div", "li", "p", "tr"):
+        elif not self._ignored_depth and tag in ("td", "th"):
+            self.parts.append("\t")
+        elif not self._ignored_depth and tag in (
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "li",
+            "p",
+            "tr",
+        ):
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
@@ -69,6 +263,60 @@ def _xml_text(xml_data: bytes) -> list[str]:
         for element in root.iter()
         if element.tag.rsplit("}", 1)[-1] in ("t", "v")
     ]
+
+
+def _xml_paragraphs(xml_data: bytes) -> list[str]:
+    root = ElementTree.fromstring(xml_data)
+    paragraphs = []
+    for paragraph in root.iter():
+        if paragraph.tag.rsplit("}", 1)[-1] != "p":
+            continue
+        parts = []
+        for element in paragraph.iter():
+            name = element.tag.rsplit("}", 1)[-1]
+            if name == "t":
+                parts.append(element.text or "")
+            elif name == "tab":
+                parts.append("\t")
+            elif name == "br":
+                parts.append("\n")
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    return paragraphs
+
+
+def _docx_document_text(xml_data: bytes) -> str:
+    root = ElementTree.fromstring(xml_data)
+    body = next(
+        (element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "body"),
+        None,
+    )
+    if body is None:
+        raise ProtocolError("The DOCX document contains no readable content")
+
+    blocks = []
+    for element in body:
+        element_type = element.tag.rsplit("}", 1)[-1]
+        if element_type == "p":
+            text = "\n".join(_xml_paragraphs(ElementTree.tostring(element)))
+            if text:
+                blocks.append(text)
+        elif element_type == "tbl":
+            for row in element:
+                if row.tag.rsplit("}", 1)[-1] != "tr":
+                    continue
+                cells = []
+                for cell in row:
+                    if cell.tag.rsplit("}", 1)[-1] != "tc":
+                        continue
+                    paragraphs = _xml_paragraphs(ElementTree.tostring(cell))
+                    cells.append(" / ".join(paragraphs))
+                if any(cells):
+                    blocks.append("\t".join(cells))
+    if not blocks:
+        raise ProtocolError("The DOCX document contains no readable content")
+    return "\n".join(blocks)
 
 
 def _office_document_text(data: bytes, document_type: str) -> str:
@@ -97,7 +345,10 @@ def _office_document_text(data: bytes, document_type: str) -> str:
                 return content
 
             if document_type == "docx":
-                xml_paths = ["word/document.xml"]
+                path = "word/document.xml"
+                if path not in archive.namelist():
+                    raise ProtocolError("The DOCX document contains no readable content")
+                return _docx_document_text(read_entry(path))
             elif document_type == "xlsx":
                 shared_strings = (
                     _xml_text(read_entry("xl/sharedStrings.xml"))
@@ -155,10 +406,12 @@ def _office_document_text(data: bytes, document_type: str) -> str:
                 raise ProtocolError(
                     f"The {document_type.upper()} document contains no readable content"
                 )
-            return "\n".join(
-                " ".join(_xml_text(read_entry(path)))
-                for path in xml_paths
-            )
+            slides = []
+            for slide_number, path in enumerate(xml_paths, start=1):
+                paragraphs = _xml_paragraphs(read_entry(path))
+                if paragraphs:
+                    slides.append(f"[Slide {slide_number}]\n" + "\n".join(paragraphs))
+            return "\n\n".join(slides)
     except ProtocolError:
         raise
     except (
@@ -174,13 +427,77 @@ def _office_document_text(data: bytes, document_type: str) -> str:
         ) from error
 
 
+def _ocr_pdf_page(data: bytes, page_number: int, deadline: float) -> str:
+    try:
+        import pymupdf
+    except ImportError as error:
+        raise ProtocolError(
+            "PDF OCR is enabled but PyMuPDF is not installed; install "
+            "LLMBridge with its OCR extra"
+        ) from error
+
+    try:
+        with pymupdf.open(stream=data, filetype="pdf") as document:
+            if page_number >= document.page_count:
+                raise ProtocolError("Could not render the PDF page for OCR")
+            page = document.load_page(page_number)
+            scale = 144 / 72
+            width = page.rect.width * scale
+            height = page.rect.height * scale
+            if width * height > _MAX_OCR_PIXELS:
+                raise ProtocolError("PDF page dimensions exceed the OCR pixel limit")
+            image = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+    except ProtocolError:
+        raise
+    except (RuntimeError, ValueError, OSError) as error:
+        raise ProtocolError("Could not render a scanned PDF page for OCR") from error
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProtocolError("PDF OCR exceeded its 90 second time limit")
+    try:
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout"],
+            input=image.tobytes("png"),
+            capture_output=True,
+            timeout=min(_OCR_PAGE_TIMEOUT_SECONDS, remaining),
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise ProtocolError(
+            "PDF OCR is enabled but Tesseract is not installed or is not on PATH"
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise ProtocolError("Tesseract OCR timed out") from error
+    if result.returncode != 0:
+        raise ProtocolError(
+            f"Tesseract OCR failed with exit status {result.returncode}"
+        )
+    return result.stdout.decode("utf-8", errors="replace").strip()
+
+
 def _convert_document_bytes(data: bytes, media_type: str) -> str:
     if media_type == "application/pdf":
         try:
             reader = PdfReader(io.BytesIO(data))
             if reader.is_encrypted:
                 raise ProtocolError("Encrypted PDF documents are not supported")
-            pages = [page.extract_text() or "" for page in reader.pages]
+            pages = []
+            ocr_enabled = os.environ.get("LLMBRIDGE_ENABLE_OCR") == "1"
+            ocr_count = 0
+            deadline = time.monotonic() + _OCR_DOCUMENT_TIMEOUT_SECONDS
+            for page_number, page in enumerate(reader.pages):
+                page_text = page.extract_text() or ""
+                if ocr_enabled and not page_text.strip():
+                    ocr_count += 1
+                    if ocr_count > _MAX_OCR_PAGES:
+                        raise ProtocolError(
+                            f"PDF OCR is limited to {_MAX_OCR_PAGES} scanned pages"
+                        )
+                    page_text = _ocr_pdf_page(data, page_number, deadline)
+                pages.append(page_text)
+        except ProtocolError:
+            raise
         except (PdfReadError, ValueError, OSError) as error:
             raise ProtocolError("Could not read the supplied PDF document") from error
         text = "\n\n".join(
@@ -221,11 +538,7 @@ def _convert_document_bytes(data: bytes, media_type: str) -> str:
     raise ProtocolError(f"Unsupported document media type: {media_type}")
 
 
-def _document_text(block: dict[str, Any]) -> str:
-    source = block.get("source")
-    if not isinstance(source, dict):
-        raise ProtocolError("Document blocks need a source object")
-
+def _resolve_document_source(source: dict[str, Any]) -> tuple[bytes, str]:
     source_type = source.get("type")
     media_type = source.get("media_type", "text/plain")
     if not isinstance(media_type, str):
@@ -235,28 +548,141 @@ def _document_text(block: dict[str, Any]) -> str:
         data = source.get("data")
         if not isinstance(data, str):
             raise ProtocolError("Text documents need a data string")
-        text = _convert_document_bytes(data.encode("utf-8"), media_type)
-    elif source_type == "base64":
+        return data.encode("utf-8"), media_type
+
+    if source_type == "base64":
         encoded_data = source.get("data")
         if not isinstance(encoded_data, str):
             raise ProtocolError("Base64 documents need a data string")
         try:
-            data = base64.b64decode(encoded_data, validate=True)
+            return base64.b64decode(encoded_data, validate=True), media_type
         except (binascii.Error, ValueError) as error:
             raise ProtocolError("Document data is not valid base64") from error
-        text = _convert_document_bytes(data, media_type)
-    elif source_type == "url":
-        raise ProtocolError(
-            "URL documents are not supported by OpenAI-compatible chat routes; "
-            "send the document content as text or base64 instead"
-        )
-    elif source_type == "file":
-        raise ProtocolError(
-            "Anthropic file IDs cannot be resolved by OpenAI-compatible chat routes; "
-            "send the document content directly instead"
-        )
-    else:
-        raise ProtocolError(f"Unsupported document source type: {source_type}")
+
+    if source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url:
+            raise ProtocolError("URL documents need a url string")
+        data, response_type = _fetch_remote_document(url)
+        if media_type == "text/plain" and response_type:
+            media_type = response_type
+        return data, media_type
+
+    if source_type == "file":
+        if "data" in source and isinstance(source.get("data"), str):
+            encoded_data = source.get("data")
+            try:
+                return base64.b64decode(encoded_data, validate=True), media_type
+            except (binascii.Error, ValueError) as error:
+                raise ProtocolError("Document data is not valid base64") from error
+
+        file_id = source.get("file_id")
+        if not isinstance(file_id, str) or not file_id:
+            raise ProtocolError(
+                "File documents need a file_id, local path, or data payload"
+            )
+
+        if file_id.startswith("file_"):
+            api_key = os.environ.get("LLMBRIDGE_ANTHROPIC_FILES_API_KEY")
+            if not api_key:
+                raise ProtocolError(
+                    "Anthropic file IDs require LLMBRIDGE_ANTHROPIC_FILES_API_KEY"
+                )
+            request = Request(
+                f"https://api.anthropic.com/v1/files/{quote(file_id, safe='')}/content",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+            try:
+                with urlopen(request, timeout=30) as response:
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > _MAX_REMOTE_DOCUMENT_BYTES:
+                        raise ProtocolError(
+                            "Remote document exceeds the 10 MiB download limit"
+                        )
+                    data = response.read(_MAX_REMOTE_DOCUMENT_BYTES + 1)
+                    if len(data) > _MAX_REMOTE_DOCUMENT_BYTES:
+                        raise ProtocolError(
+                            "Remote document exceeds the 10 MiB download limit"
+                        )
+                    response_type = response.headers.get_content_type()
+                    if media_type == "text/plain" and response_type:
+                        media_type = response_type
+            except ProtocolError:
+                raise
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+                raise ProtocolError(
+                    f"Could not retrieve Anthropic file {file_id}: {error}"
+                ) from error
+            return data, media_type
+
+        if file_id.startswith(("http://", "https://")):
+            return _resolve_document_source({**source, "type": "url", "url": file_id})
+
+        if file_id.startswith("file://"):
+            parsed_file_url = urlparse(file_id)
+            if parsed_file_url.netloc not in ("", "localhost"):
+                raise ProtocolError("File URLs must refer to this local machine")
+            path = Path(unquote(parsed_file_url.path))
+        else:
+            path = Path(file_id)
+        try:
+            allowed_roots = [
+                Path(root).expanduser().resolve()
+                for root in os.environ.get("LLMBRIDGE_DOCUMENT_ROOTS", "").split(
+                    os.pathsep
+                )
+                if root
+            ]
+        except OSError as error:
+            raise ProtocolError("Could not resolve a configured document root") from error
+        if not allowed_roots:
+            raise ProtocolError(
+                "Local document paths are disabled; configure "
+                "LLMBRIDGE_DOCUMENT_ROOTS to allow specific directories"
+            )
+        try:
+            resolved_path = path.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise ProtocolError("Could not resolve the local document path") from error
+        if not any(
+            resolved_path == root or root in resolved_path.parents
+            for root in allowed_roots
+        ):
+            raise ProtocolError(
+                "Local document path is outside the configured document roots"
+            )
+        if not media_type or media_type == "text/plain":
+            guessed_type = mimetypes.guess_type(str(resolved_path))[0]
+            if guessed_type:
+                media_type = guessed_type
+        try:
+            if not resolved_path.is_file() or resolved_path.stat().st_size > _MAX_REMOTE_DOCUMENT_BYTES:
+                raise ProtocolError(
+                    "Local documents must be regular files no larger than 10 MiB"
+                )
+            with resolved_path.open("rb") as document:
+                data = document.read(_MAX_REMOTE_DOCUMENT_BYTES + 1)
+        except ProtocolError:
+            raise
+        except OSError as error:
+            raise ProtocolError("Could not read the local document") from error
+        if len(data) > _MAX_REMOTE_DOCUMENT_BYTES:
+            raise ProtocolError("Local document exceeds the 10 MiB size limit")
+        return data, media_type
+
+    raise ProtocolError(f"Unsupported document source type: {source_type}")
+
+
+def _document_text(block: dict[str, Any]) -> str:
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ProtocolError("Document blocks need a source object")
+
+    data, media_type = _resolve_document_source(source)
+    text = _convert_document_bytes(data, media_type)
 
     title = block.get("title")
     context = block.get("context")
@@ -290,6 +716,32 @@ def _text_content(content: Any) -> Any:
             text = block.get("text", "")
             if not isinstance(text, str):
                 raise ProtocolError("Text content blocks need a text string")
+            citations = block.get("citations", [])
+            if not isinstance(citations, list):
+                raise ProtocolError("Text block citations must be a list")
+            for citation in citations:
+                if not isinstance(citation, dict):
+                    raise ProtocolError("Text block citations must be objects")
+                details = []
+                for key, label in (
+                    ("document_title", "document"),
+                    ("title", "source"),
+                    ("url", "URL"),
+                    ("start_page_number", "page"),
+                    ("end_page_number", "end page"),
+                    ("start_char_index", "start character"),
+                    ("end_char_index", "end character"),
+                ):
+                    value = citation.get(key)
+                    if value is not None:
+                        details.append(f"{label}: {value}")
+                cited_text = citation.get("cited_text")
+                if cited_text is not None:
+                    if not isinstance(cited_text, str):
+                        raise ProtocolError("Citation cited_text must be a string")
+                    details.append(f'quoted text: "{cited_text}"')
+                if details:
+                    text += "\n[Citation: " + "; ".join(details) + "]"
             openai_content.append({"type": "text", "text": text})
         elif block_type == "document":
             openai_content.append({"type": "text", "text": _document_text(block)})
@@ -318,10 +770,22 @@ def _text_content(content: Any) -> Any:
 
 
 def anthropic_to_openai(
-    request: dict[str, Any], upstream_model: str | None = None
+    request: dict[str, Any],
+    upstream_model: str | None = None,
+    reasoning_effort: str | None = None,
+    supports_images: bool | None = None,
+    supports_tools: bool | None = None,
 ) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ProtocolError("Request body must be a JSON object")
+    _reject_unsupported_cache_control(request)
+    if supports_images is False and _contains_content_type(request, {"image"}):
+        raise ProtocolError("The configured model route does not support images")
+    if supports_tools is False and (
+        bool(request.get("tools"))
+        or _contains_content_type(request, {"tool_use", "tool_result"})
+    ):
+        raise ProtocolError("The configured model route does not support tools")
     model = upstream_model or request.get("model")
     messages = request.get("messages")
     if not isinstance(request.get("model"), str) or not request["model"]:
@@ -336,6 +800,19 @@ def anthropic_to_openai(
         or request["max_tokens"] < 1
     ):
         raise ProtocolError("max_tokens must be a positive integer")
+    thinking = request.get("thinking")
+    if thinking is not None:
+        if not isinstance(thinking, dict) or thinking.get("type") not in (
+            "enabled",
+            "disabled",
+        ):
+            raise ProtocolError("thinking must specify type enabled or disabled")
+        if thinking["type"] == "enabled" and reasoning_effort is None:
+            raise ProtocolError(
+                "Thinking is enabled, but this model route has no configured "
+                "reasoning_effort. Configure a supported upstream reasoning level "
+                "or disable thinking in the request."
+            )
 
     openai_messages: list[dict[str, Any]] = []
     system = request.get("system")
@@ -408,11 +885,26 @@ def anthropic_to_openai(
                 tool_use_id = block.get("tool_use_id")
                 if not isinstance(tool_use_id, str) or not tool_use_id:
                     raise ProtocolError("tool_result blocks require tool_use_id")
+                is_error = block.get("is_error", False)
+                if not isinstance(is_error, bool):
+                    raise ProtocolError("tool_result is_error must be a boolean")
+                tool_content = _text_content(block.get("content", ""))
+                if is_error:
+                    if isinstance(tool_content, str):
+                        tool_content = f"Tool returned an error:\n{tool_content}"
+                    else:
+                        tool_content.insert(
+                            0,
+                            {
+                                "type": "text",
+                                "text": "Tool returned an error.",
+                            },
+                        )
                 openai_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_use_id,
-                        "content": _text_content(block.get("content", "")),
+                        "content": tool_content,
                     }
                 )
             elif role == "assistant" and block_type in (
@@ -420,7 +912,10 @@ def anthropic_to_openai(
                 "redacted_thinking",
                 "signature",
             ):
-                continue
+                raise ProtocolError(
+                    f"Assistant {block_type} blocks cannot be represented by "
+                    "the configured OpenAI-compatible route"
+                )
             else:
                 raise ProtocolError(f"Unsupported content block type: {block_type}")
 
@@ -439,6 +934,8 @@ def anthropic_to_openai(
         "max_tokens": request["max_tokens"],
         "stream": bool(request.get("stream", False)),
     }
+    if thinking is not None and thinking["type"] == "enabled":
+        payload["reasoning_effort"] = reasoning_effort
     for key in ("temperature", "top_p"):
         if key in request:
             payload[key] = request[key]
@@ -548,12 +1045,7 @@ def openai_to_anthropic(
         )
 
     finish_reason = choice.get("finish_reason")
-    stop_reason = {
-        "stop": "end_turn",
-        "length": "max_tokens",
-        "tool_calls": "tool_use",
-        "function_call": "tool_use",
-    }.get(finish_reason, "end_turn")
+    stop_reason = _stop_reason(finish_reason)
     usage = response.get("usage", {})
     return {
         "id": response.get("id", f"msg_{uuid4().hex}"),
@@ -717,12 +1209,7 @@ def stream_events(response_lines: Any, requested_model: str):
             "content_block_stop",
             {"type": "content_block_stop", "index": block_index},
         )
-    stop_reason = {
-        "stop": "end_turn",
-        "length": "max_tokens",
-        "tool_calls": "tool_use",
-        "function_call": "tool_use",
-    }.get(finish_reason, "end_turn")
+    stop_reason = _stop_reason(finish_reason)
     yield _sse(
         "message_delta",
         {
@@ -743,6 +1230,22 @@ def _tool_arguments_event(block_index: int, arguments: str) -> bytes:
             "delta": {"type": "input_json_delta", "partial_json": arguments},
         },
     )
+
+
+def _stop_reason(finish_reason: Any) -> str:
+    if not isinstance(finish_reason, str):
+        raise ProtocolError("Upstream completion reason must be a string")
+    stop_reason = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "function_call": "tool_use",
+    }.get(finish_reason)
+    if stop_reason is None:
+        raise ProtocolError(
+            f"Unsupported upstream completion reason: {finish_reason}"
+        )
+    return stop_reason
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
