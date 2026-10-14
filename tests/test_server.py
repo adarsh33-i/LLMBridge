@@ -3,6 +3,8 @@ import json
 import os
 import threading
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -11,9 +13,11 @@ from llmbridge.routing import ModelRoute
 from llmbridge.server import (
     LLMBridgeHandler,
     LLMBridgeServer,
+    _extract_prompt_and_system,
     _is_loopback_host,
     _validate_listener_auth,
 )
+from llmbridge.work_tracker import WorkTracker
 
 
 class _UpstreamResponse:
@@ -319,6 +323,221 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 400)
         error.exception.close()
         upstream.assert_not_called()
+
+
+class _StreamFailure:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def __iter__(self):
+        raise TimeoutError
+
+
+class InterruptedWorkTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_path = Path(self._tmp.name) / ".partial_work.json"
+        self.tracker = WorkTracker(storage_path=str(self.state_path))
+        self.server = LLMBridgeServer(
+            ("127.0.0.1", 0),
+            LLMBridgeHandler,
+            {
+                "nemotron": ModelRoute(
+                    "http://upstream.test/v1",
+                    model="nvidia/nemotron",
+                    api_key_env="LLMBRIDGE_TEST_API_KEY",
+                ),
+            },
+            work_tracker=self.tracker,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def _post_message(self, body: dict, **kwargs) -> Request:
+        return Request(
+            self._url("/v1/messages"),
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def _get_interrupted(self):
+        with urlopen(self._url("/v1/interrupted")) as response:
+            return response.status, json.loads(response.read())
+
+    def test_quota_error_records_interrupted_work(self):
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        upstream_error = HTTPError("https://upstream.test", 429, "Too Many Requests", {}, None)
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        self.assertEqual(error.exception.code, 502)
+        error.exception.close()
+
+        status, state = self._get_interrupted()
+        self.assertEqual(status, 200)
+        self.assertEqual(state["prompt"], "Hello")
+        self.assertEqual(state["model_name"], "nemotron")
+        self.assertEqual(state["error"], "Upstream returned HTTP 429")
+
+    def test_client_error_is_not_recorded(self):
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        upstream_error = HTTPError("https://upstream.test", 400, "Bad Request", {}, None)
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        error.exception.close()
+        self.assertFalse(self.state_path.exists())
+
+    def test_stream_failure_records_interrupted_work(self):
+        body = {
+            "model": "nemotron",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=_StreamFailure()):
+                with urlopen(self._post_message(body)) as response:
+                    response.read()
+
+        status, state = self._get_interrupted()
+        self.assertEqual(status, 200)
+        self.assertEqual(state["error"], "Upstream stream timed out")
+
+    def test_successful_request_clears_matching_interrupted_work(self):
+        self.tracker.start_tracking(prompt="Hello", model_name="nemotron")
+        self.tracker.save_interrupted()
+
+        upstream_response = _UpstreamResponse(
+            {
+                "id": "x",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            }
+        )
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=upstream_response):
+                with urlopen(self._post_message(body)) as response:
+                    self.assertEqual(response.status, 200)
+
+        self.assertFalse(self.state_path.exists())
+
+    def test_successful_request_keeps_unrelated_interrupted_work(self):
+        self.tracker.start_tracking(prompt="Some earlier work", model_name="nemotron")
+        self.tracker.save_interrupted()
+
+        upstream_response = _UpstreamResponse(
+            {
+                "id": "x",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            }
+        )
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Something else"}]}
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=upstream_response):
+                with urlopen(self._post_message(body)) as response:
+                    self.assertEqual(response.status, 200)
+
+        status, state = self._get_interrupted()
+        self.assertEqual(status, 200)
+        self.assertEqual(state["prompt"], "Some earlier work")
+
+    def test_delete_clears_interrupted_work(self):
+        self.tracker.start_tracking(prompt="Hello", model_name="nemotron")
+        self.tracker.save_interrupted()
+
+        with urlopen(Request(self._url("/v1/interrupted"), method="DELETE")) as response:
+            result = json.loads(response.read())
+        self.assertTrue(result["cleared"])
+        self.assertFalse(self.state_path.exists())
+
+    def test_interrupted_endpoint_requires_authentication(self):
+        self.server.client_api_key = "client-secret"
+        try:
+            self.tracker.start_tracking(prompt="Hello", model_name="nemotron")
+            self.tracker.save_interrupted()
+            with self.assertRaises(HTTPError) as error:
+                urlopen(self._url("/v1/interrupted"))
+            self.assertEqual(error.exception.code, 401)
+            error.exception.close()
+        finally:
+            self.server.client_api_key = None
+
+    def test_saved_prompt_is_not_affected_by_shared_session(self):
+        self.tracker.start_tracking(prompt="STALE", model_name="nemotron")
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        upstream_error = HTTPError("https://upstream.test", 429, "Too Many Requests", {}, None)
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        error.exception.close()
+
+        _, state = self._get_interrupted()
+        self.assertEqual(state["prompt"], "Hello")
+
+    def test_records_system_prompt(self):
+        body = {
+            "model": "nemotron",
+            "max_tokens": 100,
+            "system": "be terse",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        upstream_error = HTTPError("https://upstream.test", 429, "Too Many Requests", {}, None)
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        error.exception.close()
+
+        _, state = self._get_interrupted()
+        self.assertEqual(state["system"], "be terse")
+
+    def test_empty_prompt_does_not_clear_saved_work(self):
+        self.tracker.save(prompt="Hello", model_name="nemotron")
+        LLMBridgeHandler._clear_interrupted_on_match(object(), self.tracker, "")
+        self.assertTrue(self.state_path.exists())
+
+    def test_mismatched_prompt_does_not_clear_saved_work(self):
+        self.tracker.save(prompt="Hello", model_name="nemotron")
+        handler = MagicMock()
+        LLMBridgeHandler._clear_interrupted_on_match(handler, self.tracker, "Other")
+        self.assertTrue(self.state_path.exists())
+
+
+class PromptExtractionTests(unittest.TestCase):
+    def test_extracts_last_user_text_and_system(self):
+        body = {
+            "system": [{"type": "text", "text": "be terse"}],
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": [{"type": "text", "text": "second"}]},
+            ],
+        }
+        prompt, system = _extract_prompt_and_system(body)
+        self.assertEqual(prompt, "second")
+        self.assertEqual(system, "be terse")
+
+    def test_missing_fields_yield_empty_prompt(self):
+        prompt, system = _extract_prompt_and_system({})
+        self.assertEqual(prompt, "")
+        self.assertIsNone(system)
 
 
 if __name__ == "__main__":

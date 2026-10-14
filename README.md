@@ -98,6 +98,10 @@ aliases.
 - `POST /v1/messages` — Anthropic Messages API-compatible request.
 - `POST /v1/messages/count_tokens` — approximate input-token estimate; it is
   not the upstream model's exact tokenizer count.
+- `GET /v1/interrupted` — the interrupted work saved for resumption (`404` when
+  nothing is saved). Requires client authentication when configured.
+- `DELETE /v1/interrupted` — clear the saved interrupted work. Requires client
+  authentication when configured.
 
 ## Compatibility and limitations
 
@@ -140,6 +144,101 @@ formatting, or structured citations.
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+## Partial Work Tracking
+
+LLMBridge includes a **partial work tracking** feature that allows you to resume AI generation work when quotas expire or errors occur, without losing your place.
+
+### Automatic Server Tracking
+
+The bridge tracks every `/v1/messages` request automatically:
+
+1. When a request arrives, the bridge records the prompt (the last user message) and model.
+2. If the upstream call stops because of a quota, rate-limit, transient server, connection, timeout, or stream error, the bridge **saves the interrupted work**.
+3. When a later request with the **same prompt** completes successfully, the saved work is cleared automatically.
+4. You can inspect the saved work with `GET /v1/interrupted`, and clear it with `DELETE /v1/interrupted`.
+
+Configuration (environment variables):
+
+- `LLMBRIDGE_TRACK_INTERRUPTED` — set to `0`, `false`, `no`, or `off` to disable tracking (enabled by default).
+- `LLMBRIDGE_PARTIAL_WORK_PATH` — where to store the state file (defaults to `.partial_work.json` in the server's working directory).
+
+**Privacy:** the state file contains the prompt text in plain text. It is created with private (`0600`) permissions, but disable tracking or point `LLMBRIDGE_PARTIAL_WORK_PATH` at a suitable location if prompts are sensitive.
+
+### Library Usage
+
+The underlying `WorkTracker` class can also be used directly:
+
+1. **Start tracking** — Call `track_generation(prompt, model_name)` at the beginning of a generation run
+2. **During generation** — Call `tracker.update_progress(percent)` periodically (no disk writes)
+3. **When generation stops** (quota error, rate limit, etc.) — Call `tracker.save_interrupted()`
+   - This saves the interrupted prompt + progress percentage + error context to `.partial_work.json`
+   - No intermediate progress steps are stored — just the prompt being processed (plus optional message history if you passed it to `update_progress()`)
+   - The state is typically small (500 bytes - 2 KB), so no arbitrary size caps are needed
+4. **Resume later** — Call `tracker.load_state()` to retrieve the saved interrupted work
+   - The original prompt and progress percentage are preserved
+   - Resume from where you left off, not from scratch
+
+### Usage Example
+
+```python
+from llmbridge.work_tracker import track_generation
+
+# Start tracking a generation session
+tracker = track_generation(
+    prompt="Analyze this Python code for security issues and suggest fixes:",
+    model_name="claude-3-opus",
+)
+
+# During generation — update progress (no disk writes)
+tracker.update_progress(progress_percent=75.0)
+
+# Generation stops (quota exhausted) — save interrupted state
+tracker.save_interrupted()
+
+# Later, resume with a different model
+loaded = tracker.load_state()
+if loaded:
+    print(f"Resume from {loaded['progress_percent']:.1f}%")
+    print(f"Original prompt: {loaded['prompt'][:50]}...")
+    # Continue generation with a new model using the saved prompt
+```
+
+### State Lifecycle
+
+| Action | Behavior |
+|--------|----------|
+| `track_generation()` | Starts tracking, no disk write |
+| `update_progress()` | Updates internal state, no disk write |
+| `save_interrupted()` | **Saves to `.partial_work.json`** (one write) |
+| `load_state()` | Loads if the file exists (no expiry) |
+| `clear_state()` | Manual cleanup when done |
+
+### File
+
+- **`.partial_work.json`** — Created in the current working directory when `save_interrupted()` is called (or at a custom path passed to `WorkTracker(storage_path=...)` or `track_generation(..., storage_path=...)`)
+- **`.partial_work.<namespace>.json`** — Used when you pass `namespace=` to keep independent generations in separate slots. Namespaces must start with an alphanumeric character and contain only letters, digits, `.`, `_`, or `-` (path separators are rejected to prevent directory traversal)
+- **Typical size**: 500 bytes - 2 KB (just the interrupted prompt + metadata)
+- **No size cap needed**: The state stores one prompt (and optional message history), so it stays small naturally
+- **Atomic writes**: State is written to a temp file and moved into place, so an interrupted write cannot corrupt the saved state
+- **Thread- and process-safe**: Reads, writes, and deletions are serialized with an advisory file lock, so concurrent trackers sharing a path cannot interleave or corrupt state. Lock files live in the system temp directory (not the project), and in-memory session state is guarded so a single `WorkTracker` can be shared across threads
+- **Logging, not stdout**: Status messages go to the `llmbridge.work_tracker` logger, so they never interleave with server/protocol output
+
+### Resume Behavior
+
+| Scenario | Result |
+|----------|--------|
+| State exists | ✅ Resume from saved prompt + progress |
+| No state file exists | 🆕 Start from scratch with new prompt |
+
+### Why This Design
+
+- **No arbitrary KB caps**: The state stores only one prompt, so it's naturally small
+- **No intermediate bloat**: We don't save on every progress update
+- **Clear semantics**: `save_interrupted()` explicitly marks "this generation stopped"
+- **No expiry**: Saved state persists until you resume or clear it, so you can pick it back up the next day
+- **Concurrency-safe**: An advisory file lock serializes access, and `namespace=`/`storage_path=` let independent generations use separate slots
+- **Model-agnostic**: Works the same way when switching between Claude, OpenAI, Gemini, etc.
 
 ## License
 
