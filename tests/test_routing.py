@@ -45,6 +45,83 @@ api_key_env = "HOSTED_KEY"
             with self.assertRaisesRegex(RoutingError, "HOSTED_KEY"):
                 route.api_key()
 
+    def test_loads_configured_reasoning_effort(self):
+        config = """
+[models.reasoning-model]
+base_url = "https://provider.example/v1"
+reasoning_effort = "high"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "llmbridge.toml"
+            config_path.write_text(config, encoding="utf-8")
+            routes = load_model_routes(str(config_path))
+
+        self.assertEqual(routes["reasoning-model"].reasoning_effort, "high")
+
+    def test_rejects_unknown_reasoning_effort(self):
+        config = """
+[models.reasoning-model]
+base_url = "https://provider.example/v1"
+reasoning_effort = "maximum"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "llmbridge.toml"
+            config_path.write_text(config, encoding="utf-8")
+            with self.assertRaisesRegex(RoutingError, "reasoning_effort"):
+                load_model_routes(str(config_path))
+
+    def test_loads_explicit_route_capabilities(self):
+        config = """
+[models.text-model]
+base_url = "https://provider.example/v1"
+supports_images = false
+supports_tools = true
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "llmbridge.toml"
+            config_path.write_text(config, encoding="utf-8")
+            route = load_model_routes(str(config_path))["text-model"]
+
+        self.assertFalse(route.supports_images)
+        self.assertTrue(route.supports_tools)
+
+    def test_rejects_non_boolean_route_capability(self):
+        config = """
+[models.text-model]
+base_url = "https://provider.example/v1"
+supports_images = "no"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "llmbridge.toml"
+            config_path.write_text(config, encoding="utf-8")
+            with self.assertRaisesRegex(RoutingError, "supports_images"):
+                load_model_routes(str(config_path))
+
+    def test_loads_tokenizer_encoding(self):
+        config = """
+[models.tokenized]
+base_url = "https://provider.example/v1"
+tokenizer_encoding = "o200k_base"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "llmbridge.toml"
+            config_path.write_text(config, encoding="utf-8")
+            route = load_model_routes(str(config_path))["tokenized"]
+
+        self.assertEqual(route.tokenizer_encoding, "o200k_base")
+
+    def test_rejects_unknown_tokenizer_encoding(self):
+        config = """
+[models.tokenized]
+base_url = "https://provider.example/v1"
+tokenizer_encoding = "unknown"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "llmbridge.toml"
+            config_path.write_text(config, encoding="utf-8")
+            with self.assertRaisesRegex(RoutingError, "tokenizer_encoding"):
+                load_model_routes(str(config_path))
+
     def test_unknown_alias_is_rejected(self):
         config = """
 [models.nemotron-local]

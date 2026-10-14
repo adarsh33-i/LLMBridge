@@ -124,7 +124,13 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             route, upstream_model = resolve_model_route(
                 model, self.server.model_routes
             )
-            payload = anthropic_to_openai(body, upstream_model)
+            payload = anthropic_to_openai(
+                body,
+                upstream_model,
+                reasoning_effort=route.reasoning_effort,
+                supports_images=route.supports_images,
+                supports_tools=route.supports_tools,
+            )
             request = _upstream_request(payload, route)
         except (ValueError, RoutingError) as error:
             self._send_error(400, "invalid_request_error", str(error))
@@ -159,7 +165,32 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
                 raise ProtocolError("Request must include a messages list")
-            estimated_tokens = max(1, (len(json.dumps(body, ensure_ascii=False)) + 3) // 4)
+            tokenizer_encoding = None
+            model = body.get("model")
+            if model is not None:
+                if not isinstance(model, str) or not model:
+                    raise ProtocolError("model must be a non-empty string")
+                route, _ = resolve_model_route(model, self.server.model_routes)
+                tokenizer_encoding = route.tokenizer_encoding
+            serialized_request = json.dumps(body, ensure_ascii=False)
+            if tokenizer_encoding:
+                try:
+                    import tiktoken
+                except ImportError as error:
+                    raise ProtocolError(
+                        "This model route configures tokenizer_encoding; install "
+                        "LLMBridge with its token-count extra"
+                    ) from error
+                estimated_tokens = len(
+                    tiktoken.get_encoding(tokenizer_encoding).encode(
+                        serialized_request, disallowed_special=()
+                    )
+                )
+                estimated_tokens = max(1, estimated_tokens)
+            else:
+                estimated_tokens = max(
+                    1, (len(serialized_request) + 3) // 4
+                )
         except (ValueError, ProtocolError) as error:
             self._send_error(400, "invalid_request_error", str(error))
             return
