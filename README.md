@@ -127,12 +127,13 @@ HTTP(S), resolve only to public IP addresses, and are revalidated and pinned
 to the validated address at each redirect. Avoid allowing untrusted clients
 to submit document references.
 
-**Note:** Remaining compatibility work includes Anthropic prompt caching,
-provider-specific beta and newer API features, broader content-block support,
-and richer document fidelity. Full Anthropic API parity is not currently
-provided. OCR is optional and requires PyMuPDF and Tesseract; document
-conversion to text does not preserve full layout, embedded images, formatting,
-or structured citations.
+**Note:** Prompt caching is not provided: Anthropic `cache_control` metadata is
+removed with a warning, and requests continue without caching. Remaining
+compatibility work includes provider-specific beta and newer API features,
+broader content-block support, and richer document fidelity. Full Anthropic API
+parity is not provided. OCR is optional and requires PyMuPDF and Tesseract;
+document conversion to text does not preserve full layout, embedded images,
+formatting, or structured citations.
 
 ## Tests
 

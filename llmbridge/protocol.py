@@ -1,10 +1,12 @@
 import base64
 import binascii
+import copy
 import html.parser
 import http.client
 import ipaddress
 import io
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -29,43 +31,44 @@ class ProtocolError(ValueError):
     pass
 
 
-def _reject_cache_control_on_blocks(blocks: Any) -> None:
+_LOGGER = logging.getLogger(__name__)
+
+
+def _strip_cache_control_from_blocks(blocks: Any) -> bool:
+    found = False
     if not isinstance(blocks, list):
-        return
+        return found
     for block in blocks:
         if not isinstance(block, dict):
             continue
         if "cache_control" in block:
-            raise ProtocolError(
-                "Anthropic cache_control is not supported by the configured "
-                "OpenAI-compatible route"
-            )
+            del block["cache_control"]
+            found = True
         if block.get("type") == "tool_result":
-            _reject_cache_control_on_blocks(block.get("content"))
+            found = _strip_cache_control_from_blocks(block.get("content")) or found
+    return found
 
 
-def _reject_unsupported_cache_control(request: dict[str, Any]) -> None:
+def _strip_unsupported_cache_control(request: dict[str, Any]) -> bool:
+    found = False
     if "cache_control" in request:
-        raise ProtocolError(
-            "Anthropic cache_control is not supported by the configured "
-            "OpenAI-compatible route"
-        )
-    _reject_cache_control_on_blocks(request.get("system"))
+        del request["cache_control"]
+        found = True
+    found = _strip_cache_control_from_blocks(request.get("system")) or found
     messages = request.get("messages")
     if isinstance(messages, list):
         for message in messages:
             if isinstance(message, dict):
                 content = message.get("content")
                 if isinstance(content, list):
-                    _reject_cache_control_on_blocks(content)
+                    found = _strip_cache_control_from_blocks(content) or found
     tools = request.get("tools")
     if isinstance(tools, list):
         for tool in tools:
             if isinstance(tool, dict) and "cache_control" in tool:
-                raise ProtocolError(
-                    "Anthropic cache_control is not supported by the configured "
-                    "OpenAI-compatible route"
-                )
+                del tool["cache_control"]
+                found = True
+    return found
 
 
 def _contains_content_type(value: Any, content_types: set[str]) -> bool:
@@ -494,6 +497,12 @@ def _convert_document_bytes(data: bytes, media_type: str) -> str:
                         raise ProtocolError(
                             f"PDF OCR is limited to {_MAX_OCR_PAGES} scanned pages"
                         )
+                    if not os.environ.get("LLMBRIDGE_ENABLE_OCR"):
+                        raise ProtocolError(
+                            "PDF OCR is enabled but LLMBRIDGE_ENABLE_OCR is not set; "
+                            "install LLMBridge with its OCR extra or set "
+                            "LLMBRIDGE_ENABLE_OCR=1 to enable"
+                        )
                     page_text = _ocr_pdf_page(data, page_number, deadline)
                 pages.append(page_text)
         except ProtocolError:
@@ -778,7 +787,11 @@ def anthropic_to_openai(
 ) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ProtocolError("Request body must be a JSON object")
-    _reject_unsupported_cache_control(request)
+    request = copy.deepcopy(request)
+    if _strip_unsupported_cache_control(request):
+        _LOGGER.warning(
+            "Anthropic cache_control metadata was ignored; prompt caching is disabled"
+        )
     if supports_images is False and _contains_content_type(request, {"image"}):
         raise ProtocolError("The configured model route does not support images")
     if supports_tools is False and (
