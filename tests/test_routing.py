@@ -293,5 +293,89 @@ class RouteCacheControlTests(unittest.TestCase):
             self._route("[models.cached]\nbase_url = 'http://u/v1'\ncache_control = 'yes'\n")
 
 
+class RoutingSuggestionTests(unittest.TestCase):
+    def test_missing_config_suggests_setup(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_CONFIG": "/nonexistent/x.toml"}, clear=True):
+            with self.assertRaisesRegex(RoutingError, "llmbridge setup"):
+                load_model_routes()
+
+    def test_missing_api_key_suggests_setup(self):
+        from llmbridge.routing import ModelRoute
+
+        route = ModelRoute("http://host/v1", api_key_env="SOME_UNSET_KEY_XYZ")
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RoutingError, "llmbridge setup"):
+                route.api_key()
+
+
+class ConfigDiscoveryTests(unittest.TestCase):
+    def _chdir(self, directory):
+        original = os.getcwd()
+        os.chdir(directory)
+        self.addCleanup(os.chdir, original)
+
+    def test_user_config_used_when_no_local_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".config" / "llmbridge").mkdir(parents=True)
+            (home / ".config" / "llmbridge" / "llmbridge.toml").write_text(
+                "[models.user]\nbase_url = 'http://user.test/v1'\n", encoding="utf-8"
+            )
+            workdir = home / "work"
+            workdir.mkdir()
+            self._chdir(workdir)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=True):
+                routes = load_model_routes()
+            self.assertIn("user", routes)
+
+    def test_xdg_config_home_is_honoured(self):
+        from llmbridge.routing import user_config_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            xdg = Path(directory) / "xdg"
+            (xdg / "llmbridge").mkdir(parents=True)
+            (xdg / "llmbridge" / "llmbridge.toml").write_text(
+                "[models.xdg]\nbase_url = 'http://xdg.test/v1'\n", encoding="utf-8"
+            )
+            workdir = Path(directory) / "work"
+            workdir.mkdir()
+            self._chdir(workdir)
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}, clear=True):
+                routes = load_model_routes()
+                self.assertEqual(
+                    str(user_config_path()),
+                    str(xdg / "llmbridge" / "llmbridge.toml"),
+                )
+            self.assertIn("xdg", routes)
+
+    def test_local_file_wins_over_user_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".config" / "llmbridge").mkdir(parents=True)
+            (home / ".config" / "llmbridge" / "llmbridge.toml").write_text(
+                "[models.user]\nbase_url = 'http://user.test/v1'\n", encoding="utf-8"
+            )
+            workdir = home / "work"
+            workdir.mkdir()
+            (workdir / "llmbridge.toml").write_text(
+                "[models.local]\nbase_url = 'http://local.test/v1'\n", encoding="utf-8"
+            )
+            self._chdir(workdir)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=True):
+                routes = load_model_routes()
+            self.assertIn("local", routes)
+            self.assertNotIn("user", routes)
+
+    def test_explicit_config_env_wins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            explicit = Path(directory) / "explicit.toml"
+            explicit.write_text(
+                "[models.explicit]\nbase_url = 'http://e/v1'\n", encoding="utf-8"
+            )
+            with patch.dict(os.environ, {"LLMBRIDGE_CONFIG": str(explicit)}, clear=True):
+                routes = load_model_routes()
+            self.assertIn("explicit", routes)
+
+
 if __name__ == "__main__":
     unittest.main()

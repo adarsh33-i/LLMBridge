@@ -148,6 +148,7 @@ class WorkTracker:
         prompt: str,
         model_name: str,
         system: Optional[str] = None,
+        request: Optional[dict[str, Any]] = None,
     ) -> None:
         """Mark the start of a generation session.
 
@@ -159,6 +160,9 @@ class WorkTracker:
             prompt: The original user prompt that started the generation.
             model_name: The model being used at the start.
             system: The system prompt/instructions (optional).
+            request: The original request's replayable parts — ``messages``,
+                ``tools``, ``tool_choice`` — so a resume can rebuild the full
+                conversation instead of only the last prompt (optional).
         """
         with self._session_lock:
             self._current_prompt = prompt
@@ -168,6 +172,7 @@ class WorkTracker:
             self._error: Optional[str] = None
             self._messages: List[dict[str, Any]] = []
             self._partial_output = ""
+            self._request = request
 
         # Do NOT save to disk here — just set internal state
         # This avoids saving on every intermediate step
@@ -197,7 +202,11 @@ class WorkTracker:
                 values are treated as empty.
         """
         with self._session_lock:
-            self._progress_percent = progress_percent
+            # Clamp progress to 0-100 range
+            try:
+                self._progress_percent = max(0.0, min(100.0, float(progress_percent)))
+            except (TypeError, ValueError):
+                self._progress_percent = 0.0
             if error is not _UNSET:
                 self._error = error or None
             if messages is not None:
@@ -237,6 +246,7 @@ class WorkTracker:
                 "error": self._error,
                 "messages": self._messages,
                 "partial_output": self._partial_output,
+                "request": getattr(self, "_request", None),
             }
 
         self._write_state(state)
@@ -254,6 +264,7 @@ class WorkTracker:
         messages: Optional[List[dict[str, Any]]] = None,
         partial_output: str = "",
         max_tokens: Optional[int] = None,
+        request: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Save an interrupted generation directly, without a session.
 
@@ -269,6 +280,9 @@ class WorkTracker:
                 (optional). Non-string values are stored as an empty string.
             max_tokens: The generation's token limit, kept so a resume can reuse
                 it (optional).
+            request: The original request's replayable parts — ``messages``,
+                ``tools``, ``tool_choice`` — so a resume can rebuild the full
+                conversation (optional).
 
         Returns:
             The saved state dictionary (same format as ``load_state()``).
@@ -283,6 +297,7 @@ class WorkTracker:
             "messages": list(messages) if messages is not None else [],
             "partial_output": partial_output if isinstance(partial_output, str) else "",
             "max_tokens": max_tokens,
+            "request": request,
         }
         self._write_state(state)
         self._log_saved(state)
@@ -392,6 +407,42 @@ class WorkTracker:
         self._reset_session()
         return True
 
+    def clear_if_matches(self, prompt: str) -> bool:
+        """Clear the saved state only when its prompt matches ``prompt``.
+
+        Unlike :meth:`clear_state`, the read-compare-delete happens under a
+        single advisory lock. That closes the check-then-act window where a
+        concurrent :meth:`save` of *different* work could slip in between a
+        :meth:`load_state` and an unconditional :meth:`clear_state` and be
+        silently deleted.
+
+        Returns:
+            True if a state with a matching prompt was cleared, else False.
+        """
+        if not self.storage_path.exists():
+            self._reset_session()
+            return False
+        cleared = False
+        with _exclusive_lock(self._lock_path):
+            try:
+                with open(self.storage_path, "r") as state_file:
+                    state = json.load(state_file)
+            except (json.JSONDecodeError, OSError):
+                state = None
+            if isinstance(state, dict) and state.get("prompt") == prompt:
+                try:
+                    self.storage_path.unlink()
+                    cleared = True
+                except FileNotFoundError:
+                    cleared = False
+        if cleared:
+            logger.info(
+                "Cleared interrupted work state from %s (prompt match)",
+                self.storage_path,
+            )
+        self._reset_session()
+        return cleared
+
     def _reset_session(self) -> None:
         """Forget any in-memory generation session."""
         with self._session_lock:
@@ -403,6 +454,7 @@ class WorkTracker:
                 "_error",
                 "_messages",
                 "_partial_output",
+                "_request",
             ):
                 if hasattr(self, attribute):
                     delattr(self, attribute)

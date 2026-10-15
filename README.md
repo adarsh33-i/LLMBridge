@@ -23,14 +23,42 @@ Install the project and its dependencies:
 python -m pip install -e .
 ```
 
-Copy `llmbridge.toml.example` to `llmbridge.toml`, edit the model aliases and
-endpoints, and set any required upstream API keys in environment variables:
+The quickest way to get going is the guided setup, which writes a config and
+tells you the next step:
+
+```sh
+llmbridge setup          # pick a provider preset (Ollama, OpenAI, OpenRouter, ...)
+llmbridge doctor         # check Python, config, API keys, ledger, and port
+llmbridge serve          # start the bridge
+```
+
+`setup` writes to `~/.config/llmbridge/llmbridge.toml` (private `0600`
+permissions) unless a `llmbridge.toml` already exists in the working directory,
+in which case that file is updated. Pass `--preset`, `--alias`, `--base-url`,
+`--model`, `--api-key-env`, or `--no-key` to skip the prompts.
+
+You can also configure by hand. Copy `llmbridge.toml.example` to
+`llmbridge.toml`, edit the model aliases and endpoints, and set any required
+upstream API keys in environment variables:
 
 ```sh
 cp llmbridge.toml.example llmbridge.toml
 export NVIDIA_API_KEY="your-provider-key"
 python -m llmbridge
 ```
+
+### Where the config is found
+
+LLMBridge looks for its routing config in this order, so `llmbridge serve`
+works from any directory once set up:
+
+1. an explicit path passed to `--config` or set in `LLMBRIDGE_CONFIG`;
+2. `./llmbridge.toml` in the current directory;
+3. `$XDG_CONFIG_HOME/llmbridge/llmbridge.toml` (default
+   `~/.config/llmbridge/llmbridge.toml`).
+
+If none is found, the error names the paths it searched and points at
+`llmbridge setup`.
 
 Each `[models.<alias>]` entry has a `base_url` and may specify an upstream
 `model`, an `api_key_env` environment-variable name, and (for providers that
@@ -104,11 +132,26 @@ offers:
 ```sh
 llmbridge check  --config llmbridge.toml   # validate the routing config
 llmbridge models --config llmbridge.toml   # list aliases, endpoints, fallbacks
+llmbridge setup                            # guided config writer (presets, prompts)
+llmbridge doctor                           # diagnose env, config, keys, port
+llmbridge claude -- --model local          # launch Claude Code against the bridge
 llmbridge init   --path llmbridge.toml     # write a starter config (--force to overwrite)
+llmbridge generations --ledger .llmbridge/generations   # list recorded generations
+llmbridge status   # summarise the ledger and flag recoverable work
+llmbridge fork gen_1a2b3c4d5e6f --model strong           # continue a generation
 llmbridge serve  --host 127.0.0.1 --port 8787 --config llmbridge.toml
 ```
 
 `python -m llmbridge` behaves the same as `llmbridge serve`.
+
+`llmbridge claude` sets `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` (from
+`--client-api-key` or `LLMBRIDGE_API_KEY`) and execs the `claude` CLI, forwarding
+any extra arguments. Use `--print-env` to inspect the values without launching.
+
+`llmbridge fork` talks to a running server (default `http://127.0.0.1:8787`,
+override with `--base-url` or `LLMBRIDGE_BASE_URL`; authenticate with `--api-key`
+or `LLMBRIDGE_API_KEY`). It POSTs to `/v1/generations/{id}/fork` and prints the
+continuing response, with the new generation id echoed to stderr.
 
 ### Fallbacks and retries
 
@@ -124,6 +167,13 @@ Each route can also be retried before moving on:
 - `LLMBRIDGE_ROUTE_ATTEMPTS` — attempts per route (default `1`, max `10`).
 - `LLMBRIDGE_ROUTE_RETRY_BACKOFF` — base seconds between attempts, doubled each
   retry (default `0.5`; set to `0` to disable the delay).
+
+Two timeouts can be tuned for slow models or long generations:
+
+- `LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS` — how long to wait on the upstream model
+  (default `180`).
+- `LLMBRIDGE_CLIENT_TIMEOUT_SECONDS` — how long a client socket may stay idle
+  mid-request (default `300`).
 
 ## Endpoints
 
@@ -143,6 +193,75 @@ Each route can also be retried before moving on:
   when configured.
 - `DELETE /v1/interrupted` — clear the saved interrupted work. Requires client
   authentication when configured.
+- `GET /v1/generations` — list durable generations newest-first. Requires client
+  authentication when configured.
+- `GET /v1/generations/{id}` — full record for one generation, including its
+  request prompt/system, the assistant text produced, and the event history.
+- `POST /v1/generations/{id}/fork` — continue a generation as a *new* one from
+  the point it reached. Pass `{"model": "alias"}` to switch models, plus optional
+  `max_tokens`, `stream`, and `at_event`. The response is a normal Messages
+  response for the forked child.
+- `DELETE /v1/generations/{id}` — remove a generation from the ledger.
+
+Every `/v1/messages` response also carries an `X-LLMBridge-Generation` header
+with the id of the generation it created (or forked), so a client can address it
+afterwards.
+
+## Durable Generations
+
+LLMBridge does not treat a completion as a throwaway response. Each request is
+recorded in an **append-only ledger** as an event history — `start`, then
+`complete`, `interrupt`, or `fail`. The record keeps the original prompt and
+whatever assistant text was produced, so the generation is addressable and can
+be *forked*: continued from where it stopped, optionally on a **different
+model**.
+
+This makes a generation durable work rather than a fire-and-forget call:
+
+```sh
+# 1. A request over a flaky free tier is interrupted at 40%.
+curl -s localhost:8787/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"cheap","max_tokens":2000,"messages":[{"role":"user","content":"Write a design doc"}]}'
+# -> X-LLMBridge-Generation: gen_1a2b3c4d5e6f
+
+# 2. See what was produced before it stopped.
+curl -s localhost:8787/v1/generations/gen_1a2b3c4d5e6f
+
+# 3. Fork it onto a stronger model and finish the job.
+curl -s localhost:8787/v1/generations/gen_1a2b3c4d5e6f/fork \
+  -H 'content-type: application/json' \
+  -d '{"model":"strong","max_tokens":2000}'
+
+# ...or from the CLI, against a running server:
+llmbridge status                                  # see recoverable generations
+llmbridge fork gen_1a2b3c4d5e6f --model strong
+```
+
+When a request is interrupted mid-stream, the error the client receives names the
+generation and points at its fork endpoint, so recoverable work is never a dead
+end — the client (or an operator reading `llmbridge status`) is told exactly how
+to continue it.
+
+The forked child records `parent` and `fork_event_seq`, so a lineage of how an
+output evolved across models is preserved. Because requests are content-addressed
+by a `fingerprint`, identical requests can be recognised across runs.
+
+A fork or resume rebuilds the **full original conversation** — the complete
+`messages` history plus any `system` prompt, `tools`, and `tool_choice` — not
+just the last user turn. Multi-turn and tool-using generations therefore
+continue faithfully rather than restarting from a single prompt. (Older records
+written before this was captured fall back to the recorded prompt.)
+
+The ledger is stored one JSON document per generation (default
+`.llmbridge/generations`, override with `LLMBRIDGE_LEDGER_PATH`); writes are
+atomic and serialized with an advisory file lock, so concurrent requests and
+multiple processes cannot corrupt a record. Recording can be disabled with
+`LLMBRIDGE_TRACK_GENERATIONS=0`.
+
+**Privacy:** ledger entries contain prompts and generated text in plain text.
+Each file is created with private (`0600`) permissions, but disable tracking or
+point `LLMBRIDGE_LEDGER_PATH` at a suitable location if prompts are sensitive.
 
 ## Compatibility and limitations
 

@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -14,11 +15,13 @@ from llmbridge.routing import ModelRoute, RoutingError
 from llmbridge.server import (
     LLMBridgeHandler,
     LLMBridgeServer,
+    _client_timeout_seconds,
     _extract_prompt_and_system,
     _is_loopback_host,
     _is_retryable_status,
     _route_attempts,
     _route_retry_backoff_seconds,
+    _upstream_timeout_seconds,
     _validate_listener_auth,
     load_server_settings,
 )
@@ -28,6 +31,7 @@ from llmbridge.work_tracker import WorkTracker
 class _UpstreamResponse:
     def __init__(self, body: dict):
         self.body = json.dumps(body).encode("utf-8")
+        self._offset = 0
 
     def __enter__(self):
         return self
@@ -36,7 +40,12 @@ class _UpstreamResponse:
         return False
 
     def read(self, size=-1):
-        return self.body[:size] if size is not None and size >= 0 else self.body
+        if size is None or size < 0:
+            chunk = self.body[self._offset :]
+        else:
+            chunk = self.body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 class _TimedOutStream:
@@ -607,6 +616,9 @@ class InterruptedWorkTests(unittest.TestCase):
 
     def test_invalid_upstream_response_records_interrupted_work(self):
         class _BadResponse:
+            def __init__(self):
+                self._sent = False
+
             def __enter__(self):
                 return self
 
@@ -614,6 +626,9 @@ class InterruptedWorkTests(unittest.TestCase):
                 return False
 
             def read(self, size=-1):
+                if self._sent:
+                    return b""
+                self._sent = True
                 return b"not json"
 
         body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
@@ -684,18 +699,32 @@ class InterruptedWorkTests(unittest.TestCase):
         LLMBridgeHandler._save_interrupted(handler, tracker, "p", "m", None, "boom")
         handler.log_error.assert_called_once()
 
-    def test_clear_interrupted_ignores_load_failures(self):
+    def test_save_interrupted_forwards_replayable_request(self):
         handler = MagicMock()
         tracker = MagicMock()
-        tracker.load_state.side_effect = OSError("disk")
+        body = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "be terse",
+            "tools": [{"name": "search"}],
+        }
+        LLMBridgeHandler._save_interrupted(
+            handler, tracker, "hi", "m", "be terse", "boom", body=body
+        )
+        _, kwargs = tracker.save.call_args
+        self.assertEqual(kwargs["request"]["messages"], body["messages"])
+        self.assertEqual(kwargs["request"]["tools"], body["tools"])
+        self.assertEqual(kwargs["request"]["system"], "be terse")
+
+    def test_clear_interrupted_delegates_to_atomic_clear(self):
+        handler = MagicMock()
+        tracker = MagicMock()
         LLMBridgeHandler._clear_interrupted_on_match(handler, tracker, "p")
-        tracker.clear_state.assert_not_called()
+        tracker.clear_if_matches.assert_called_once_with("p")
 
     def test_clear_interrupted_logs_clear_failures(self):
         handler = MagicMock()
         tracker = MagicMock()
-        tracker.load_state.return_value = {"prompt": "p"}
-        tracker.clear_state.side_effect = OSError("disk")
+        tracker.clear_if_matches.side_effect = OSError("disk")
         LLMBridgeHandler._clear_interrupted_on_match(handler, tracker, "p")
         handler.log_error.assert_called_once()
 
@@ -743,14 +772,70 @@ class StreamResponseUnitTests(unittest.TestCase):
     def test_handler_declares_client_socket_timeout(self):
         self.assertEqual(LLMBridgeHandler.timeout, 300)
 
+    def test_client_timeout_honours_environment(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_CLIENT_TIMEOUT_SECONDS": "45"}):
+            self.assertEqual(_client_timeout_seconds(), 45.0)
+            handler = object.__new__(LLMBridgeHandler)
+            handler.request = MagicMock()
+            LLMBridgeHandler.setup(handler)
+            self.assertEqual(handler.timeout, 45.0)
+
+    def test_client_timeout_ignores_invalid_values(self):
+        for value in ("0", "-1", "abc"):
+            with patch.dict(os.environ, {"LLMBRIDGE_CLIENT_TIMEOUT_SECONDS": value}):
+                self.assertEqual(_client_timeout_seconds(), 300)
+
+    def test_upstream_timeout_honours_environment(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS": "12.5"}):
+            self.assertEqual(_upstream_timeout_seconds(), 12.5)
+
+    def test_upstream_timeout_ignores_invalid_values(self):
+        for value in ("0", "-3", "nope"):
+            with patch.dict(os.environ, {"LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS": value}):
+                self.assertEqual(_upstream_timeout_seconds(), 180)
+
+    def test_broken_pipe_during_request_is_swallowed(self):
+        handler = object.__new__(LLMBridgeHandler)
+        handler.close_connection = False
+        handler.log_error = MagicMock()
+        with patch.object(
+            BaseHTTPRequestHandler, "handle_one_request", side_effect=BrokenPipeError
+        ):
+            LLMBridgeHandler.handle_one_request(handler)
+        self.assertTrue(handler.close_connection)
+        handler.log_error.assert_called_once()
+
+    def test_connection_reset_during_request_is_swallowed(self):
+        handler = object.__new__(LLMBridgeHandler)
+        handler.close_connection = False
+        handler.log_error = MagicMock()
+        with patch.object(
+            BaseHTTPRequestHandler, "handle_one_request", side_effect=ConnectionResetError
+        ):
+            LLMBridgeHandler.handle_one_request(handler)
+        self.assertTrue(handler.close_connection)
+
+    def test_other_errors_still_propagate(self):
+        handler = object.__new__(LLMBridgeHandler)
+        handler.close_connection = False
+        handler.log_error = MagicMock()
+        with patch.object(
+            BaseHTTPRequestHandler, "handle_one_request", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                LLMBridgeHandler.handle_one_request(handler)
+
 
 class ServerSettingsTests(unittest.TestCase):
     def setUp(self):
         self._routes = {
             "nemotron": ModelRoute("http://upstream.test/v1", model="nvidia/nemotron")
         }
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
 
     def _load(self, env):
+        env = {"LLMBRIDGE_LEDGER_PATH": str(Path(self._tmp.name) / "generations"), **env}
         with patch("llmbridge.server.load_model_routes", return_value=self._routes):
             with patch.dict(os.environ, env, clear=True):
                 return load_server_settings()
@@ -761,6 +846,7 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertEqual(settings.port, 8787)
         self.assertIsNone(settings.client_api_key)
         self.assertIsNotNone(settings.work_tracker)
+        self.assertIsNotNone(settings.ledger)
 
     def test_reads_host_port_and_client_key(self):
         settings = self._load(
@@ -779,6 +865,19 @@ class ServerSettingsTests(unittest.TestCase):
             with self.subTest(value=value):
                 settings = self._load({"LLMBRIDGE_TRACK_INTERRUPTED": value})
                 self.assertIsNone(settings.work_tracker)
+
+    def test_generation_tracking_can_be_disabled(self):
+        for value in ("0", "false", "no", "off"):
+            with self.subTest(value=value):
+                settings = self._load({"LLMBRIDGE_TRACK_GENERATIONS": value})
+                self.assertIsNone(settings.ledger)
+
+    def test_custom_ledger_path_is_used(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger"
+            settings = self._load({"LLMBRIDGE_LEDGER_PATH": str(path)})
+            self.assertIsNotNone(settings.ledger)
+            self.assertEqual(settings.ledger.root, path)
 
     def test_custom_partial_work_path_is_used(self):
         with TemporaryDirectory() as directory:
@@ -1202,6 +1301,40 @@ class ResumeInterruptedTests(unittest.TestCase):
         )
         self.assertEqual(forwarded["stream"], False)
         self.assertFalse(self.state_path.exists())
+
+    def test_resume_replays_full_recorded_conversation(self):
+        history = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"},
+        ]
+        self.tracker.save(
+            prompt="second",
+            model_name="nemotron",
+            system="be terse",
+            partial_output="half",
+            max_tokens=256,
+            request={
+                "messages": history,
+                "system": "be terse",
+                "tools": [{"name": "search", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "auto"},
+            },
+        )
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch(
+                "llmbridge.server.urlopen", return_value=self._ok_response()
+            ) as call:
+                with urlopen(self._resume({})) as response:
+                    self.assertEqual(response.status, 200)
+
+        forwarded = json.loads(call.call_args.args[0].data)
+        roles = [message["role"] for message in forwarded["messages"]]
+        # system + full history + the replayed partial assistant turn
+        self.assertEqual(roles, ["system", "user", "assistant", "user", "assistant"])
+        self.assertEqual(forwarded["messages"][-1]["content"], "half")
+        self.assertIn("tools", forwarded)
+        self.assertEqual(forwarded["tool_choice"], "auto")
 
     def test_resume_accepts_an_explicit_model_and_max_tokens(self):
         self.tracker.save(

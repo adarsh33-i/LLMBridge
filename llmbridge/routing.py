@@ -43,7 +43,8 @@ class ModelRoute:
         value = os.environ.get(self.api_key_env)
         if not value:
             raise RoutingError(
-                f"Environment variable {self.api_key_env} is required for this model"
+                f"Environment variable {self.api_key_env} is required for this model. "
+                f"Set it with `export {self.api_key_env}=...` or run `llmbridge setup`."
             )
         return value
 
@@ -147,9 +148,37 @@ def _validate_fallback_targets(routes: dict[str, ModelRoute]) -> None:
                 )
 
 
+def user_config_path() -> Path:
+    """The per-user config location, honouring ``XDG_CONFIG_HOME``."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "llmbridge" / "llmbridge.toml"
+
+
+def config_search_paths() -> list[Path]:
+    """Ordered candidate config locations.
+
+    An explicit path (argument or ``LLMBRIDGE_CONFIG``) is authoritative on its
+    own. Otherwise the working directory wins over the per-user config, so a
+    project-local file still takes precedence once the user has run
+    ``llmbridge setup``.
+    """
+    env_path = os.environ.get("LLMBRIDGE_CONFIG")
+    if env_path:
+        return [Path(env_path)]
+    return [Path("llmbridge.toml"), user_config_path()]
+
+
+def discover_config_path() -> Path | None:
+    """Return the first existing config file, or ``None``."""
+    return next((path for path in config_search_paths() if path.is_file()), None)
+
+
 def load_model_routes(config_path: str | None = None) -> dict[str, ModelRoute]:
-    path = Path(config_path or os.environ.get("LLMBRIDGE_CONFIG", "llmbridge.toml"))
-    if path.is_file():
+    candidates = [Path(config_path)] if config_path else config_search_paths()
+    found = next((path for path in candidates if path.is_file()), None)
+    if found is not None:
+        path = found
         try:
             with path.open("rb") as config_file:
                 config = tomllib.load(config_file)
@@ -168,9 +197,12 @@ def load_model_routes(config_path: str | None = None) -> dict[str, ModelRoute]:
 
     base_url = os.environ.get("LLMBRIDGE_UPSTREAM_BASE_URL")
     if not base_url:
+        searched = ", ".join(str(path) for path in candidates)
         raise RoutingError(
+            f"No model routing config found (looked in: {searched}). "
             "Configure [models.<alias>] in llmbridge.toml or set "
-            "LLMBRIDGE_UPSTREAM_BASE_URL"
+            "LLMBRIDGE_UPSTREAM_BASE_URL. Run `llmbridge setup` for guided "
+            "configuration, or `llmbridge init` to write a starter file."
         )
     upstream_model = os.environ.get("LLMBRIDGE_UPSTREAM_MODEL")
     api_key_env = (

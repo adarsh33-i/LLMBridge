@@ -1,3 +1,10 @@
+# LLMBridge routing configuration.
+#
+# Durable Generations (inspecting/forking past requests) is controlled by the
+# environment, not this file:
+#   LLMBRIDGE_TRACK_GENERATIONS=1            # record every generation (default on)
+#   LLMBRIDGE_LEDGER_PATH=.llmbridge/generations
+
 [models.nemotron-local]
 base_url = "http://127.0.0.1:11434/v1"
 model = "nemotron"

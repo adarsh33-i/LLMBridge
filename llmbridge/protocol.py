@@ -844,7 +844,7 @@ def anthropic_to_openai(
     if cache_control not in ("strip", "passthrough"):
         raise ProtocolError("cache_control mode must be 'strip' or 'passthrough'")
     if not preserve_cache_control and _strip_unsupported_cache_control(request):
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Anthropic cache_control metadata was ignored; prompt caching is disabled"
         )
     if supports_images is False and _contains_content_type(request, {"image"}):

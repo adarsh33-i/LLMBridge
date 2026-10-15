@@ -213,6 +213,51 @@ class WorkTrackerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             tracker.save_interrupted()
 
+    def test_clear_if_matches_clears_matching_prompt(self):
+        tracker = self._tracker()
+        tracker.save(prompt="Hello", model_name="m")
+        self.assertTrue(tracker.clear_if_matches("Hello"))
+        self.assertFalse(self.path.exists())
+
+    def test_clear_if_matches_keeps_other_prompt(self):
+        tracker = self._tracker()
+        tracker.save(prompt="Hello", model_name="m")
+        self.assertFalse(tracker.clear_if_matches("Other"))
+        self.assertTrue(self.path.exists())
+        self.assertEqual(self._tracker().load_state()["prompt"], "Hello")
+
+    def test_clear_if_matches_without_file_returns_false(self):
+        self.assertFalse(self._tracker().clear_if_matches("Hello"))
+
+    def test_clear_if_matches_tolerates_corrupt_state(self):
+        self.path.write_text("{ not json", encoding="utf-8")
+        self.assertFalse(self._tracker().clear_if_matches("Hello"))
+        self.assertTrue(self.path.exists())
+
+    def test_save_persists_replayable_request(self):
+        tracker = self._tracker()
+        request = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "search"}],
+            "tool_choice": {"type": "auto"},
+        }
+        tracker.save(prompt="hi", model_name="m", request=request)
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["request"], request)
+
+    def test_start_tracking_persists_replayable_request(self):
+        tracker = self._tracker()
+        request = {"messages": [{"role": "user", "content": "hi"}]}
+        tracker.start_tracking(prompt="hi", model_name="m", request=request)
+        tracker.save_interrupted()
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["request"], request)
+
+    def test_replayable_request_defaults_to_none(self):
+        tracker = self._tracker()
+        tracker.save(prompt="hi", model_name="m")
+        self.assertIsNone(self._tracker().load_state()["request"])
+
     def test_load_state_returns_none_for_non_dict_json(self):
         for content in ("[1, 2, 3]", "42", '"a string"', "null"):
             self.path.write_text(content, encoding="utf-8")

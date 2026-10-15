@@ -289,7 +289,7 @@ class ProtocolTests(unittest.TestCase):
             ],
         }
 
-        with self.assertLogs("llmbridge.protocol", level="WARNING") as logs:
+        with self.assertLogs("llmbridge.protocol", level="DEBUG") as logs:
             translated = anthropic_to_openai(request)
 
         self.assertIn("prompt caching is disabled", logs.output[0])
