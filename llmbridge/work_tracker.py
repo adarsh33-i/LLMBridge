@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterator, Optional, List
 
-if os.name == "nt":
+if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
     import msvcrt
 else:
     import fcntl
@@ -78,7 +78,7 @@ def _exclusive_lock(lock_path: Path) -> Iterator[None]:
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+") as lock_file:
-        if os.name == "nt":
+        if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
             lock_file.seek(0)
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
             try:

@@ -2,6 +2,7 @@ import hmac
 import ipaddress
 import json
 import os
+from dataclasses import dataclass
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -22,6 +23,12 @@ from .work_tracker import WorkTracker
 # overloaded backend, or a transient server fault — i.e. work worth resuming
 # with a different model rather than a client mistake.
 _RESUMABLE_HTTP_STATUS = frozenset({402, 403, 408, 429, 500, 502, 503, 504, 529})
+
+# Bound how much we will ever buffer from a single upstream reply, and how long
+# a client socket may stay idle mid-request, so a misbehaving peer cannot
+# exhaust memory or tie up a worker thread indefinitely.
+_MAX_UPSTREAM_RESPONSE_BYTES = 32 * 1024 * 1024
+_CLIENT_SOCKET_TIMEOUT_SECONDS = 300
 
 
 def _truthy(value: str | None) -> bool:
@@ -62,6 +69,16 @@ def _extract_prompt_and_system(body: dict[str, Any]) -> tuple[str, str | None]:
                 if prompt:
                     break
     return prompt, system_text
+
+
+def _read_bounded(stream: Any, limit: int) -> bytes:
+    """Read an upstream body, refusing to buffer more than ``limit`` bytes."""
+    data = stream.read(limit + 1)
+    if data is None:
+        return b""
+    if len(data) > limit:
+        raise ProtocolError("Upstream response exceeded the size limit")
+    return data
 
 
 def _sse_event_data(event: bytes) -> dict[str, Any] | None:
@@ -155,18 +172,15 @@ def _is_loopback_host(host: str) -> bool:
 def _validate_listener_auth(host: str, client_api_key: str | None) -> None:
     if _is_loopback_host(host):
         return
-    if client_api_key is not None and len(client_api_key) < 32:
-        raise ValueError(
+    if client_api_key is None:
+        raise SystemExit(
+            "LLMBRIDGE_API_KEY is required when binding to a non-loopback "
+            "address; set it to a secret of at least 32 characters"
+        )
+    if len(client_api_key) < 32:
+        raise SystemExit(
             "LLMBRIDGE_API_KEY must be at least 32 characters for non-loopback "
             "listeners"
-        )
-    if client_api_key is None and not _is_loopback_host(host):
-        import warnings
-        warnings.warn(
-            "LLMBRIDGE_API_KEY not set and host is not loopback; "
-            "anyone can connect and use your upstream API keys",
-            RuntimeWarning,
-            stacklevel=2,
         )
 
 
@@ -187,6 +201,7 @@ class LLMBridgeServer(ThreadingHTTPServer):
 
 class LLMBridgeHandler(BaseHTTPRequestHandler):
     server_version = "LLMBridge/0.1"
+    timeout = _CLIENT_SOCKET_TIMEOUT_SECONDS
 
     def _models_response(self) -> dict[str, Any]:
         routes = self.server.model_routes
@@ -294,7 +309,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                         max_tokens=body.get("max_tokens"),
                     )
                     return
-                response = json.loads(upstream.read())
+                response = json.loads(_read_bounded(upstream, _MAX_UPSTREAM_RESPONSE_BYTES))
             anthropic_response = openai_to_anthropic(response, model or payload["model"])
             self._clear_interrupted_on_match(tracker, prompt)
             self._send_json(200, anthropic_response)
@@ -350,8 +365,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 progress_percent=progress,
                 partial_output=partial_output,
             )
-        except Exception:
-            self.log_error("Could not record interrupted work")
+        except Exception as error:
+            self.log_error("Could not record interrupted work: %s", error)
 
     def _clear_interrupted_on_match(self, tracker: WorkTracker | None, prompt: str) -> None:
         """Clear a saved interruption once the same prompt completes successfully."""
@@ -359,13 +374,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             return
         try:
             state = tracker.load_state()
-        except Exception:
+        except Exception as error:
+            self.log_error("Could not read interrupted work before clearing: %s", error)
             return
         if isinstance(state, dict) and state.get("prompt") == prompt:
             try:
                 tracker.clear_state()
-            except Exception:
-                self.log_error("Could not clear completed interrupted work")
+            except Exception as error:
+                self.log_error("Could not clear completed interrupted work: %s", error)
 
     def _count_tokens(self) -> None:
         try:
@@ -469,6 +485,19 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 self.log_error("Client disconnected during streaming response")
+                partial_output = "".join(partial_chunks)
+                if partial_output:
+                    self._save_interrupted(
+                        tracker,
+                        prompt,
+                        model,
+                        system,
+                        "Client disconnected during streaming response",
+                        progress=_stream_progress(
+                            partial_output, reported_tokens, max_tokens
+                        ),
+                        partial_output=partial_output,
+                    )
                 return
 
     def _authenticate_client(self) -> bool:
@@ -505,7 +534,19 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         super().log_message(format_string, *args)
 
 
-def main() -> None:
+@dataclass(frozen=True)
+class ServerSettings:
+    """Resolved server configuration derived from the environment."""
+
+    host: str
+    port: int
+    client_api_key: str | None
+    model_routes: dict[str, ModelRoute]
+    work_tracker: WorkTracker | None
+
+
+def load_server_settings() -> "ServerSettings":
+    """Resolve listener, routing, and interrupted-work settings from the environment."""
     host = os.environ.get("LLMBRIDGE_HOST", "127.0.0.1")
     port = int(os.environ.get("LLMBRIDGE_PORT", "8787"))
     client_api_key = os.environ.get("LLMBRIDGE_API_KEY") or None
@@ -519,10 +560,25 @@ def main() -> None:
         work_tracker = WorkTracker(
             storage_path=os.environ.get("LLMBRIDGE_PARTIAL_WORK_PATH") or None
         )
-    server = LLMBridgeServer(
-        (host, port), LLMBridgeHandler, model_routes, client_api_key, work_tracker
+    return ServerSettings(
+        host=host,
+        port=port,
+        client_api_key=client_api_key,
+        model_routes=model_routes,
+        work_tracker=work_tracker,
     )
-    print(f"LLMBridge listening on http://{host}:{port}")
+
+
+def main() -> None:  # pragma: no cover - process entrypoint, blocks in serve_forever
+    settings = load_server_settings()
+    server = LLMBridgeServer(
+        (settings.host, settings.port),
+        LLMBridgeHandler,
+        settings.model_routes,
+        settings.client_api_key,
+        settings.work_tracker,
+    )
+    print(f"LLMBridge listening on http://{settings.host}:{settings.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

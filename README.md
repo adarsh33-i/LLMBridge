@@ -112,7 +112,7 @@ OpenAI-compatible Chat Completions calls. This is not full Anthropic API parity.
 | --- | --- |
 | Messages | System text, user/assistant text, and supported content blocks are translated. |
 | Images | URL and base64 image blocks are translated to OpenAI image content; actual support depends on the upstream provider and model. |
-| Documents | Text, base64, public HTTP(S) URL sources, local file references, and Anthropic Files API IDs are converted to text. Remote downloads are limited to 10 MiB. File IDs require an Anthropic API key; local paths require configured allowlisted roots. |
+| Documents | Text, base64, public HTTP(S) URL sources, local file references, and Anthropic Files API IDs are converted to text. Remote downloads are limited to 10 MiB over standard ports. File IDs require an Anthropic API key; local paths require configured allowlisted roots. |
 | Tools | Tool definitions, tool choices, tool results, and upstream tool calls are translated to/from function-calling format. Provider/model behavior may differ. |
 | Streaming | Basic OpenAI-style SSE chunks are translated into Anthropic-style events. Unknown upstream finish reasons are rejected; this is not full Anthropic streaming parity. |
 | Token counting | `/v1/messages/count_tokens` returns an estimate using a route-configured tiktoken encoding or a character-based fallback. It may differ from the upstream model's exact count. |
@@ -127,9 +127,9 @@ Local file references are disabled unless one or more trusted directories are
 configured in `LLMBRIDGE_DOCUMENT_ROOTS`, separated by the platform path
 separator (`:` on macOS/Linux, `;` on Windows). Resolved paths must remain
 within those roots, including after symlink resolution. URL documents must use
-HTTP(S), resolve only to public IP addresses, and are revalidated and pinned
-to the validated address at each redirect. Avoid allowing untrusted clients
-to submit document references.
+HTTP(S) on the standard ports (80/443), resolve only to public IP addresses, and
+are revalidated and pinned to the validated addresses at each redirect. Avoid
+allowing untrusted clients to submit document references.
 
 **Note:** Prompt caching is not provided: Anthropic `cache_control` metadata is
 removed with a warning, and requests continue without caching. Remaining

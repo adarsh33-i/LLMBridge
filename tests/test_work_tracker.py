@@ -302,6 +302,23 @@ class WorkTrackerTests(unittest.TestCase):
         tracker = WorkTracker(storage_path=str(self.path), namespace="ignored")
         self.assertEqual(tracker.storage_path, self.path)
 
+    def test_default_storage_path_is_cwd_partial_work(self):
+        with TemporaryDirectory() as directory:
+            cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                tracker = WorkTracker()
+                self.assertEqual(tracker.storage_path, Path(".partial_work.json"))
+            finally:
+                os.chdir(cwd)
+
+    def test_update_progress_coerces_non_string_partial_output(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.update_progress(progress_percent=10.0, partial_output=42)  # type: ignore[arg-type]
+        tracker.save_interrupted()
+        self.assertEqual(self._tracker().load_state()["partial_output"], "")
+
     def test_state_file_is_locked_during_save(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
@@ -399,6 +416,14 @@ class WorkTrackerTests(unittest.TestCase):
         tracker.save_interrupted()
         self.assertNotIn("Partial output:", self._tracker().get_progress_summary())
 
+    def test_get_progress_summary_survives_unparseable_progress(self):
+        self.path.write_text(
+            '{"prompt": "p", "progress_percent": "not-a-number"}',
+            encoding="utf-8",
+        )
+        summary = self._tracker().get_progress_summary()
+        self.assertIn("0.0%", summary)
+
     def test_failed_save_cleans_up_temp_file(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
@@ -408,6 +433,16 @@ class WorkTrackerTests(unittest.TestCase):
         leftovers = [p.name for p in self.path.parent.iterdir() if p.name.endswith(".tmp")]
         self.assertEqual(leftovers, [])
         self.assertFalse(self.path.exists())
+
+    def test_failed_save_tolerates_cleanup_failure(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        with (
+            mock.patch("llmbridge.work_tracker.json.dump", side_effect=ValueError("boom")),
+            mock.patch("llmbridge.work_tracker.os.unlink", side_effect=OSError("locked")),
+        ):
+            with self.assertRaises(ValueError):
+                tracker.save_interrupted()
 
     def test_load_state_returns_none_on_oserror(self):
         self.path.write_text('{"prompt": "x"}', encoding="utf-8")
@@ -425,8 +460,11 @@ class WorkTrackerTests(unittest.TestCase):
         lock_path = self.path.with_name(self.path.name + ".lock")
         guard = threading.Lock()
         state = {"active": 0, "max_active": 0}
+        workers = 5
+        start = threading.Barrier(workers)
 
         def worker():
+            start.wait()
             with _exclusive_lock(lock_path):
                 with guard:
                     state["active"] += 1
@@ -435,7 +473,7 @@ class WorkTrackerTests(unittest.TestCase):
                 with guard:
                     state["active"] -= 1
 
-        threads = [threading.Thread(target=worker) for _ in range(5)]
+        threads = [threading.Thread(target=worker) for _ in range(workers)]
         for thread in threads:
             thread.start()
         for thread in threads:

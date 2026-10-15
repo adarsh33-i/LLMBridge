@@ -7,11 +7,11 @@ from urllib.parse import urlparse
 
 try:
     import tomllib
-except ImportError:
+except ImportError:  # pragma: no cover - Python < 3.11 only
     # Python < 3.11 fallback
     try:
         import tomli as tomllib  # type: ignore[assignment]
-    except ImportError:  # pragma: no cover
+    except ImportError:
         raise ImportError(
             "Cannot parse TOML config: install `tomli` or use Python 3.11+"
         )

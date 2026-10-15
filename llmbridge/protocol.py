@@ -15,7 +15,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -32,6 +32,12 @@ class ProtocolError(ValueError):
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _env_enabled(name: str) -> bool:
+    """Treat common falsey spellings (0/false/no/off) as disabled."""
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _strip_cache_control_from_blocks(blocks: Any) -> bool:
@@ -102,14 +108,16 @@ _TEXT_DOCUMENT_TYPES = {
 }
 _MAX_OFFICE_DOCUMENT_BYTES = 25 * 1024 * 1024
 _MAX_REMOTE_DOCUMENT_BYTES = 10 * 1024 * 1024
+_MAX_STREAM_LINE_BYTES = 4 * 1024 * 1024
 _MAX_URL_REDIRECTS = 5
+_ALLOWED_REMOTE_PORTS = frozenset({80, 443})
 _MAX_OCR_PAGES = 10
 _MAX_OCR_PIXELS = 20_000_000
 _OCR_PAGE_TIMEOUT_SECONDS = 20
 _OCR_DOCUMENT_TIMEOUT_SECONDS = 90
 
 
-def _validate_public_http_url(url: str) -> tuple[Any, str, int]:
+def _validate_public_http_url(url: str) -> tuple[Any, list[str], int]:
     try:
         parsed = urlparse(url)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -122,6 +130,8 @@ def _validate_public_http_url(url: str) -> tuple[Any, str, int]:
         or parsed.password is not None
     ):
         raise ProtocolError("URL documents must use an HTTP(S) URL without credentials")
+    if port not in _ALLOWED_REMOTE_PORTS:
+        raise ProtocolError("URL documents may only use standard HTTP(S) ports")
     try:
         addresses = [
             ipaddress.ip_address(result[4][0])
@@ -135,41 +145,56 @@ def _validate_public_http_url(url: str) -> tuple[Any, str, int]:
         raise ProtocolError("Could not resolve the URL document host") from error
     if not addresses or any(not address.is_global for address in addresses):
         raise ProtocolError("URL documents may only target public internet addresses")
-    return parsed, str(addresses[0]), port
+    return parsed, [str(address) for address in addresses], port
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host: str, port: int, address: str) -> None:
+    def __init__(self, host: str, port: int, addresses: list[str]) -> None:
         super().__init__(host, port, timeout=30)
-        self.address = address
+        self.addresses = addresses
 
     def connect(self) -> None:
-        self.sock = socket.create_connection(
-            (self.address, self.port), self.timeout, self.source_address
+        self.sock = _connect_to_pinned_address(
+            self.addresses, self.port, self.timeout, self.source_address
         )
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host: str, port: int, address: str) -> None:
+    def __init__(self, host: str, port: int, addresses: list[str]) -> None:
         super().__init__(host, port, timeout=30, context=ssl.create_default_context())
-        self.address = address
+        self.addresses = addresses
 
     def connect(self) -> None:
-        raw_socket = socket.create_connection(
-            (self.address, self.port), self.timeout, self.source_address
+        raw_socket = _connect_to_pinned_address(
+            self.addresses, self.port, self.timeout, self.source_address
         )
         self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
+def _connect_to_pinned_address(
+    addresses: list[str], port: int, timeout: Any, source_address: Any
+) -> socket.socket:
+    """Connect to the first resolved address that accepts a connection."""
+    last_error: OSError | None = None
+    for address in addresses:
+        try:
+            return socket.create_connection((address, port), timeout, source_address)
+        except OSError as error:
+            last_error = error
+    if last_error is not None:
+        raise last_error
+    raise OSError("No addresses available for the URL document host")
+
+
 def _fetch_remote_document(url: str) -> tuple[bytes, str | None]:
     for redirect_count in range(_MAX_URL_REDIRECTS + 1):
-        parsed, address, port = _validate_public_http_url(url)
+        parsed, addresses, port = _validate_public_http_url(url)
         connection_type = (
             _PinnedHTTPSConnection
             if parsed.scheme == "https"
             else _PinnedHTTPConnection
         )
-        connection = connection_type(parsed.hostname, port, address)
+        connection = connection_type(parsed.hostname, port, addresses)
         path = parsed.path or "/"
         if parsed.query:
             path += f"?{parsed.query}"
@@ -192,10 +217,17 @@ def _fetch_remote_document(url: str) -> tuple[bytes, str | None]:
                     f"URL document server returned HTTP {response.status}"
                 )
             content_length = response.getheader("Content-Length")
-            if content_length and int(content_length) > _MAX_REMOTE_DOCUMENT_BYTES:
-                raise ProtocolError(
-                    "Remote document exceeds the 10 MiB download limit"
-                )
+            if content_length:
+                try:
+                    declared_length = int(content_length)
+                except ValueError as error:
+                    raise ProtocolError(
+                        "URL document returned an invalid Content-Length header"
+                    ) from error
+                if declared_length > _MAX_REMOTE_DOCUMENT_BYTES:
+                    raise ProtocolError(
+                        "Remote document exceeds the 10 MiB download limit"
+                    )
             data = response.read(_MAX_REMOTE_DOCUMENT_BYTES + 1)
             if len(data) > _MAX_REMOTE_DOCUMENT_BYTES:
                 raise ProtocolError(
@@ -430,7 +462,9 @@ def _office_document_text(data: bytes, document_type: str) -> str:
         ) from error
 
 
-def _ocr_pdf_page(data: bytes, page_number: int, deadline: float) -> str:
+def _ocr_pdf_page(  # pragma: no cover - requires the optional PyMuPDF/Tesseract extra
+    data: bytes, page_number: int, deadline: float
+) -> str:
     try:
         import pymupdf
     except ImportError as error:
@@ -486,7 +520,7 @@ def _convert_document_bytes(data: bytes, media_type: str) -> str:
             if reader.is_encrypted:
                 raise ProtocolError("Encrypted PDF documents are not supported")
             pages = []
-            ocr_enabled = os.environ.get("LLMBRIDGE_ENABLE_OCR") == "1"
+            ocr_enabled = _env_enabled("LLMBRIDGE_ENABLE_OCR")
             ocr_count = 0
             deadline = time.monotonic() + _OCR_DOCUMENT_TIMEOUT_SECONDS
             for page_number, page in enumerate(reader.pages):
@@ -496,12 +530,6 @@ def _convert_document_bytes(data: bytes, media_type: str) -> str:
                     if ocr_count > _MAX_OCR_PAGES:
                         raise ProtocolError(
                             f"PDF OCR is limited to {_MAX_OCR_PAGES} scanned pages"
-                        )
-                    if not os.environ.get("LLMBRIDGE_ENABLE_OCR"):
-                        raise ProtocolError(
-                            "PDF OCR is enabled but LLMBRIDGE_ENABLE_OCR is not set; "
-                            "install LLMBridge with its OCR extra or set "
-                            "LLMBRIDGE_ENABLE_OCR=1 to enable"
                         )
                     page_text = _ocr_pdf_page(data, page_number, deadline)
                 pages.append(page_text)
@@ -1075,6 +1103,29 @@ def openai_to_anthropic(
     }
 
 
+def _iter_stream_lines(stream: Any, limit: int) -> Iterator[bytes]:
+    """Yield upstream SSE lines while bounding how much a single line may buffer.
+
+    Real HTTP responses support ``readline(size)`` so an oversized line is
+    rejected before it can be fully buffered; in-memory iterables (used by
+    tests) fall back to a post-hoc length check.
+    """
+    readline = getattr(stream, "readline", None)
+    if callable(readline):
+        while True:
+            line = readline(limit + 1)
+            if not line:
+                return
+            if len(line) > limit:
+                raise ProtocolError("Upstream streaming event exceeded the size limit")
+            yield line
+        return
+    for line in stream:
+        if len(line) > limit:
+            raise ProtocolError("Upstream streaming event exceeded the size limit")
+        yield line
+
+
 def stream_events(response_lines: Any, requested_model: str):
     message_id = f"msg_{uuid4().hex}"
     yield _sse(
@@ -1099,7 +1150,7 @@ def stream_events(response_lines: Any, requested_model: str):
     pending_tool_arguments: dict[int, list[str]] = {}
     usage: dict[str, Any] = {}
     finish_reason: str | None = None
-    for raw_line in response_lines:
+    for raw_line in _iter_stream_lines(response_lines, _MAX_STREAM_LINE_BYTES):
         try:
             line = raw_line.decode("utf-8").strip()
         except UnicodeDecodeError as error:

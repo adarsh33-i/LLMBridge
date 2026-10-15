@@ -12,6 +12,8 @@ from zipfile import ZipFile
 
 from llmbridge.protocol import (
     ProtocolError,
+    _connect_to_pinned_address,
+    _env_enabled,
     _ocr_pdf_page,
     anthropic_to_openai,
     openai_to_anthropic,
@@ -393,6 +395,125 @@ class ProtocolTests(unittest.TestCase):
                     ],
                 },
                 supports_images=False,
+            )
+
+    def test_translates_url_image_block(self):
+        request = anthropic_to_openai(
+            {
+                "model": "client-model",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "url",
+                                    "url": "https://example.test/image.png",
+                                },
+                            },
+                            {"type": "text", "text": "What is this?"},
+                        ],
+                    }
+                ],
+            }
+        )
+
+        content = request["messages"][0]["content"]
+        self.assertEqual(
+            content[0],
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/image.png"},
+            },
+        )
+        self.assertEqual(content[1], {"type": "text", "text": "What is this?"})
+
+    def test_translates_base64_image_block(self):
+        encoded = base64.b64encode(b"\x89PNG").decode()
+        request = anthropic_to_openai(
+            {
+                "model": "client-model",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": encoded,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            request["messages"][0]["content"][0],
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{encoded}",
+                },
+            },
+        )
+
+    def test_rejects_image_source_that_is_not_url_or_base64(self):
+        with self.assertRaisesRegex(ProtocolError, "URL or base64"):
+            anthropic_to_openai(
+                {
+                    "model": "client-model",
+                    "max_tokens": 100,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {"type": "file", "file_id": "abc"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    def test_rejects_empty_image_url(self):
+        with self.assertRaisesRegex(ProtocolError, "non-empty string"):
+            anthropic_to_openai(
+                {
+                    "model": "client-model",
+                    "max_tokens": 100,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "source": {"type": "url", "url": ""}}
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    def test_rejects_non_object_image_source(self):
+        with self.assertRaisesRegex(ProtocolError, "Image source must be an object"):
+            anthropic_to_openai(
+                {
+                    "model": "client-model",
+                    "max_tokens": 100,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image", "source": "nope"}],
+                        }
+                    ],
+                }
             )
 
     def test_rejects_tool_use_when_route_declares_no_tool_support(self):
@@ -956,7 +1077,7 @@ class ProtocolTests(unittest.TestCase):
                 }
             )
 
-        connection.assert_called_once_with("example.test", 80, "93.184.216.34")
+        connection.assert_called_once_with("example.test", 80, ["93.184.216.34"])
         mock_connection.request.assert_called_once_with(
             "GET", "/file.txt", headers={"Host": "example.test", "Connection": "close"}
         )
@@ -1033,6 +1154,196 @@ class ProtocolTests(unittest.TestCase):
                 )
 
         connection.assert_not_called()
+
+    def _url_document_request(self, url="http://example.test/file.txt"):
+        return {
+            "model": "client-model",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {"type": "url", "url": url},
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def _public_dns(self):
+        return [(2, 1, 6, "", ("93.184.216.34", 80))]
+
+    def test_follows_url_document_redirect(self):
+        redirect = MagicMock()
+        redirect.status = 302
+        redirect.getheader.return_value = "/final"
+        final = MagicMock()
+        final.status = 200
+        final.getheader.side_effect = lambda name, default=None: {
+            "Content-Type": "text/plain",
+            "Content-Length": None,
+        }.get(name, default)
+        final.read.return_value = b"Final body"
+        mock_connection = MagicMock()
+        mock_connection.getresponse.side_effect = [redirect, final]
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ) as connection,
+        ):
+            request = anthropic_to_openai(self._url_document_request())
+
+        self.assertEqual(connection.call_count, 2)
+        self.assertEqual(
+            mock_connection.request.call_args.args[1], "/final"
+        )
+        self.assertIn("Final body", request["messages"][0]["content"][0]["text"])
+
+    def test_rejects_url_document_redirect_without_location(self):
+        redirect = MagicMock()
+        redirect.status = 302
+        redirect.getheader.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.getresponse.return_value = redirect
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ),
+        ):
+            with self.assertRaisesRegex(ProtocolError, "redirect has no location"):
+                anthropic_to_openai(self._url_document_request())
+
+    def test_rejects_url_document_redirect_loop(self):
+        redirect = MagicMock()
+        redirect.status = 307
+        redirect.getheader.return_value = "/loop"
+        mock_connection = MagicMock()
+        mock_connection.getresponse.return_value = redirect
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ),
+        ):
+            with self.assertRaisesRegex(ProtocolError, "redirect limit"):
+                anthropic_to_openai(self._url_document_request())
+
+    def test_rejects_url_document_http_error_status(self):
+        response = MagicMock()
+        response.status = 500
+        response.getheader.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.getresponse.return_value = response
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ),
+        ):
+            with self.assertRaisesRegex(ProtocolError, "HTTP 500"):
+                anthropic_to_openai(self._url_document_request())
+
+    def test_rejects_url_document_by_content_length_header(self):
+        response = MagicMock()
+        response.status = 200
+        response.getheader.side_effect = lambda name, default=None: {
+            "Content-Length": str(20 * 1024 * 1024),
+        }.get(name, default)
+        mock_connection = MagicMock()
+        mock_connection.getresponse.return_value = response
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ),
+        ):
+            with self.assertRaisesRegex(ProtocolError, "10 MiB download limit"):
+                anthropic_to_openai(self._url_document_request())
+
+    def test_wraps_url_document_connection_errors(self):
+        mock_connection = MagicMock()
+        mock_connection.getresponse.side_effect = OSError("connection refused")
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ),
+        ):
+            with self.assertRaisesRegex(ProtocolError, "Could not fetch the URL document"):
+                anthropic_to_openai(self._url_document_request())
+
+    def test_rejects_url_document_on_nonstandard_port(self):
+        with patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()):
+            with self.assertRaisesRegex(ProtocolError, "standard HTTP"):
+                anthropic_to_openai(
+                    self._url_document_request("http://example.test:8080/file.txt")
+                )
+
+    def test_rejects_url_document_with_invalid_content_length(self):
+        response = MagicMock()
+        response.status = 200
+        response.getheader.side_effect = lambda name, default=None: {
+            "Content-Length": "not-a-number",
+        }.get(name, default)
+        mock_connection = MagicMock()
+        mock_connection.getresponse.return_value = response
+
+        with (
+            patch("llmbridge.protocol.socket.getaddrinfo", return_value=self._public_dns()),
+            patch(
+                "llmbridge.protocol._PinnedHTTPConnection",
+                return_value=mock_connection,
+            ),
+        ):
+            with self.assertRaisesRegex(ProtocolError, "invalid Content-Length"):
+                anthropic_to_openai(self._url_document_request())
+
+    def test_connect_to_pinned_address_falls_back_to_next_address(self):
+        connection = MagicMock()
+        with patch(
+            "llmbridge.protocol.socket.create_connection",
+            side_effect=[OSError("unreachable"), connection],
+        ):
+            result = _connect_to_pinned_address(
+                ["2001:db8::1", "93.184.216.34"], 80, 30, None
+            )
+        self.assertIs(result, connection)
+
+    def test_connect_to_pinned_address_raises_when_all_fail(self):
+        with patch(
+            "llmbridge.protocol.socket.create_connection",
+            side_effect=OSError("unreachable"),
+        ):
+            with self.assertRaisesRegex(OSError, "unreachable"):
+                _connect_to_pinned_address(["93.184.216.34"], 80, 30, None)
+
+    def test_env_enabled_accepts_common_truthy_spellings(self):
+        for value in ("1", "true", "TRUE", "yes", "on"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"LLMBRIDGE_TEST_FLAG": value}):
+                    self.assertTrue(_env_enabled("LLMBRIDGE_TEST_FLAG"))
+        for value in ("", "0", "false", "no", "off"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"LLMBRIDGE_TEST_FLAG": value}):
+                    self.assertFalse(_env_enabled("LLMBRIDGE_TEST_FLAG"))
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_env_enabled("LLMBRIDGE_TEST_FLAG"))
 
     def test_rejects_redirect_to_private_url_document_destination(self):
         response = MagicMock()
@@ -1372,6 +1683,114 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(tool_start["content_block"]["name"], "find")
         self.assertEqual(json.loads(partial_json), {"x": 1})
+
+    def _tool_choice_request(self, tool_choice):
+        return anthropic_to_openai(
+            {
+                "model": "client-model",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "find", "input_schema": {"type": "object"}}],
+                "tool_choice": tool_choice,
+            }
+        )
+
+    def test_translates_object_tool_choice_variants(self):
+        named = self._tool_choice_request({"type": "tool", "name": "find"})
+        self.assertEqual(
+            named["tool_choice"],
+            {"type": "function", "function": {"name": "find"}},
+        )
+        self.assertEqual(
+            self._tool_choice_request({"type": "any"})["tool_choice"], "required"
+        )
+        self.assertEqual(
+            self._tool_choice_request({"type": "auto"})["tool_choice"], "auto"
+        )
+
+    def test_translates_string_tool_choice(self):
+        for value in ("auto", "none", "required"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self._tool_choice_request(value)["tool_choice"], value
+                )
+
+    def test_rejects_tool_choice_requiring_a_name(self):
+        with self.assertRaisesRegex(ProtocolError, "requires a name"):
+            self._tool_choice_request({"type": "tool"})
+
+    def test_rejects_unknown_tool_choice_variants(self):
+        for value in ({"type": "whatever"}, "sometimes"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ProtocolError, "tool_choice"):
+                    self._tool_choice_request(value)
+
+    def test_reports_upstream_completion_tokens(self):
+        upstream_events = [
+            b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n',
+            b'data: {"choices":[],"usage":{"completion_tokens":7}}\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+        ]
+        events = b"".join(stream_events(upstream_events, "nemotron")).decode()
+        payloads = [
+            json.loads(line[6:])
+            for line in events.splitlines()
+            if line.startswith("data: ")
+        ]
+        message_delta = next(item for item in payloads if item.get("type") == "message_delta")
+        self.assertEqual(message_delta["usage"]["output_tokens"], 7)
+
+    def test_rejects_malformed_streaming_events(self):
+        cases = {
+            "non-UTF-8": b"data: \xff\xfe\n",
+            "invalid streaming event": b"data: not-json\n",
+            "must be a JSON object": b"data: [1, 2]\n",
+            "error during streaming": b'data: {"error": {"message": "boom"}}\n',
+            "usage must be an object": b'data: {"usage": 5}\n',
+            "choices must be a list": b'data: {"choices": {}}\n',
+            "choice must be an object": b'data: {"choices": [5]}\n',
+            "delta must be an object": b'data: {"choices": [{"delta": 5}]}\n',
+            "stream content must be text": b'data: {"choices": [{"delta": {"content": 5}}]}\n',
+            "tool_calls must be a list": b'data: {"choices": [{"delta": {"tool_calls": {}}}]}\n',
+            "tool call must be an object": b'data: {"choices": [{"delta": {"tool_calls": [5]}}]}\n',
+            "tool index must be non-negative": b'data: {"choices": [{"delta": {"tool_calls": [{"index": -1}]}}]}\n',
+            "tool function must be an object": b'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c", "function": 5}]}}]}\n',
+            "tool name must be text": b'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c", "function": {"name": 5}}]}}]}\n',
+            "tool id must be text": b'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": 5, "function": {"name": "f"}}]}}]}\n',
+            "tool arguments must be text": b'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c", "function": {"name": "f", "arguments": 5}}]}}]}\n',
+        }
+        for message, line in cases.items():
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ProtocolError, message):
+                    list(stream_events([line], "nemotron"))
+
+    def test_rejects_stream_with_incomplete_tool_metadata(self):
+        upstream_events = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"arguments":"{"}}]},"finish_reason":"tool_calls"}]}\n',
+        ]
+        with self.assertRaisesRegex(ProtocolError, "incomplete tool-call metadata"):
+            list(stream_events(upstream_events, "nemotron"))
+
+    def test_rejects_oversized_stream_line_from_iterable(self):
+        oversized = b"data: " + b"x" * 100 + b"\n"
+        with patch("llmbridge.protocol._MAX_STREAM_LINE_BYTES", 10):
+            with self.assertRaisesRegex(ProtocolError, "size limit"):
+                list(stream_events([oversized], "nemotron"))
+
+    def test_rejects_oversized_stream_line_from_readline_stream(self):
+        class _ReadlineStream:
+            def __init__(self):
+                self._sent = False
+
+            def readline(self, size=-1):
+                if self._sent:
+                    return b""
+                self._sent = True
+                return b"data: " + b"y" * 100 + b"\n"
+
+        with patch("llmbridge.protocol._MAX_STREAM_LINE_BYTES", 10):
+            with self.assertRaisesRegex(ProtocolError, "size limit"):
+                list(stream_events(_ReadlineStream(), "nemotron"))
 
 
 if __name__ == "__main__":

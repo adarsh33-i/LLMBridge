@@ -5,17 +5,19 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
-from llmbridge.routing import ModelRoute
+from llmbridge.routing import ModelRoute, RoutingError
 from llmbridge.server import (
     LLMBridgeHandler,
     LLMBridgeServer,
     _extract_prompt_and_system,
     _is_loopback_host,
     _validate_listener_auth,
+    load_server_settings,
 )
 from llmbridge.work_tracker import WorkTracker
 
@@ -30,8 +32,8 @@ class _UpstreamResponse:
     def __exit__(self, *_):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, size=-1):
+        return self.body[:size] if size is not None and size >= 0 else self.body
 
 
 class _TimedOutStream:
@@ -588,11 +590,205 @@ class InterruptedWorkTests(unittest.TestCase):
         LLMBridgeHandler._clear_interrupted_on_match(object(), self.tracker, "")
         self.assertTrue(self.state_path.exists())
 
+    def test_connection_error_records_interrupted_work(self):
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", side_effect=URLError("refused")):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        self.assertEqual(error.exception.code, 502)
+        error.exception.close()
+
+        _, state = self._get_interrupted()
+        self.assertEqual(state["error"], "Could not connect to the configured upstream")
+
+    def test_invalid_upstream_response_records_interrupted_work(self):
+        class _BadResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, size=-1):
+                return b"not json"
+
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=_BadResponse()):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        self.assertEqual(error.exception.code, 502)
+        error.exception.close()
+
+        _, state = self._get_interrupted()
+        self.assertTrue(state["error"])
+
+    def test_non_stream_timeout_records_interrupted_work(self):
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", side_effect=TimeoutError()):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post_message(body))
+        self.assertEqual(error.exception.code, 504)
+        error.exception.close()
+
+        _, state = self._get_interrupted()
+        self.assertEqual(state["error"], "Upstream request timed out")
+
+    def test_oversized_upstream_response_is_rejected(self):
+        body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
+        upstream_response = _UpstreamResponse(
+            {"id": "x", "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server._MAX_UPSTREAM_RESPONSE_BYTES", 5):
+                with patch("llmbridge.server.urlopen", return_value=upstream_response):
+                    with self.assertRaises(HTTPError) as error:
+                        urlopen(self._post_message(body))
+        self.assertEqual(error.exception.code, 502)
+        error.exception.close()
+
+        _, state = self._get_interrupted()
+        self.assertIn("size limit", state["error"])
+
+    def test_missing_interrupted_work_returns_404(self):
+        with self.assertRaises(HTTPError) as error:
+            urlopen(self._url("/v1/interrupted"))
+        self.assertEqual(error.exception.code, 404)
+        error.exception.close()
+
+    def test_delete_unknown_endpoint_returns_404(self):
+        with self.assertRaises(HTTPError) as error:
+            urlopen(Request(self._url("/v1/nope"), method="DELETE"))
+        self.assertEqual(error.exception.code, 404)
+        error.exception.close()
+
+    def test_delete_interrupted_requires_authentication(self):
+        self.server.client_api_key = "client-secret"
+        try:
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(self._url("/v1/interrupted"), method="DELETE"))
+            self.assertEqual(error.exception.code, 401)
+            error.exception.close()
+        finally:
+            self.server.client_api_key = None
+
+    def test_save_interrupted_swallows_tracker_failures(self):
+        handler = MagicMock()
+        tracker = MagicMock()
+        tracker.save.side_effect = OSError("disk")
+        LLMBridgeHandler._save_interrupted(handler, tracker, "p", "m", None, "boom")
+        handler.log_error.assert_called_once()
+
+    def test_clear_interrupted_ignores_load_failures(self):
+        handler = MagicMock()
+        tracker = MagicMock()
+        tracker.load_state.side_effect = OSError("disk")
+        LLMBridgeHandler._clear_interrupted_on_match(handler, tracker, "p")
+        tracker.clear_state.assert_not_called()
+
+    def test_clear_interrupted_logs_clear_failures(self):
+        handler = MagicMock()
+        tracker = MagicMock()
+        tracker.load_state.return_value = {"prompt": "p"}
+        tracker.clear_state.side_effect = OSError("disk")
+        LLMBridgeHandler._clear_interrupted_on_match(handler, tracker, "p")
+        handler.log_error.assert_called_once()
+
+    def test_clear_interrupted_ignores_missing_tracker(self):
+        handler = MagicMock()
+        LLMBridgeHandler._clear_interrupted_on_match(handler, None, "p")
+        handler.log_error.assert_not_called()
+
     def test_mismatched_prompt_does_not_clear_saved_work(self):
         self.tracker.save(prompt="Hello", model_name="nemotron")
         handler = MagicMock()
         LLMBridgeHandler._clear_interrupted_on_match(handler, self.tracker, "Other")
         self.assertTrue(self.state_path.exists())
+
+
+class StreamResponseUnitTests(unittest.TestCase):
+    def test_client_disconnect_persists_partial_output(self):
+        class _TextStream:
+            def __iter__(self):
+                yield b'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n'
+
+        handler = MagicMock()
+        handler.wfile.write.side_effect = [None, None, BrokenPipeError("client gone")]
+        LLMBridgeHandler._stream_response(
+            handler,
+            _TextStream(),
+            "nemotron",
+            MagicMock(),
+            "prompt",
+            None,
+            max_tokens=100,
+        )
+
+        handler._save_interrupted.assert_called_once()
+        _, kwargs = handler._save_interrupted.call_args
+        self.assertEqual(kwargs["partial_output"], "Hello")
+        self.assertGreater(kwargs["progress"], 0.0)
+
+    def test_handler_declares_client_socket_timeout(self):
+        self.assertEqual(LLMBridgeHandler.timeout, 300)
+
+
+class ServerSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self._routes = {
+            "nemotron": ModelRoute("http://upstream.test/v1", model="nvidia/nemotron")
+        }
+
+    def _load(self, env):
+        with patch("llmbridge.server.load_model_routes", return_value=self._routes):
+            with patch.dict(os.environ, env, clear=True):
+                return load_server_settings()
+
+    def test_defaults_to_loopback_and_enables_tracking(self):
+        settings = self._load({})
+        self.assertEqual(settings.host, "127.0.0.1")
+        self.assertEqual(settings.port, 8787)
+        self.assertIsNone(settings.client_api_key)
+        self.assertIsNotNone(settings.work_tracker)
+
+    def test_reads_host_port_and_client_key(self):
+        settings = self._load(
+            {
+                "LLMBRIDGE_HOST": "127.0.0.2",
+                "LLMBRIDGE_PORT": "9999",
+                "LLMBRIDGE_API_KEY": "x" * 32,
+            }
+        )
+        self.assertEqual(settings.host, "127.0.0.2")
+        self.assertEqual(settings.port, 9999)
+        self.assertEqual(settings.client_api_key, "x" * 32)
+
+    def test_tracking_can_be_disabled(self):
+        for value in ("0", "false", "no", "off"):
+            with self.subTest(value=value):
+                settings = self._load({"LLMBRIDGE_TRACK_INTERRUPTED": value})
+                self.assertIsNone(settings.work_tracker)
+
+    def test_custom_partial_work_path_is_used(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            settings = self._load({"LLMBRIDGE_PARTIAL_WORK_PATH": str(path)})
+            self.assertIsNotNone(settings.work_tracker)
+            self.assertEqual(settings.work_tracker.storage_path, path)
+
+    def test_non_loopback_without_key_exits(self):
+        with self.assertRaisesRegex(SystemExit, "LLMBRIDGE_API_KEY is required"):
+            self._load({"LLMBRIDGE_HOST": "0.0.0.0"})
+
+    def test_routing_error_becomes_system_exit(self):
+        with patch(
+            "llmbridge.server.load_model_routes", side_effect=RoutingError("bad config")
+        ):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(SystemExit, "bad config"):
+                    load_server_settings()
 
 
 class PromptExtractionTests(unittest.TestCase):
@@ -613,6 +809,66 @@ class PromptExtractionTests(unittest.TestCase):
         prompt, system = _extract_prompt_and_system({})
         self.assertEqual(prompt, "")
         self.assertIsNone(system)
+
+
+class CountTokensUnitTests(unittest.TestCase):
+    def _run(self, content_length, body=b""):
+        handler = MagicMock()
+        handler.headers = {"Content-Length": str(content_length)}
+        handler.rfile = io.BytesIO(body)
+        handler.server = SimpleNamespace(
+            model_routes={
+                "nemotron": ModelRoute("http://upstream.test/v1", model="nemotron")
+            }
+        )
+        LLMBridgeHandler._count_tokens(handler)
+        return handler
+
+    def test_rejects_body_outside_size_bounds(self):
+        for size in (0, 11 * 1024 * 1024):
+            with self.subTest(size=size):
+                handler = self._run(size)
+                handler._send_error.assert_called_once()
+                self.assertEqual(handler._send_error.call_args.args[0], 400)
+                self.assertIn("MiB", handler._send_error.call_args.args[2])
+
+    def test_rejects_malformed_body_variants(self):
+        cases = {
+            "must include a messages list": b"[1, 2]",
+            "model must be a non-empty string": b'{"model": 5, "messages": []}',
+        }
+        for message, body in cases.items():
+            with self.subTest(message=message):
+                handler = self._run(len(body), body)
+                handler._send_error.assert_called_once()
+                self.assertEqual(handler._send_error.call_args.args[0], 400)
+                self.assertIn(message, handler._send_error.call_args.args[2])
+
+    def test_rejects_invalid_json(self):
+        body = b"{oops"
+        handler = self._run(len(body), body)
+        self.assertEqual(handler._send_error.call_args.args[0], 400)
+
+    def test_rejects_empty_messages(self):
+        body = b'{"model": "nemotron"}'
+        handler = self._run(len(body), body)
+        self.assertEqual(handler._send_error.call_args.args[0], 400)
+
+    def test_rejects_unknown_model(self):
+        body = json.dumps({"model": "missing", "messages": []}).encode()
+        handler = self._run(len(body), body)
+        self.assertEqual(handler._send_error.call_args.args[0], 400)
+
+    def test_estimates_input_tokens(self):
+        body = json.dumps(
+            {"model": "nemotron", "messages": [{"role": "user", "content": "hello world"}]}
+        ).encode()
+        handler = self._run(len(body), body)
+        handler._send_error.assert_not_called()
+        handler._send_json.assert_called_once()
+        status, payload = handler._send_json.call_args.args
+        self.assertEqual(status, 200)
+        self.assertGreater(payload["input_tokens"], 0)
 
 
 if __name__ == "__main__":

@@ -6,5 +6,8 @@ venv/
 build/
 dist/
 .pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 llmbridge.toml
 .partial_work*.json
