@@ -30,6 +30,8 @@ class ModelRoute:
     supports_images: bool | None = None
     supports_tools: bool | None = None
     tokenizer_encoding: str | None = None
+    fallbacks: tuple[str, ...] = ()
+    cache_control: str = "strip"
 
     @property
     def completions_url(self) -> str:
@@ -44,6 +46,10 @@ class ModelRoute:
                 f"Environment variable {self.api_key_env} is required for this model"
             )
         return value
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        return self.cache_control == "passthrough"
 
 
 def _parse_route(alias: str, value: Any) -> ModelRoute:
@@ -91,14 +97,54 @@ def _parse_route(alias: str, value: Any) -> ModelRoute:
         raise RoutingError(
             f"Route {alias!r} tokenizer_encoding must be a supported tiktoken encoding"
         )
+    fallbacks = _parse_fallbacks(alias, value.get("fallbacks"))
+    cache_control = value.get("cache_control", "strip")
+    if cache_control not in ("strip", "passthrough"):
+        raise RoutingError(
+            f"Route {alias!r} cache_control must be 'strip' or 'passthrough'"
+        )
     return ModelRoute(
         base_url=base_url.rstrip("/"),
         model=model,
         api_key_env=api_key_env,
         reasoning_effort=reasoning_effort,
         tokenizer_encoding=tokenizer_encoding,
+        fallbacks=fallbacks,
+        cache_control=cache_control,
         **capabilities,
     )
+
+
+def _parse_fallbacks(alias: str, value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise RoutingError(
+            f"Route {alias!r} fallbacks must be a non-empty array of model aliases"
+        )
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise RoutingError(
+                f"Route {alias!r} fallbacks must contain non-empty model aliases"
+            )
+        if item == alias:
+            raise RoutingError(f"Route {alias!r} cannot fall back to itself")
+        if item in names:
+            raise RoutingError(f"Route {alias!r} lists duplicate fallback {item!r}")
+        names.append(item)
+    return tuple(names)
+
+
+def _validate_fallback_targets(routes: dict[str, ModelRoute]) -> None:
+    """Reject fallbacks that point at aliases the config never defines."""
+    for alias, route in routes.items():
+        for target in route.fallbacks:
+            if target not in routes:
+                raise RoutingError(
+                    f"Route {alias!r} falls back to unknown model {target!r}; "
+                    f"configured model aliases: {', '.join(sorted(routes))}"
+                )
 
 
 def load_model_routes(config_path: str | None = None) -> dict[str, ModelRoute]:
@@ -117,6 +163,7 @@ def load_model_routes(config_path: str | None = None) -> dict[str, ModelRoute]:
             if not isinstance(alias, str) or not alias.strip():
                 raise RoutingError("Model route aliases must be non-empty strings")
             routes[alias] = _parse_route(alias, value)
+        _validate_fallback_targets(routes)
         return routes
 
     base_url = os.environ.get("LLMBRIDGE_UPSTREAM_BASE_URL")

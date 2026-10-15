@@ -738,7 +738,7 @@ def _document_text(block: dict[str, Any]) -> str:
     return text
 
 
-def _text_content(content: Any) -> Any:
+def _text_content(content: Any, preserve_cache_control: bool = False) -> Any:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -779,9 +779,19 @@ def _text_content(content: Any) -> Any:
                     details.append(f'quoted text: "{cited_text}"')
                 if details:
                     text += "\n[Citation: " + "; ".join(details) + "]"
-            openai_content.append({"type": "text", "text": text})
+            openai_content.append(
+                _attach_cache_control(
+                    {"type": "text", "text": text}, block, preserve_cache_control
+                )
+            )
         elif block_type == "document":
-            openai_content.append({"type": "text", "text": _document_text(block)})
+            openai_content.append(
+                _attach_cache_control(
+                    {"type": "text", "text": _document_text(block)},
+                    block,
+                    preserve_cache_control,
+                )
+            )
         elif block_type == "image":
             source = block.get("source", {})
             if not isinstance(source, dict):
@@ -799,11 +809,24 @@ def _text_content(content: Any) -> Any:
             else:
                 raise ProtocolError("Image source must be a URL or base64 data")
             openai_content.append(
-                {"type": "image_url", "image_url": {"url": image_url}}
+                _attach_cache_control(
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    block,
+                    preserve_cache_control,
+                )
             )
         else:
             raise ProtocolError(f"Unsupported content block type: {block_type}")
     return openai_content
+
+
+def _attach_cache_control(
+    part: dict[str, Any], block: dict[str, Any], preserve: bool
+) -> dict[str, Any]:
+    """Carry an Anthropic cache breakpoint onto the translated upstream part."""
+    if preserve and "cache_control" in block:
+        part["cache_control"] = block["cache_control"]
+    return part
 
 
 def anthropic_to_openai(
@@ -812,11 +835,15 @@ def anthropic_to_openai(
     reasoning_effort: str | None = None,
     supports_images: bool | None = None,
     supports_tools: bool | None = None,
+    cache_control: str = "strip",
 ) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ProtocolError("Request body must be a JSON object")
     request = copy.deepcopy(request)
-    if _strip_unsupported_cache_control(request):
+    preserve_cache_control = cache_control == "passthrough"
+    if cache_control not in ("strip", "passthrough"):
+        raise ProtocolError("cache_control mode must be 'strip' or 'passthrough'")
+    if not preserve_cache_control and _strip_unsupported_cache_control(request):
         _LOGGER.warning(
             "Anthropic cache_control metadata was ignored; prompt caching is disabled"
         )
@@ -860,7 +887,11 @@ def anthropic_to_openai(
     if isinstance(system, str):
         openai_messages.append({"role": "system", "content": system})
     elif isinstance(system, list):
+        preserve_system_cache = preserve_cache_control and any(
+            isinstance(block, dict) and "cache_control" in block for block in system
+        )
         system_parts: list[str] = []
+        system_content: list[dict[str, Any]] = []
         for block in system:
             if not isinstance(block, dict):
                 raise ProtocolError("System content blocks must be objects")
@@ -869,14 +900,26 @@ def anthropic_to_openai(
                 text = block.get("text", "")
                 if not isinstance(text, str):
                     raise ProtocolError("Text content blocks need a text string")
-                system_parts.append(text)
             elif block_type == "document":
-                system_parts.append(_document_text(block))
+                text = _document_text(block)
             else:
                 raise ProtocolError(f"Unsupported system content block type: {block_type}")
-        system_text = "\n\n".join(system_parts)
-        if system_text:
-            openai_messages.append({"role": "system", "content": system_text})
+            system_parts.append(text)
+            if preserve_system_cache:
+                system_content.append(
+                    _attach_cache_control(
+                        {"type": "text", "text": text}, block, True
+                    )
+                )
+        if preserve_system_cache:
+            if system_content:
+                openai_messages.append(
+                    {"role": "system", "content": system_content}
+                )
+        else:
+            system_text = "\n\n".join(system_parts)
+            if system_text:
+                openai_messages.append({"role": "system", "content": system_text})
     elif system is not None:
         raise ProtocolError("system must be a string or list of text blocks")
 
@@ -901,7 +944,7 @@ def anthropic_to_openai(
                 raise ProtocolError("Content blocks must be objects")
             block_type = block.get("type")
             if block_type in ("text", "image", "document"):
-                text_blocks.extend(_text_content([block]))
+                text_blocks.extend(_text_content([block], preserve_cache_control))
             elif role == "assistant" and block_type == "tool_use":
                 tool_name = block.get("name")
                 tool_input = block.get("input", {})
@@ -929,7 +972,9 @@ def anthropic_to_openai(
                 is_error = block.get("is_error", False)
                 if not isinstance(is_error, bool):
                     raise ProtocolError("tool_result is_error must be a boolean")
-                tool_content = _text_content(block.get("content", ""))
+                tool_content = _text_content(
+                    block.get("content", ""), preserve_cache_control
+                )
                 if is_error:
                     if isinstance(tool_content, str):
                         tool_content = f"Tool returned an error:\n{tool_content}"
@@ -975,6 +1020,8 @@ def anthropic_to_openai(
         "max_tokens": request["max_tokens"],
         "stream": bool(request.get("stream", False)),
     }
+    if preserve_cache_control and "cache_control" in request:
+        payload["cache_control"] = request["cache_control"]
     if thinking is not None and thinking["type"] == "enabled":
         payload["reasoning_effort"] = reasoning_effort
     for key in ("temperature", "top_p"):
@@ -998,8 +1045,9 @@ def anthropic_to_openai(
                 or not isinstance(tool.get("input_schema", {}), dict)
             ):
                 raise ProtocolError("Each tool needs a name and object input_schema")
-        payload["tools"] = [
-            {
+        converted_tools: list[dict[str, Any]] = []
+        for tool in request["tools"]:
+            converted_tool: dict[str, Any] = {
                 "type": "function",
                 "function": {
                     "name": tool["name"],
@@ -1007,8 +1055,10 @@ def anthropic_to_openai(
                     "parameters": tool.get("input_schema", {}),
                 },
             }
-            for tool in request["tools"]
-        ]
+            if preserve_cache_control and "cache_control" in tool:
+                converted_tool["cache_control"] = tool["cache_control"]
+            converted_tools.append(converted_tool)
+        payload["tools"] = converted_tools
     tool_choice = request.get("tool_choice")
     if isinstance(tool_choice, dict):
         choice_type = tool_choice.get("type")
@@ -1144,6 +1194,7 @@ def stream_events(response_lines: Any, requested_model: str):
             },
         },
     )
+    yield _sse("ping", {"type": "ping"})
     open_blocks: set[int] = set()
     tool_ids: dict[int, str] = {}
     tool_names: dict[int, str] = {}
@@ -1274,12 +1325,21 @@ def stream_events(response_lines: Any, requested_model: str):
             {"type": "content_block_stop", "index": block_index},
         )
     stop_reason = _stop_reason(finish_reason)
+    delta_usage: dict[str, Any] = {}
+    prompt_tokens = usage.get("prompt_tokens")
+    if (
+        isinstance(prompt_tokens, int)
+        and not isinstance(prompt_tokens, bool)
+        and prompt_tokens >= 0
+    ):
+        delta_usage["input_tokens"] = prompt_tokens
+    delta_usage["output_tokens"] = usage.get("completion_tokens", 0)
     yield _sse(
         "message_delta",
         {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": usage.get("completion_tokens", 0)},
+            "usage": delta_usage,
         },
     )
     yield _sse("message_stop", {"type": "message_stop"})
@@ -1304,6 +1364,7 @@ def _stop_reason(finish_reason: Any) -> str:
         "length": "max_tokens",
         "tool_calls": "tool_use",
         "function_call": "tool_use",
+        "content_filter": "end_turn",
     }.get(finish_reason)
     if stop_reason is None:
         raise ProtocolError(

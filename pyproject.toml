@@ -17,7 +17,7 @@ token-count = ["tiktoken>=0.8"]
 test = ["pytest>=7", "pytest-cov>=4"]
 
 [project.scripts]
-llmbridge = "llmbridge.server:main"
+llmbridge = "llmbridge.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["llmbridge*"]

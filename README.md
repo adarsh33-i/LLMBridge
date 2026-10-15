@@ -43,6 +43,12 @@ estimates for that alias. The alias is what Claude Code sends; `model` is the
 ID understood by the upstream. Routes can target local Ollama, vLLM, or
 compatible hosted services.
 
+Add `fallbacks = ["other-alias", "..."]` to a route to try other configured
+aliases when the primary route fails (see *Fallbacks* below). Set
+`cache_control = "passthrough"` on a route to forward Anthropic `cache_control`
+breakpoints to an upstream that understands them instead of stripping them
+(the default is `"strip"`, which warns and removes them).
+
 Anthropic requests that enable thinking are accepted only on a route configured
 with `reasoning_effort`; the configured level is sent upstream. This does not
 preserve Anthropic's `budget_tokens` value.
@@ -90,6 +96,35 @@ If `LLMBRIDGE_API_KEY` is configured, set `ANTHROPIC_AUTH_TOKEN` to the same
 secret before launching Claude Code. `GET /v1/models` returns configured
 aliases.
 
+## Command-line interface
+
+The `llmbridge` command starts the server when run with no subcommand. It also
+offers:
+
+```sh
+llmbridge check  --config llmbridge.toml   # validate the routing config
+llmbridge models --config llmbridge.toml   # list aliases, endpoints, fallbacks
+llmbridge init   --path llmbridge.toml     # write a starter config (--force to overwrite)
+llmbridge serve  --host 127.0.0.1 --port 8787 --config llmbridge.toml
+```
+
+`python -m llmbridge` behaves the same as `llmbridge serve`.
+
+### Fallbacks and retries
+
+A route may list `fallbacks = ["alias-a", "alias-b"]`. When the primary route
+fails, LLMBridge tries each fallback alias in order before reporting an error,
+so a quota-exhausted or unavailable model can be transparently replaced. For
+streaming requests a fallback is only used before the first byte is sent to the
+client; a failure after streaming has started is recorded as interrupted work
+instead.
+
+Each route can also be retried before moving on:
+
+- `LLMBRIDGE_ROUTE_ATTEMPTS` — attempts per route (default `1`, max `10`).
+- `LLMBRIDGE_ROUTE_RETRY_BACKOFF` — base seconds between attempts, doubled each
+  retry (default `0.5`; set to `0` to disable the delay).
+
 ## Endpoints
 
 - `GET /health` — readiness check.
@@ -100,6 +135,12 @@ aliases.
   not the upstream model's exact tokenizer count.
 - `GET /v1/interrupted` — the interrupted work saved for resumption (`404` when
   nothing is saved). Requires client authentication when configured.
+- `POST /v1/interrupted/resume` — re-issue the saved interrupted work to a model
+  and return a normal Messages response. Pass `{"model": "alias"}` to choose the
+  model (defaults to the saved one) and an optional `max_tokens`. Any partial
+  output is sent as an assistant turn so the upstream continues from where it
+  stopped. On success the saved work is cleared. Requires client authentication
+  when configured.
 - `DELETE /v1/interrupted` — clear the saved interrupted work. Requires client
   authentication when configured.
 
@@ -114,7 +155,7 @@ OpenAI-compatible Chat Completions calls. This is not full Anthropic API parity.
 | Images | URL and base64 image blocks are translated to OpenAI image content; actual support depends on the upstream provider and model. |
 | Documents | Text, base64, public HTTP(S) URL sources, local file references, and Anthropic Files API IDs are converted to text. Remote downloads are limited to 10 MiB over standard ports. File IDs require an Anthropic API key; local paths require configured allowlisted roots. |
 | Tools | Tool definitions, tool choices, tool results, and upstream tool calls are translated to/from function-calling format. Provider/model behavior may differ. |
-| Streaming | Basic OpenAI-style SSE chunks are translated into Anthropic-style events. Unknown upstream finish reasons are rejected; this is not full Anthropic streaming parity. |
+| Streaming | OpenAI-style SSE chunks are translated into Anthropic-style events, including an initial `ping`, an `input_tokens` count when the upstream reports one, and a `content_filter` finish reason mapped to `end_turn`. Truly unknown upstream finish reasons are rejected; this is not full Anthropic streaming parity. |
 | Token counting | `/v1/messages/count_tokens` returns an estimate using a route-configured tiktoken encoding or a character-based fallback. It may differ from the upstream model's exact count. |
 | Other request fields | Only fields with explicit translations are sent upstream. Unrecognized Anthropic fields are not forwarded. |
 | Unknown content blocks | Unsupported block types are rejected. Assistant `thinking`, `redacted_thinking`, and `signature` blocks are explicitly rejected because generic chat-completions routes cannot represent them. Citation details and tool-result errors are rendered as readable text. |
@@ -131,8 +172,10 @@ HTTP(S) on the standard ports (80/443), resolve only to public IP addresses, and
 are revalidated and pinned to the validated addresses at each redirect. Avoid
 allowing untrusted clients to submit document references.
 
-**Note:** Prompt caching is not provided: Anthropic `cache_control` metadata is
-removed with a warning, and requests continue without caching. Remaining
+**Note:** Prompt caching is off by default: Anthropic `cache_control` metadata is
+removed with a warning unless a route sets `cache_control = "passthrough"`, in
+which case the breakpoints are forwarded to the upstream (useful for
+Anthropic-aware gateways, not standard OpenAI endpoints). Remaining
 compatibility work includes provider-specific beta and newer API features,
 broader content-block support, and richer document fidelity. Full Anthropic API
 parity is not provided. OCR is optional and requires PyMuPDF and Tesseract;

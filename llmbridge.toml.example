@@ -15,6 +15,10 @@ api_key_env = "HOSTED_MODEL_API_KEY"
 base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/nemotron-3-ultra-550b-a55b"
 api_key_env = "NVIDIA_API_KEY"
+# Try these aliases in order if this route fails (quota, rate limit, outage).
+fallbacks = ["claude-haiku-4-5"]
+# Forward Anthropic cache_control breakpoints instead of stripping them.
+# cache_control = "passthrough"
 
 [models.claude-haiku-4-5]
 base_url = "https://integrate.api.nvidia.com/v1"

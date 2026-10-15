@@ -253,6 +253,7 @@ class WorkTracker:
         error: Optional[str] = None,
         messages: Optional[List[dict[str, Any]]] = None,
         partial_output: str = "",
+        max_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
         """Save an interrupted generation directly, without a session.
 
@@ -266,6 +267,8 @@ class WorkTracker:
         Args:
             partial_output: Assistant text generated before the interruption
                 (optional). Non-string values are stored as an empty string.
+            max_tokens: The generation's token limit, kept so a resume can reuse
+                it (optional).
 
         Returns:
             The saved state dictionary (same format as ``load_state()``).
@@ -279,6 +282,7 @@ class WorkTracker:
             "error": error,
             "messages": list(messages) if messages is not None else [],
             "partial_output": partial_output if isinstance(partial_output, str) else "",
+            "max_tokens": max_tokens,
         }
         self._write_state(state)
         self._log_saved(state)

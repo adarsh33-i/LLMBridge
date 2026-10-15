@@ -2,6 +2,7 @@ import hmac
 import ipaddress
 import json
 import os
+import time
 from dataclasses import dataclass
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,11 +25,65 @@ from .work_tracker import WorkTracker
 # with a different model rather than a client mistake.
 _RESUMABLE_HTTP_STATUS = frozenset({402, 403, 408, 429, 500, 502, 503, 504, 529})
 
+# How many times a single route is attempted before giving up on it, and how
+# long to wait before the first retry. Both are overridable from the
+# environment so a deployment can trade latency for resilience.
+_DEFAULT_ROUTE_ATTEMPTS = 1
+_DEFAULT_ROUTE_RETRY_BACKOFF_SECONDS = 0.5
+
+# A failed upstream attempt: (kind, message, http_status). ``kind`` decides how
+# the failure is reported to the client and whether it is worth saving.
+_Failure = tuple[str, str, int | None]
+
 # Bound how much we will ever buffer from a single upstream reply, and how long
 # a client socket may stay idle mid-request, so a misbehaving peer cannot
 # exhaust memory or tie up a worker thread indefinitely.
 _MAX_UPSTREAM_RESPONSE_BYTES = 32 * 1024 * 1024
 _CLIENT_SOCKET_TIMEOUT_SECONDS = 300
+
+# Fallback max_tokens for a resumed generation whose original limit was not
+# recorded (it always is for runs this server saved, but older state files
+# predate that field).
+_DEFAULT_RESUME_MAX_TOKENS = 4096
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _route_attempts() -> int:
+    """How many times one route is tried before falling through to the next."""
+    raw = os.environ.get("LLMBRIDGE_ROUTE_ATTEMPTS")
+    if raw is None:
+        return _DEFAULT_ROUTE_ATTEMPTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_ROUTE_ATTEMPTS
+    return max(1, min(value, 10))
+
+
+def _route_retry_backoff_seconds() -> float:
+    """Base delay between attempts at the same route; doubles per attempt."""
+    raw = os.environ.get("LLMBRIDGE_ROUTE_RETRY_BACKOFF")
+    if raw is None:
+        return _DEFAULT_ROUTE_RETRY_BACKOFF_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_ROUTE_RETRY_BACKOFF_SECONDS
+    return max(0.0, value)
+
+
+def _retry_sleep(attempt: int) -> None:
+    backoff = _route_retry_backoff_seconds()
+    if backoff > 0:
+        time.sleep(backoff * (2 ** (attempt - 1)))
+
+
+def _is_retryable_status(status: int) -> bool:
+    return status in _RESUMABLE_HTTP_STATUS or status >= 500
+
 
 
 def _truthy(value: str | None) -> bool:
@@ -69,6 +124,30 @@ def _extract_prompt_and_system(body: dict[str, Any]) -> tuple[str, str | None]:
                 if prompt:
                     break
     return prompt, system_text
+
+
+def _build_resume_request(
+    state: dict[str, Any], model: str, max_tokens: int
+) -> dict[str, Any]:
+    """Rebuild a non-streaming Anthropic request from saved interrupted work.
+
+    Any partial output already produced is supplied as an assistant turn so the
+    upstream continues from where it stopped rather than starting over.
+    """
+    messages: list[dict[str, Any]] = [{"role": "user", "content": state["prompt"]}]
+    partial_output = state.get("partial_output")
+    if isinstance(partial_output, str) and partial_output:
+        messages.append({"role": "assistant", "content": partial_output})
+    request: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "stream": False,
+    }
+    system = state.get("system")
+    if isinstance(system, str) and system:
+        request["system"] = system
+    return request
 
 
 def _read_bounded(stream: Any, limit: int) -> bytes:
@@ -258,6 +337,52 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, state)
 
+    def _resume_interrupted(self) -> None:
+        """Re-issue saved interrupted work to a (possibly different) model."""
+        tracker = self.server.work_tracker
+        state = tracker.load_state() if tracker is not None else None
+        if state is None:
+            self._send_error(404, "not_found", "No interrupted work is recorded")
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size < 0 or size > 10 * 1024 * 1024:
+                raise ProtocolError("Request body must be at most 10 MiB")
+            body = json.loads(self.rfile.read(size)) if size > 0 else {}
+        except (ValueError, ProtocolError) as error:
+            self._send_error(400, "invalid_request_error", str(error))
+            return
+        if not isinstance(body, dict):
+            self._send_error(
+                400, "invalid_request_error", "Request body must be a JSON object"
+            )
+            return
+        if not isinstance(state.get("prompt"), str) or not state["prompt"]:
+            self._send_error(
+                400, "invalid_request_error", "The saved work has no prompt to resume"
+            )
+            return
+        model = body.get("model") or state.get("model_name")
+        if not isinstance(model, str) or not model:
+            self._send_error(
+                400, "invalid_request_error", "A model name is required to resume"
+            )
+            return
+        try:
+            route, upstream_model = resolve_model_route(
+                model, self.server.model_routes
+            )
+        except (ValueError, RoutingError) as error:
+            self._send_error(400, "invalid_request_error", str(error))
+            return
+        max_tokens = body.get("max_tokens")
+        if not _is_positive_int(max_tokens):
+            max_tokens = state.get("max_tokens")
+        if not _is_positive_int(max_tokens):
+            max_tokens = _DEFAULT_RESUME_MAX_TOKENS
+        resume_body = _build_resume_request(state, model, max_tokens)
+        self._handle_messages(resume_body, model, route, upstream_model)
+
     def do_POST(self) -> None:
         if not self._authenticate_client():
             return
@@ -265,84 +390,294 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if path == "/v1/messages/count_tokens":
             self._count_tokens()
             return
+        if path == "/v1/interrupted/resume":
+            self._resume_interrupted()
+            return
         if path != "/v1/messages":
             self._send_error(404, "not_found", "Endpoint not found")
             return
         try:
-            size = int(self.headers.get("Content-Length", "0"))
-            if size < 1 or size > 10 * 1024 * 1024:
-                raise ProtocolError("Request body must be between 1 byte and 10 MiB")
-            body = json.loads(self.rfile.read(size))
+            body = self._read_json_body()
             model = body.get("model") if isinstance(body, dict) else None
             if not isinstance(model, str) or not model:
                 raise ProtocolError("A client model name is required")
             route, upstream_model = resolve_model_route(
                 model, self.server.model_routes
             )
-            payload = anthropic_to_openai(
-                body,
-                upstream_model,
-                reasoning_effort=route.reasoning_effort,
-                supports_images=route.supports_images,
-                supports_tools=route.supports_tools,
-            )
-            request = _upstream_request(payload, route)
         except (ValueError, RoutingError) as error:
             self._send_error(400, "invalid_request_error", str(error))
             return
+        self._handle_messages(body, model, route, upstream_model)
 
+    def _read_json_body(self) -> Any:
+        size = int(self.headers.get("Content-Length", "0"))
+        if size < 1 or size > 10 * 1024 * 1024:
+            raise ProtocolError("Request body must be between 1 byte and 10 MiB")
+        return json.loads(self.rfile.read(size))
+
+    def _route_candidates(
+        self, primary_route: ModelRoute, primary_model: str
+    ) -> list[tuple[ModelRoute, str]]:
+        """Primary route followed by its configured fallbacks, in order."""
+        candidates: list[tuple[ModelRoute, str]] = [(primary_route, primary_model)]
+        for alias in primary_route.fallbacks:
+            try:
+                route, upstream_model = resolve_model_route(
+                    alias, self.server.model_routes
+                )
+            except RoutingError as error:
+                self.log_error("Skipping unusable fallback %s: %s", alias, error)
+                continue
+            candidate = (route, upstream_model)
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def _handle_messages(
+        self,
+        body: Any,
+        model: str,
+        primary_route: ModelRoute,
+        primary_model: str,
+    ) -> None:
+        """Translate, call upstream (following fallbacks), and answer the client."""
         tracker = self.server.work_tracker
         prompt = ""
         system_prompt: str | None = None
-        if tracker is not None:
+        if tracker is not None and isinstance(body, dict):
             prompt, system_prompt = _extract_prompt_and_system(body)
+        display_model = model or primary_model
+        candidates = self._route_candidates(primary_route, primary_model)
+        max_tokens = body.get("max_tokens") if isinstance(body, dict) else None
+        stream = isinstance(body, dict) and bool(body.get("stream"))
+        if stream:
+            self._stream_with_fallback(
+                candidates,
+                body,
+                display_model,
+                tracker,
+                prompt,
+                system_prompt,
+                max_tokens,
+            )
+            return
+        self._respond_with_fallback(
+            candidates,
+            body,
+            display_model,
+            tracker,
+            prompt,
+            system_prompt,
+            max_tokens,
+        )
 
-        try:
-            with urlopen(request, timeout=180) as upstream:
-                if payload["stream"]:
+    def _build_upstream_request(
+        self, route: ModelRoute, upstream_model: str, body: Any
+    ) -> Request:
+        payload = anthropic_to_openai(
+            body,
+            upstream_model,
+            reasoning_effort=route.reasoning_effort,
+            supports_images=route.supports_images,
+            supports_tools=route.supports_tools,
+            cache_control=route.cache_control,
+        )
+        return _upstream_request(payload, route)
+
+    def _respond_with_fallback(
+        self,
+        candidates: list[tuple[ModelRoute, str]],
+        body: Any,
+        display_model: str,
+        tracker: WorkTracker | None,
+        prompt: str,
+        system_prompt: str | None,
+        max_tokens: Any = None,
+    ) -> None:
+        payload_error: ValueError | None = None
+        failure: _Failure | None = None
+        for route, upstream_model in candidates:
+            for attempt in range(1, _route_attempts() + 1):
+                try:
+                    request = self._build_upstream_request(
+                        route, upstream_model, body
+                    )
+                except ValueError as error:
+                    payload_error = error
+                    break
+                try:
+                    upstream = urlopen(request, timeout=180)
+                except HTTPError as error:
+                    failure = self._record_http_failure(error)
+                    if (
+                        failure[2] is not None
+                        and _is_retryable_status(failure[2])
+                        and attempt < _route_attempts()
+                    ):
+                        _retry_sleep(attempt)
+                        continue
+                    break
+                except URLError as error:
+                    self.log_error("Could not connect to upstream: %s", error.reason)
+                    failure = (
+                        "connect",
+                        "Could not connect to the configured upstream",
+                        None,
+                    )
+                    if attempt < _route_attempts():
+                        _retry_sleep(attempt)
+                        continue
+                    break
+                except TimeoutError:
+                    self.log_error("Upstream request timed out")
+                    failure = ("timeout", "Upstream request timed out", None)
+                    if attempt < _route_attempts():
+                        _retry_sleep(attempt)
+                        continue
+                    break
+                response, failure = self._read_json_reply(upstream)
+                if failure is not None:
+                    break
+                anthropic_response = openai_to_anthropic(response, display_model)
+                self._clear_interrupted_on_match(tracker, prompt)
+                self._send_json(200, anthropic_response)
+                return
+        self._report_failure(
+            failure,
+            payload_error,
+            tracker,
+            prompt,
+            display_model,
+            system_prompt,
+            max_tokens,
+        )
+
+    def _stream_with_fallback(
+        self,
+        candidates: list[tuple[ModelRoute, str]],
+        body: Any,
+        display_model: str,
+        tracker: WorkTracker | None,
+        prompt: str,
+        system_prompt: str | None,
+        max_tokens: Any = None,
+    ) -> None:
+        payload_error: ValueError | None = None
+        failure: _Failure | None = None
+        for route, upstream_model in candidates:
+            for attempt in range(1, _route_attempts() + 1):
+                try:
+                    request = self._build_upstream_request(
+                        route, upstream_model, body
+                    )
+                except ValueError as error:
+                    payload_error = error
+                    break
+                try:
+                    upstream = urlopen(request, timeout=180)
+                except HTTPError as error:
+                    failure = self._record_http_failure(error)
+                    if (
+                        failure[2] is not None
+                        and _is_retryable_status(failure[2])
+                        and attempt < _route_attempts()
+                    ):
+                        _retry_sleep(attempt)
+                        continue
+                    break
+                except URLError as error:
+                    self.log_error("Could not connect to upstream: %s", error.reason)
+                    failure = (
+                        "connect",
+                        "Could not connect to the configured upstream",
+                        None,
+                    )
+                    if attempt < _route_attempts():
+                        _retry_sleep(attempt)
+                        continue
+                    break
+                except TimeoutError:
+                    self.log_error("Upstream request timed out")
+                    failure = ("timeout", "Upstream request timed out", None)
+                    if attempt < _route_attempts():
+                        _retry_sleep(attempt)
+                        continue
+                    break
+                # The connection opened, so this route is good enough to start
+                # streaming on. Once the client has bytes it cannot be
+                # re-routed, so mid-stream failures stay on the interrupt path.
+                with upstream:
                     self._stream_response(
                         upstream,
-                        model or payload["model"],
+                        display_model,
                         tracker,
                         prompt,
                         system_prompt,
-                        max_tokens=body.get("max_tokens"),
+                        max_tokens=max_tokens,
                     )
-                    return
-                response = json.loads(_read_bounded(upstream, _MAX_UPSTREAM_RESPONSE_BYTES))
-            anthropic_response = openai_to_anthropic(response, model or payload["model"])
-            self._clear_interrupted_on_match(tracker, prompt)
-            self._send_json(200, anthropic_response)
-        except HTTPError as error:
-            status = error.code
-            error.close()
-            self.log_error("Upstream returned HTTP %s", status)
-            if status in _RESUMABLE_HTTP_STATUS:
-                self._save_interrupted(
-                    tracker, prompt, model or payload["model"], system_prompt,
-                    f"Upstream returned HTTP {status}",
+                return
+        self._report_failure(
+            failure,
+            payload_error,
+            tracker,
+            prompt,
+            display_model,
+            system_prompt,
+            max_tokens,
+        )
+
+    def _record_http_failure(self, error: HTTPError) -> _Failure:
+        status = error.code
+        error.close()
+        self.log_error("Upstream returned HTTP %s", status)
+        return ("http", f"Upstream returned HTTP {status}", status)
+
+    def _read_json_reply(self, upstream: Any) -> tuple[Any, _Failure | None]:
+        try:
+            with upstream:
+                payload = json.loads(
+                    _read_bounded(upstream, _MAX_UPSTREAM_RESPONSE_BYTES)
                 )
-            self._send_error(502, "upstream_error", f"Upstream returned HTTP {status}")
-        except URLError as error:
-            self.log_error("Could not connect to upstream: %s", error.reason)
-            self._save_interrupted(
-                tracker, prompt, model or payload["model"], system_prompt,
-                "Could not connect to the configured upstream",
-            )
-            self._send_error(502, "upstream_error", "Could not connect to the configured upstream")
         except (json.JSONDecodeError, ProtocolError) as error:
             self.log_error("Invalid upstream response: %s", error)
-            self._save_interrupted(
-                tracker, prompt, model or payload["model"], system_prompt, str(error)
-            )
-            self._send_error(502, "upstream_error", str(error))
+            return None, ("invalid", str(error), None)
         except TimeoutError:
             self.log_error("Upstream request timed out")
-            self._save_interrupted(
-                tracker, prompt, model or payload["model"], system_prompt,
-                "Upstream request timed out",
+            return None, ("timeout", "Upstream request timed out", None)
+        return payload, None
+
+    def _report_failure(
+        self,
+        failure: _Failure | None,
+        payload_error: ValueError | None,
+        tracker: WorkTracker | None,
+        prompt: str,
+        model: str,
+        system_prompt: str | None,
+        max_tokens: Any = None,
+    ) -> None:
+        """Answer the client after every candidate route has been exhausted."""
+        if failure is None:
+            message = (
+                str(payload_error)
+                if payload_error is not None
+                else "No usable model route is configured"
             )
-            self._send_error(504, "upstream_timeout", "Upstream request timed out")
+            self._send_error(400, "invalid_request_error", message)
+            return
+        kind, message, status = failure
+        if kind == "http" and status not in _RESUMABLE_HTTP_STATUS:
+            # A client-side mistake from the upstream would just repeat on the
+            # next attempt, so it is not worth saving for resumption.
+            self._send_error(502, "upstream_error", message)
+            return
+        self._save_interrupted(
+            tracker, prompt, model, system_prompt, message, max_tokens=max_tokens
+        )
+        if kind == "timeout":
+            self._send_error(504, "upstream_timeout", message)
+        else:
+            self._send_error(502, "upstream_error", message)
 
     def _save_interrupted(
         self,
@@ -353,6 +688,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         message: str,
         progress: float = 0.0,
         partial_output: str = "",
+        max_tokens: Any = None,
     ) -> None:
         if tracker is None:
             return
@@ -364,6 +700,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 error=message,
                 progress_percent=progress,
                 partial_output=partial_output,
+                max_tokens=max_tokens if isinstance(max_tokens, int) else None,
             )
         except Exception as error:
             self.log_error("Could not record interrupted work: %s", error)
@@ -462,6 +799,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     message,
                     progress=_stream_progress(partial_output, reported_tokens, max_tokens),
                     partial_output=partial_output,
+                    max_tokens=max_tokens,
                 )
                 event = json.dumps(
                     {
@@ -497,6 +835,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                             partial_output, reported_tokens, max_tokens
                         ),
                         partial_output=partial_output,
+                        max_tokens=max_tokens,
                     )
                 return
 

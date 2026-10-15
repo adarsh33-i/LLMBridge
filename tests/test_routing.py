@@ -192,5 +192,106 @@ class RoutingConfigErrorTests(unittest.TestCase):
                     load_model_routes(self._config(text))
 
 
+class RouteFallbackTests(unittest.TestCase):
+    def _config(self, text):
+        directory = tempfile.mkdtemp()
+        path = Path(directory) / "llmbridge.toml"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_loads_fallback_chain(self):
+        routes = load_model_routes(
+            self._config(
+                """
+[models.primary]
+base_url = "http://upstream-a/v1"
+model = "a"
+fallbacks = ["backup", "third"]
+
+[models.backup]
+base_url = "http://upstream-b/v1"
+model = "b"
+
+[models.third]
+base_url = "http://upstream-c/v1"
+model = "c"
+"""
+            )
+        )
+
+        self.assertEqual(routes["primary"].fallbacks, ("backup", "third"))
+        self.assertEqual(routes["backup"].fallbacks, ())
+        self.assertEqual(
+            resolve_model_route("backup", routes)[1],
+            "b",
+        )
+
+    def test_fallbacks_default_to_empty(self):
+        routes = load_model_routes(
+            self._config("[models.only]\nbase_url = 'http://upstream/v1'\n")
+        )
+        self.assertEqual(routes["only"].fallbacks, ())
+
+    def test_rejects_unknown_fallback_target(self):
+        with self.assertRaisesRegex(RoutingError, "unknown model 'missing'"):
+            load_model_routes(
+                self._config(
+                    """
+[models.primary]
+base_url = "http://upstream-a/v1"
+fallbacks = ["missing"]
+"""
+                )
+            )
+
+    def test_rejects_self_fallback(self):
+        with self.assertRaisesRegex(RoutingError, "cannot fall back to itself"):
+            load_model_routes(
+                self._config(
+                    """
+[models.primary]
+base_url = "http://upstream-a/v1"
+fallbacks = ["primary"]
+"""
+                )
+            )
+
+    def test_rejects_malformed_fallbacks(self):
+        cases = {
+            "non-empty array": "[models.x]\nbase_url = 'http://u/v1'\nfallbacks = []\n",
+            "must be a non-empty array": "[models.x]\nbase_url = 'http://u/v1'\nfallbacks = 'backup'\n",
+            "non-empty model aliases": "[models.x]\nbase_url = 'http://u/v1'\nfallbacks = [1]\n",
+            "duplicate fallback": "[models.x]\nbase_url = 'http://u/v1'\nfallbacks = ['a', 'a']\n",
+        }
+        for message, text in cases.items():
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RoutingError, message):
+                    load_model_routes(self._config(text))
+
+
+class RouteCacheControlTests(unittest.TestCase):
+    def _route(self, text):
+        directory = tempfile.mkdtemp()
+        path = Path(directory) / "llmbridge.toml"
+        path.write_text(text, encoding="utf-8")
+        return load_model_routes(str(path))["cached"]
+
+    def test_defaults_to_stripping_cache_control(self):
+        route = self._route("[models.cached]\nbase_url = 'http://u/v1'\n")
+        self.assertEqual(route.cache_control, "strip")
+        self.assertFalse(route.preserves_cache_control)
+
+    def test_loads_passthrough_cache_control(self):
+        route = self._route(
+            "[models.cached]\nbase_url = 'http://u/v1'\ncache_control = 'passthrough'\n"
+        )
+        self.assertEqual(route.cache_control, "passthrough")
+        self.assertTrue(route.preserves_cache_control)
+
+    def test_rejects_unknown_cache_control_mode(self):
+        with self.assertRaisesRegex(RoutingError, "cache_control must be"):
+            self._route("[models.cached]\nbase_url = 'http://u/v1'\ncache_control = 'yes'\n")
+
+
 if __name__ == "__main__":
     unittest.main()

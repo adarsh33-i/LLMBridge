@@ -209,16 +209,30 @@ class ProtocolTests(unittest.TestCase):
                     "choices": [
                         {
                             "message": {"content": "Filtered"},
-                            "finish_reason": "content_filter",
+                            "finish_reason": "made_up_reason",
                         }
                     ]
                 },
                 "nemotron",
             )
 
+    def test_translates_content_filter_finish_reason(self):
+        result = openai_to_anthropic(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "Filtered"},
+                        "finish_reason": "content_filter",
+                    }
+                ]
+            },
+            "nemotron",
+        )
+        self.assertEqual(result["stop_reason"], "end_turn")
+
     def test_rejects_unknown_stream_finish_reason(self):
         events = [
-            b'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"made_up_reason"}]}\n',
         ]
         with self.assertRaisesRegex(ProtocolError, "Unsupported upstream completion reason"):
             list(stream_events(events, "nemotron"))
@@ -1632,6 +1646,7 @@ class ProtocolTests(unittest.TestCase):
         next(events)
         next(events)
         next(events)
+        next(events)
         with self.assertRaisesRegex(ProtocolError, "before a completion reason"):
             next(events)
 
@@ -1791,6 +1806,189 @@ class ProtocolTests(unittest.TestCase):
         with patch("llmbridge.protocol._MAX_STREAM_LINE_BYTES", 10):
             with self.assertRaisesRegex(ProtocolError, "size limit"):
                 list(stream_events(_ReadlineStream(), "nemotron"))
+
+
+class CachePassthroughTests(unittest.TestCase):
+    def _request(self) -> dict:
+        return {
+            "model": "client-model",
+            "max_tokens": 100,
+            "cache_control": {"type": "ephemeral"},
+            "system": [
+                {
+                    "type": "text",
+                    "text": "Rules",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Question",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": "http://x/y.png"},
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "out",
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "cache_control": {"type": "ephemeral"},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cache_control": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+
+    def test_passthrough_keeps_cache_breakpoints_everywhere(self):
+        with self.assertNoLogs("llmbridge.protocol", level="WARNING"):
+            translated = anthropic_to_openai(
+                self._request(), cache_control="passthrough"
+            )
+
+        self.assertEqual(translated["cache_control"], {"type": "ephemeral"})
+
+        system_message = translated["messages"][0]
+        self.assertEqual(system_message["role"], "system")
+        self.assertIsInstance(system_message["content"], list)
+        self.assertEqual(
+            system_message["content"][0]["cache_control"], {"type": "ephemeral"}
+        )
+
+        user_message = translated["messages"][1]
+        text_part, image_part = user_message["content"]
+        self.assertEqual(text_part["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(image_part["cache_control"], {"type": "ephemeral"})
+
+        tool_message = next(
+            message for message in translated["messages"] if message["role"] == "tool"
+        )
+        self.assertEqual(
+            tool_message["content"][0]["cache_control"], {"type": "ephemeral"}
+        )
+
+        self.assertEqual(
+            translated["tools"][0]["cache_control"], {"type": "ephemeral"}
+        )
+        self.assertEqual(
+            translated["tools"][0]["function"]["parameters"]["properties"][
+                "cache_control"
+            ],
+            {"type": "string"},
+        )
+
+    def test_passthrough_does_not_mutate_the_request(self):
+        request = self._request()
+        anthropic_to_openai(request, cache_control="passthrough")
+        self.assertEqual(
+            request["messages"][0]["content"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+
+    def test_passthrough_leaves_system_a_string_without_breakpoints(self):
+        translated = anthropic_to_openai(
+            {
+                "model": "client-model",
+                "max_tokens": 100,
+                "system": [{"type": "text", "text": "Rules"}],
+                "messages": [{"role": "user", "content": "Question"}],
+            },
+            cache_control="passthrough",
+        )
+        self.assertEqual(translated["messages"][0]["content"], "Rules")
+
+    def test_rejects_unknown_cache_control_mode(self):
+        with self.assertRaisesRegex(ProtocolError, "cache_control mode"):
+            anthropic_to_openai(
+                {"model": "m", "max_tokens": 1, "messages": []},
+                cache_control="sometimes",
+            )
+
+
+class StreamParityTests(unittest.TestCase):
+    @staticmethod
+    def _payloads(events):
+        rendered = b"".join(stream_events(events, "nemotron")).decode()
+        return rendered, [
+            json.loads(line[6:])
+            for line in rendered.splitlines()
+            if line.startswith("data: ")
+        ]
+
+    def test_emits_ping_after_message_start(self):
+        rendered, _ = self._payloads(
+            [
+                b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+            ]
+        )
+        self.assertIn("event: ping\n", rendered)
+        self.assertLess(
+            rendered.index("event: message_start"), rendered.index("event: ping")
+        )
+        self.assertLess(
+            rendered.index("event: ping"),
+            rendered.index("event: content_block_start"),
+        )
+
+    def test_reports_upstream_input_tokens_in_message_delta(self):
+        _, payloads = self._payloads(
+            [
+                b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n',
+                b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+            ]
+        )
+        message_delta = next(
+            item for item in payloads if item.get("type") == "message_delta"
+        )
+        self.assertEqual(
+            message_delta["usage"], {"input_tokens": 11, "output_tokens": 7}
+        )
+
+    def test_message_delta_omits_input_tokens_when_upstream_reports_none(self):
+        _, payloads = self._payloads(
+            [
+                b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+            ]
+        )
+        message_delta = next(
+            item for item in payloads if item.get("type") == "message_delta"
+        )
+        self.assertEqual(message_delta["usage"], {"output_tokens": 0})
 
 
 if __name__ == "__main__":
