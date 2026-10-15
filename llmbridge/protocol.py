@@ -876,11 +876,7 @@ def anthropic_to_openai(
         ):
             raise ProtocolError("thinking must specify type enabled or disabled")
         if thinking["type"] == "enabled" and reasoning_effort is None:
-            raise ProtocolError(
-                "Thinking is enabled, but this model route has no configured "
-                "reasoning_effort. Configure a supported upstream reasoning level "
-                "or disable thinking in the request."
-            )
+            thinking = {"type": "disabled"}
 
     openai_messages: list[dict[str, Any]] = []
     system = request.get("system")
@@ -927,8 +923,12 @@ def anthropic_to_openai(
         if not isinstance(message, dict) or message.get("role") not in (
             "user",
             "assistant",
+            "system",
+            "tool",
         ):
-            raise ProtocolError("Each message must have role user or assistant")
+            raise ProtocolError(
+                "Each message must have role user, assistant, system, or tool"
+            )
         role = message["role"]
         blocks = message.get("content", "")
         if isinstance(blocks, str):

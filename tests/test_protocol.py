@@ -376,16 +376,19 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(request["reasoning_effort"], "high")
 
-    def test_rejects_enabled_thinking_without_route_mapping(self):
-        with self.assertRaisesRegex(ProtocolError, "no configured reasoning_effort"):
-            anthropic_to_openai(
-                {
-                    "model": "client-model",
-                    "max_tokens": 100,
-                    "thinking": {"type": "enabled", "budget_tokens": 1024},
-                    "messages": [{"role": "user", "content": "Think this through"}],
-                }
-            )
+    def test_downgrades_enabled_thinking_without_route_mapping(self):
+        request = anthropic_to_openai(
+            {
+                "model": "client-model",
+                "max_tokens": 100,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{"role": "user", "content": "Think this through"}],
+            }
+        )
+        # Thinking should be downgraded to "disabled" when reasoning_effort is not configured
+        self.assertNotIn("reasoning_effort", request)
+        # Content is a plain string when only text is present
+        self.assertEqual(request["messages"][0]["content"], "Think this through")
 
     def test_rejects_images_when_route_declares_no_image_support(self):
         with self.assertRaisesRegex(ProtocolError, "does not support images"):
