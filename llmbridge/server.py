@@ -64,6 +64,72 @@ def _extract_prompt_and_system(body: dict[str, Any]) -> tuple[str, str | None]:
     return prompt, system_text
 
 
+def _sse_event_data(event: bytes) -> dict[str, Any] | None:
+    """Extract the JSON payload from an SSE event emitted by stream_events()."""
+    try:
+        decoded = event.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    payload = None
+    for line in decoded.splitlines():
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            break
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _event_output_tokens(event: bytes) -> int | None:
+    """Return the exact output-token count reported by a message_delta event."""
+    data = _sse_event_data(event)
+    if not data or data.get("type") != "message_delta":
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    tokens = usage.get("output_tokens")
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+        return tokens
+    return None
+
+
+def _collect_text_delta(event: bytes, partial_chunks: list[str]) -> None:
+    """Append streamed assistant text from an SSE event to the partial output."""
+    data = _sse_event_data(event)
+    if not data or data.get("type") != "content_block_delta":
+        return
+    delta = data.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return
+    text = delta.get("text")
+    if isinstance(text, str):
+        partial_chunks.append(text)
+
+
+def _stream_progress(
+    partial_output: str, output_tokens: int | None, max_tokens: Any
+) -> float:
+    """Estimate completion percentage for an interrupted stream.
+
+    Uses the exact output-token count when the upstream reported one before
+    the failure, otherwise estimates from the characters already streamed.
+    Capped below 100% because an interrupted run is by definition incomplete.
+    """
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        return 0.0
+    tokens = output_tokens
+    if not tokens:
+        if not partial_output:
+            return 0.0
+        tokens = max(1, (len(partial_output) + 3) // 4)
+    return min(99.9, round(100.0 * tokens / max_tokens, 1))
+
+
 def _upstream_request(payload: dict[str, Any], route: ModelRoute) -> Request:
     headers = {"Content-Type": "application/json"}
     api_key = route.api_key()
@@ -220,7 +286,12 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             with urlopen(request, timeout=180) as upstream:
                 if payload["stream"]:
                     self._stream_response(
-                        upstream, model or payload["model"], tracker, prompt, system_prompt
+                        upstream,
+                        model or payload["model"],
+                        tracker,
+                        prompt,
+                        system_prompt,
+                        max_tokens=body.get("max_tokens"),
                     )
                     return
                 response = json.loads(upstream.read())
@@ -265,6 +336,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         model: str,
         system: str | None,
         message: str,
+        progress: float = 0.0,
+        partial_output: str = "",
     ) -> None:
         if tracker is None:
             return
@@ -274,6 +347,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 model_name=model,
                 system=system,
                 error=message,
+                progress_percent=progress,
+                partial_output=partial_output,
             )
         except Exception:
             self.log_error("Could not record interrupted work")
@@ -338,6 +413,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         tracker: WorkTracker | None = None,
         prompt: str = "",
         system: str | None = None,
+        max_tokens: Any = None,
     ) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -345,6 +421,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         events = iter(stream_events(upstream, model))
+        partial_chunks: list[str] = []
+        reported_tokens: int | None = None
         while True:
             try:
                 event = next(events)
@@ -359,7 +437,16 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 else:
                     message = "Upstream stream failed"
                 self.log_error("Invalid upstream stream: %s", message)
-                self._save_interrupted(tracker, prompt, model, system, message)
+                partial_output = "".join(partial_chunks)
+                self._save_interrupted(
+                    tracker,
+                    prompt,
+                    model,
+                    system,
+                    message,
+                    progress=_stream_progress(partial_output, reported_tokens, max_tokens),
+                    partial_output=partial_output,
+                )
                 event = json.dumps(
                     {
                         "type": "error",
@@ -372,6 +459,11 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     self.log_error("Client disconnected during streaming response")
                 return
+            _collect_text_delta(event, partial_chunks)
+            if reported_tokens is None:
+                tokens = _event_output_tokens(event)
+                if tokens is not None:
+                    reported_tokens = tokens
             try:
                 self.wfile.write(event)
                 self.wfile.flush()

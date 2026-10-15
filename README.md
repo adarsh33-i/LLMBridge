@@ -154,7 +154,7 @@ LLMBridge includes a **partial work tracking** feature that allows you to resume
 The bridge tracks every `/v1/messages` request automatically:
 
 1. When a request arrives, the bridge records the prompt (the last user message) and model.
-2. If the upstream call stops because of a quota, rate-limit, transient server, connection, timeout, or stream error, the bridge **saves the interrupted work**.
+2. If the upstream call stops because of a quota, rate-limit, transient server, connection, timeout, or stream error, the bridge **saves the interrupted work** — including any partial assistant output streamed so far and an estimated progress percentage (generated tokens vs. the request's `max_tokens`).
 3. When a later request with the **same prompt** completes successfully, the saved work is cleared automatically.
 4. You can inspect the saved work with `GET /v1/interrupted`, and clear it with `DELETE /v1/interrupted`.
 
@@ -170,13 +170,13 @@ Configuration (environment variables):
 The underlying `WorkTracker` class can also be used directly:
 
 1. **Start tracking** — Call `track_generation(prompt, model_name)` at the beginning of a generation run
-2. **During generation** — Call `tracker.update_progress(percent)` periodically (no disk writes)
+2. **During generation** — Call `tracker.update_progress(percent, partial_output=...)` periodically (no disk writes)
 3. **When generation stops** (quota error, rate limit, etc.) — Call `tracker.save_interrupted()`
-   - This saves the interrupted prompt + progress percentage + error context to `.partial_work.json`
-   - No intermediate progress steps are stored — just the prompt being processed (plus optional message history if you passed it to `update_progress()`)
-   - The state is typically small (500 bytes - 2 KB), so no arbitrary size caps are needed
+   - This saves the interrupted prompt + progress percentage + error context + partial output to `.partial_work.json`
+   - No intermediate progress steps are stored — just the prompt being processed, the text generated so far, and optional message history if you passed it to `update_progress()`
+   - The state stays naturally small, so no arbitrary size caps are needed
 4. **Resume later** — Call `tracker.load_state()` to retrieve the saved interrupted work
-   - The original prompt and progress percentage are preserved
+   - The original prompt, the partial output generated before the stop, and the progress percentage are preserved
    - Resume from where you left off, not from scratch
 
 ### Usage Example
@@ -191,7 +191,7 @@ tracker = track_generation(
 )
 
 # During generation — update progress (no disk writes)
-tracker.update_progress(progress_percent=75.0)
+tracker.update_progress(progress_percent=75.0, partial_output="...text generated so far...")
 
 # Generation stops (quota exhausted) — save interrupted state
 tracker.save_interrupted()
@@ -201,7 +201,8 @@ loaded = tracker.load_state()
 if loaded:
     print(f"Resume from {loaded['progress_percent']:.1f}%")
     print(f"Original prompt: {loaded['prompt'][:50]}...")
-    # Continue generation with a new model using the saved prompt
+    print(f"Partial output: {loaded['partial_output'][:50]}...")
+    # Continue generation with a new model using the saved prompt + partial output
 ```
 
 ### State Lifecycle
@@ -218,8 +219,8 @@ if loaded:
 
 - **`.partial_work.json`** — Created in the current working directory when `save_interrupted()` is called (or at a custom path passed to `WorkTracker(storage_path=...)` or `track_generation(..., storage_path=...)`)
 - **`.partial_work.<namespace>.json`** — Used when you pass `namespace=` to keep independent generations in separate slots. Namespaces must start with an alphanumeric character and contain only letters, digits, `.`, `_`, or `-` (path separators are rejected to prevent directory traversal)
-- **Typical size**: 500 bytes - 2 KB (just the interrupted prompt + metadata)
-- **No size cap needed**: The state stores one prompt (and optional message history), so it stays small naturally
+- **Typical size**: 500 bytes - a few KB (the interrupted prompt, partial output, and metadata)
+- **No size cap needed**: The state stores one prompt, the partial output of a single run, and optional message history, so it stays small naturally
 - **Atomic writes**: State is written to a temp file and moved into place, so an interrupted write cannot corrupt the saved state
 - **Thread- and process-safe**: Reads, writes, and deletions are serialized with an advisory file lock, so concurrent trackers sharing a path cannot interleave or corrupt state. Lock files live in the system temp directory (not the project), and in-memory session state is guarded so a single `WorkTracker` can be shared across threads
 - **Logging, not stdout**: Status messages go to the `llmbridge.work_tracker` logger, so they never interleave with server/protocol output
@@ -228,12 +229,12 @@ if loaded:
 
 | Scenario | Result |
 |----------|--------|
-| State exists | ✅ Resume from saved prompt + progress |
+| State exists | ✅ Resume from saved prompt + partial output + progress |
 | No state file exists | 🆕 Start from scratch with new prompt |
 
 ### Why This Design
 
-- **No arbitrary KB caps**: The state stores only one prompt, so it's naturally small
+- **No arbitrary KB caps**: The state stores only one prompt plus the partial output generated so far, so it's naturally small
 - **No intermediate bloat**: We don't save on every progress update
 - **Clear semantics**: `save_interrupted()` explicitly marks "this generation stopped"
 - **No expiry**: Saved state persists until you resume or clear it, so you can pick it back up the next day

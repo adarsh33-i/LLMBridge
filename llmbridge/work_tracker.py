@@ -3,9 +3,10 @@
 Design philosophy:
 - Track ONLY the interrupted/prompt that was being processed when generation stopped
 - No size limits during ongoing generation (just mark "in progress")
-- When generation stops (quota error, etc.), save just that interrupted prompt
+- When generation stops (quota error, etc.), save the interrupted prompt, any
+  partial output already generated, and a progress estimate
 - After resumption/completion, clear the state
-- State is small (just one prompt + metadata), so no arbitrary KB caps needed
+- State is small (one prompt + partial output + metadata), so no arbitrary KB caps needed
 - Saved state has no expiry — resume the next day if needed
 """
 
@@ -99,8 +100,10 @@ class WorkTracker:
 
     Key design:
     - State is ONLY saved when generation stops (not on every call)
-    - Only the interrupted prompt + minimal metadata is stored
-    - No arbitrary KB caps — the state is naturally small (just one prompt)
+    - The interrupted prompt, the partial output generated so far, and minimal
+      metadata are stored
+    - No arbitrary KB caps — the state is naturally small (one prompt + the
+      partial output of a single generation)
     - Saved state persists until resumed or explicitly cleared
     - Clear automatically after resumption or on demand
     - Access to the state file is serialized with an advisory file lock, so
@@ -164,6 +167,7 @@ class WorkTracker:
             self._progress_percent = 0.0
             self._error: Optional[str] = None
             self._messages: List[dict[str, Any]] = []
+            self._partial_output = ""
 
         # Do NOT save to disk here — just set internal state
         # This avoids saving on every intermediate step
@@ -174,6 +178,7 @@ class WorkTracker:
         progress_percent: float,
         error: Any = _UNSET,
         messages: Optional[List[dict[str, Any]]] = None,
+        partial_output: Any = _UNSET,
     ) -> None:
         """Update the current generation progress (called during generation).
 
@@ -187,6 +192,9 @@ class WorkTracker:
                 clear a previously recorded error. Omit to leave it unchanged.
             messages: Conversation history so far (optional). Omit to leave it
                 unchanged; pass an empty list to clear it.
+            partial_output: Assistant text generated so far (optional). Omit to
+                leave it unchanged; pass an empty string to clear it. Non-string
+                values are treated as empty.
         """
         with self._session_lock:
             self._progress_percent = progress_percent
@@ -194,6 +202,8 @@ class WorkTracker:
                 self._error = error or None
             if messages is not None:
                 self._messages = messages
+            if partial_output is not _UNSET:
+                self._partial_output = partial_output if isinstance(partial_output, str) else ""
 
     def save_interrupted(self) -> dict[str, Any]:
         """Save the interrupted generation state to disk.
@@ -201,10 +211,11 @@ class WorkTracker:
         Call this method when generation stops unexpectedly (quota error,
         rate limit, etc.) so the work can be resumed with a different model.
 
-        Only the current prompt + minimal metadata is stored — no intermediate
-        progress steps. Message history is only included if it was passed to
+        The saved state holds the current prompt, any partial output recorded
+        via update_progress(), and minimal metadata — no intermediate progress
+        steps. Message history is only included if it was passed to
         update_progress(). This keeps the state naturally small (typically
-        500 bytes - 2 KB) without needing arbitrary KB caps.
+        500 bytes - a few KB) without needing arbitrary KB caps.
 
         The write is atomic: the state is written to a temporary file and then
         moved into place, so a crash mid-write cannot leave a corrupt state
@@ -225,6 +236,7 @@ class WorkTracker:
                 "progress_percent": self._progress_percent,
                 "error": self._error,
                 "messages": self._messages,
+                "partial_output": self._partial_output,
             }
 
         self._write_state(state)
@@ -240,6 +252,7 @@ class WorkTracker:
         progress_percent: float = 0.0,
         error: Optional[str] = None,
         messages: Optional[List[dict[str, Any]]] = None,
+        partial_output: str = "",
     ) -> dict[str, Any]:
         """Save an interrupted generation directly, without a session.
 
@@ -249,6 +262,10 @@ class WorkTracker:
         no shared session state, two threads calling ``save()`` cannot attribute
         one request's prompt to another; the on-disk write is still serialized
         by the advisory file lock.
+
+        Args:
+            partial_output: Assistant text generated before the interruption
+                (optional). Non-string values are stored as an empty string.
 
         Returns:
             The saved state dictionary (same format as ``load_state()``).
@@ -261,6 +278,7 @@ class WorkTracker:
             "progress_percent": progress_percent,
             "error": error,
             "messages": list(messages) if messages is not None else [],
+            "partial_output": partial_output if isinstance(partial_output, str) else "",
         }
         self._write_state(state)
         self._log_saved(state)
@@ -272,8 +290,9 @@ class WorkTracker:
         # - Model name (short string)
         # - Progress percentage (number)
         # - Error message (optional, usually short)
+        # - Partial output (the text streamed before the stop)
         # - Optional message history (only if provided)
-        # Typical total: 500 bytes - 2 KB
+        # Typical total: 500 bytes - a few KB
         fd, tmp_path = tempfile.mkstemp(
             dir=str(self.storage_path.parent),
             prefix=f".{self.storage_path.name}.",
@@ -379,6 +398,7 @@ class WorkTracker:
                 "_progress_percent",
                 "_error",
                 "_messages",
+                "_partial_output",
             ):
                 if hasattr(self, attribute):
                     delattr(self, attribute)
@@ -412,6 +432,12 @@ class WorkTracker:
             lines.append(f"  Saved: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(saved_at))}")
         if error:
             lines.append(f"  Error: {error}")
+
+        partial_output = state.get("partial_output")
+        if isinstance(partial_output, str) and partial_output:
+            collapsed = " ".join(partial_output.split())
+            preview = collapsed[:60] + ("..." if len(collapsed) > 60 else "")
+            lines.append(f"  Partial output: {preview}")
 
         # Also show prompt preview
         prompt = state.get("prompt")

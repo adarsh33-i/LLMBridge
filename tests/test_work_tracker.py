@@ -97,6 +97,57 @@ class WorkTrackerTests(unittest.TestCase):
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["messages"], [])
 
+    def test_save_defaults_partial_output_to_empty_string(self):
+        tracker = self._tracker()
+        tracker.save(prompt="p", model_name="m")
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "")
+
+    def test_save_persists_partial_output(self):
+        tracker = self._tracker()
+        tracker.save(prompt="p", model_name="m", partial_output="half an answer")
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "half an answer")
+
+    def test_save_coerces_non_string_partial_output(self):
+        tracker = self._tracker()
+        tracker.save(prompt="p", model_name="m", partial_output=123)  # type: ignore[arg-type]
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "")
+
+    def test_update_progress_persists_partial_output(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.update_progress(progress_percent=50.0, partial_output="so far")
+        tracker.save_interrupted()
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "so far")
+
+    def test_update_progress_omitting_partial_output_leaves_it_unchanged(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.update_progress(progress_percent=50.0, partial_output="kept")
+        tracker.update_progress(progress_percent=60.0)
+        tracker.save_interrupted()
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "kept")
+
+    def test_update_progress_can_clear_partial_output(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.update_progress(progress_percent=50.0, partial_output="kept")
+        tracker.update_progress(progress_percent=60.0, partial_output="")
+        tracker.save_interrupted()
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "")
+
+    def test_save_interrupted_defaults_partial_output_to_empty_string(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.save_interrupted()
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["partial_output"], "")
+
     def test_load_state_returns_none_when_missing(self):
         self.assertIsNone(self._tracker().load_state())
 
@@ -331,6 +382,22 @@ class WorkTrackerTests(unittest.TestCase):
         tracker.start_tracking(prompt="x" * 100, model_name="m")
         tracker.save_interrupted()
         self.assertIn("...", self._tracker().get_progress_summary())
+
+    def test_summary_includes_partial_output_preview(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.update_progress(progress_percent=10.0, partial_output="def solve():\n    return 42")
+        tracker.save_interrupted()
+        summary = self._tracker().get_progress_summary()
+        self.assertIn("Partial output:", summary)
+        self.assertIn("def solve()", summary)
+        self.assertNotIn("\n    return", summary)
+
+    def test_summary_omits_partial_output_when_absent(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.save_interrupted()
+        self.assertNotIn("Partial output:", self._tracker().get_progress_summary())
 
     def test_failed_save_cleans_up_temp_file(self):
         tracker = self._tracker()

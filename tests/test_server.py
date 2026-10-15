@@ -336,6 +336,32 @@ class _StreamFailure:
         raise TimeoutError
 
 
+class _PartialThenFailingStream:
+    """Streams some text, then fails mid-generation."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def __iter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"Hello wor"},"finish_reason":null}]}\n'
+        yield b'data: {"choices":[{"delta":{"content":"ld!"},"finish_reason":null}]}\n'
+        raise TimeoutError
+
+
+class _CompletingStream:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def __iter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n'
+
+
 class InterruptedWorkTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -418,6 +444,55 @@ class InterruptedWorkTests(unittest.TestCase):
         status, state = self._get_interrupted()
         self.assertEqual(status, 200)
         self.assertEqual(state["error"], "Upstream stream timed out")
+
+    def test_stream_failure_saves_partial_output_and_progress(self):
+        body = {
+            "model": "nemotron",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=_PartialThenFailingStream()):
+                with urlopen(self._post_message(body)) as response:
+                    response.read()
+
+        _, state = self._get_interrupted()
+        self.assertEqual(state["partial_output"], "Hello world!")
+        # 12 characters ~ 3 estimated tokens of 100 allowed.
+        self.assertEqual(state["progress_percent"], 3.0)
+        self.assertEqual(state["error"], "Upstream stream timed out")
+
+    def test_stream_failure_without_output_reports_zero_progress(self):
+        body = {
+            "model": "nemotron",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=_StreamFailure()):
+                with urlopen(self._post_message(body)) as response:
+                    response.read()
+
+        _, state = self._get_interrupted()
+        self.assertEqual(state["partial_output"], "")
+        self.assertEqual(state["progress_percent"], 0.0)
+
+    def test_successful_stream_does_not_save_interrupted_work(self):
+        body = {
+            "model": "nemotron",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        with patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "k"}):
+            with patch("llmbridge.server.urlopen", return_value=_CompletingStream()):
+                with urlopen(self._post_message(body)) as response:
+                    result = response.read().decode("utf-8")
+
+        self.assertIn("event: message_stop", result)
+        self.assertFalse(self.state_path.exists())
 
     def test_successful_request_clears_matching_interrupted_work(self):
         self.tracker.start_tracking(prompt="Hello", model_name="nemotron")
