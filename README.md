@@ -53,6 +53,26 @@ claude --model nemotron-local
 
 To persist on Windows across new terminals: `setx ANTHROPIC_BASE_URL "http://127.0.0.1:8787"` (and the same for `ANTHROPIC_AUTH_TOKEN`).
 
+**Claude Code desktop app** doesn't read shell exports either. In the desktop app: Help → Troubleshooting → Enable Developer Mode, restart the app, then go to Developer → Developer Settings → Configure Third-Party Inference and set:
+
+- Base URL: `http://127.0.0.1:8787`
+- Token: `local` (or your `LLMBRIDGE_API_KEY`)
+
+**VS Code extension / CLI** (without shell exports): add the same values to `~/.claude/settings.json` instead:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_AUTH_TOKEN": "local"
+  }
+}
+```
+
+For a per-project setup, put the same `"env"` block in that project's `.claude/settings.json`.
+
+Or skip the exports entirely: `llmbridge claude` launches Claude Code wired to the bridge (add `--print-env` to just see the values).
+
 ---
 
 ## Configuration
