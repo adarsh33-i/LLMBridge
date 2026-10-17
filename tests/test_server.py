@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+from llmbridge.ledger import MAX_TRACKED_INTERRUPTED, GenerationLedger, GenerationRecord
 from llmbridge.routing import ModelRoute, RoutingError
 from llmbridge.server import (
     LLMBridgeHandler,
@@ -380,8 +381,8 @@ class InterruptedWorkTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.state_path = Path(self._tmp.name) / ".partial_work.json"
-        self.tracker = WorkTracker(storage_path=str(self.state_path))
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+        self.tracker = WorkTracker(self.ledger)
         self.server = LLMBridgeServer(
             ("127.0.0.1", 0),
             LLMBridgeHandler,
@@ -441,7 +442,7 @@ class InterruptedWorkTests(unittest.TestCase):
                 with self.assertRaises(HTTPError) as error:
                     urlopen(self._post_message(body))
         error.exception.close()
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_stream_failure_records_interrupted_work(self):
         body = {
@@ -506,7 +507,7 @@ class InterruptedWorkTests(unittest.TestCase):
                     result = response.read().decode("utf-8")
 
         self.assertIn("event: message_stop", result)
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_successful_request_clears_matching_interrupted_work(self):
         self.tracker.start_tracking(prompt="Hello", model_name="nemotron")
@@ -524,7 +525,7 @@ class InterruptedWorkTests(unittest.TestCase):
                 with urlopen(self._post_message(body)) as response:
                     self.assertEqual(response.status, 200)
 
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_successful_request_keeps_unrelated_interrupted_work(self):
         self.tracker.start_tracking(prompt="Some earlier work", model_name="nemotron")
@@ -553,7 +554,7 @@ class InterruptedWorkTests(unittest.TestCase):
         with urlopen(Request(self._url("/v1/interrupted"), method="DELETE")) as response:
             result = json.loads(response.read())
         self.assertTrue(result["cleared"])
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_interrupted_endpoint_requires_authentication(self):
         self.server.client_api_key = "client-secret"
@@ -600,7 +601,7 @@ class InterruptedWorkTests(unittest.TestCase):
     def test_empty_prompt_does_not_clear_saved_work(self):
         self.tracker.save(prompt="Hello", model_name="nemotron")
         LLMBridgeHandler._clear_interrupted_on_match(object(), self.tracker, "")
-        self.assertTrue(self.state_path.exists())
+        self.assertEqual(len(self.ledger.interrupted()), 1)
 
     def test_connection_error_records_interrupted_work(self):
         body = {"model": "nemotron", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}
@@ -699,6 +700,26 @@ class InterruptedWorkTests(unittest.TestCase):
         LLMBridgeHandler._save_interrupted(handler, tracker, "p", "m", None, "boom")
         handler.log_error.assert_called_once()
 
+    def test_save_interrupted_skips_when_generation_record_exists(self):
+        handler = MagicMock()
+        tracker = MagicMock()
+        record = GenerationRecord(
+            id="gen_abc",
+            fingerprint="fp",
+            model="m",
+            prompt="p",
+            system=None,
+            params={},
+            status="running",
+            created_at=0.0,
+            updated_at=0.0,
+        )
+        LLMBridgeHandler._save_interrupted(
+            handler, tracker, "p", "m", None, "boom", record=record
+        )
+        tracker.save.assert_not_called()
+        handler.log_error.assert_not_called()
+
     def test_save_interrupted_forwards_replayable_request(self):
         handler = MagicMock()
         tracker = MagicMock()
@@ -737,7 +758,7 @@ class InterruptedWorkTests(unittest.TestCase):
         self.tracker.save(prompt="Hello", model_name="nemotron")
         handler = MagicMock()
         LLMBridgeHandler._clear_interrupted_on_match(handler, self.tracker, "Other")
-        self.assertTrue(self.state_path.exists())
+        self.assertEqual(len(self.ledger.interrupted()), 1)
 
 
 class StreamResponseUnitTests(unittest.TestCase):
@@ -879,12 +900,37 @@ class ServerSettingsTests(unittest.TestCase):
             self.assertIsNotNone(settings.ledger)
             self.assertEqual(settings.ledger.root, path)
 
-    def test_custom_partial_work_path_is_used(self):
+    def test_custom_partial_work_path_is_no_longer_used(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             settings = self._load({"LLMBRIDGE_PARTIAL_WORK_PATH": str(path)})
             self.assertIsNotNone(settings.work_tracker)
-            self.assertEqual(settings.work_tracker.storage_path, path)
+            # Interrupted work lives in the ledger, not a partial-work file.
+            self.assertEqual(
+                settings.work_tracker.ledger.root, Path(self._tmp.name) / "generations"
+            )
+
+    def test_work_tracker_shares_the_server_ledger(self):
+        settings = self._load({})
+        self.assertIsNotNone(settings.work_tracker)
+        self.assertIsNotNone(settings.ledger)
+        self.assertIs(settings.work_tracker.ledger, settings.ledger)
+
+    def test_interrupted_tracking_without_generations_uses_own_ledger(self):
+        settings = self._load({"LLMBRIDGE_TRACK_GENERATIONS": "0"})
+        self.assertIsNone(settings.ledger)
+        self.assertIsNotNone(settings.work_tracker)
+        self.assertEqual(
+            settings.work_tracker.ledger.root, Path(self._tmp.name) / "generations"
+        )
+
+    def test_ledger_retention_cap_is_env_configurable(self):
+        settings = self._load({"LLMBRIDGE_LEDGER_MAX_RECORDS": "3"})
+        self.assertEqual(settings.ledger.max_records, 3)
+
+    def test_invalid_ledger_retention_cap_falls_back_to_default(self):
+        settings = self._load({"LLMBRIDGE_LEDGER_MAX_RECORDS": "nope"})
+        self.assertEqual(settings.ledger.max_records, MAX_TRACKED_INTERRUPTED)
 
     def test_non_loopback_without_key_exits(self):
         with self.assertRaisesRegex(SystemExit, "LLMBRIDGE_API_KEY is required"):
@@ -1014,8 +1060,8 @@ class FallbackRouteTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.state_path = Path(self._tmp.name) / ".partial_work.json"
-        self.tracker = WorkTracker(storage_path=str(self.state_path))
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+        self.tracker = WorkTracker(self.ledger)
         self.server = LLMBridgeServer(
             ("127.0.0.1", 0),
             LLMBridgeHandler,
@@ -1079,7 +1125,7 @@ class FallbackRouteTests(unittest.TestCase):
                 "http://backup.test/v1/chat/completions",
             ],
         )
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_falls_back_after_non_resumable_primary_error(self):
         bad = HTTPError("http://primary.test", 400, "Bad Request", {}, None)
@@ -1113,7 +1159,7 @@ class FallbackRouteTests(unittest.TestCase):
             call.call_args_list[1].args[0].full_url,
             "http://backup.test/v1/chat/completions",
         )
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_all_routes_failing_records_the_last_error(self):
         quota = HTTPError("http://primary.test", 429, "Too Many", {}, None)
@@ -1224,8 +1270,8 @@ class ResumeInterruptedTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.state_path = Path(self._tmp.name) / ".partial_work.json"
-        self.tracker = WorkTracker(storage_path=str(self.state_path))
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+        self.tracker = WorkTracker(self.ledger)
         self.server = LLMBridgeServer(
             ("127.0.0.1", 0),
             LLMBridgeHandler,
@@ -1300,7 +1346,7 @@ class ResumeInterruptedTests(unittest.TestCase):
             ],
         )
         self.assertEqual(forwarded["stream"], False)
-        self.assertFalse(self.state_path.exists())
+        self.assertEqual(self.ledger.interrupted(), [])
 
     def test_resume_replays_full_recorded_conversation(self):
         history = [

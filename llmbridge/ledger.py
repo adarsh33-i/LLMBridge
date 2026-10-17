@@ -16,6 +16,7 @@ forks, the parent generation it grew out of.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -27,27 +28,91 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
-from .work_tracker import _exclusive_lock, _lock_path_for
+if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
+    import msvcrt
+else:
+    import fcntl
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ROOT = ".llmbridge/generations"
 _DEFAULT_FORK_MAX_TOKENS = 4096
 
+# The ledger keeps only the newest records; older ones are pruned whenever a
+# new generation is created. Interrupted work is surfaced from these records,
+# so anything worth resuming must be among the retained few. Override with
+# LLMBRIDGE_LEDGER_MAX_RECORDS.
+MAX_TRACKED_INTERRUPTED: int = 10
+
+
+def _env_max_records() -> int:
+    """Read the retention cap from the environment, falling back on bad input."""
+    raw = os.environ.get("LLMBRIDGE_LEDGER_MAX_RECORDS")
+    if raw is None:
+        return MAX_TRACKED_INTERRUPTED
+    try:
+        value = int(raw)
+    except ValueError:
+        return MAX_TRACKED_INTERRUPTED
+    return value if value >= 1 else MAX_TRACKED_INTERRUPTED
+
+
+def _lock_path_for(storage_path: Path) -> Path:
+    """Return a stable lock-file path in the system temp directory.
+
+    Keeping locks out of the working directory means a tracker never litters
+    the project with ``.lock`` files. The name is derived from the resolved
+    state path so every process targeting the same state file shares a lock.
+    """
+    key = hashlib.sha256(str(storage_path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "llmbridge-locks" / f"{storage_path.name}.{key}.lock"
+
+
+@contextlib.contextmanager
+def _exclusive_lock(lock_path: Path) -> Iterator[None]:
+    """Serialize access to a ledger record across threads and processes.
+
+    Uses an advisory file lock (fcntl on POSIX, msvcrt on Windows) so that
+    concurrent writers sharing the same record cannot interleave reads,
+    writes, or deletions. The lock is released automatically if a process
+    exits, so a crash cannot leave the lock permanently held.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as lock_file:
+        if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 # Event kinds. ``start`` opens a generation; ``complete`` / ``interrupt`` /
-# ``fail`` close it; ``fork`` records that this generation descends from another.
+# ``fail`` close it; ``fork`` records that this generation descends from another;
+# ``heal`` records a mid-stream failover onto a fallback model; ``queue``
+# records that quota exhaustion parked the request for an automatic retry.
 EVENT_START = "start"
 EVENT_COMPLETE = "complete"
 EVENT_INTERRUPT = "interrupt"
 EVENT_FAIL = "fail"
 EVENT_FORK = "fork"
+EVENT_HEAL = "heal"
+EVENT_QUEUED = "queue"
 
 _STATUS_RUNNING = "running"
 _STATUS_COMPLETED = "completed"
 _STATUS_INTERRUPTED = "interrupted"
 _STATUS_FAILED = "failed"
+_STATUS_QUEUED = "queued"
 
 _ID_RE = re.compile(r"^gen_[A-Za-z0-9]+$")
 
@@ -263,6 +328,7 @@ class GenerationLedger:
         base = root or os.environ.get("LLMBRIDGE_LEDGER_PATH") or _DEFAULT_ROOT
         self.root = Path(base)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.max_records = _env_max_records()
         self._lock = threading.RLock()
 
     def _path(self, generation_id: str) -> Path:
@@ -343,6 +409,7 @@ class GenerationLedger:
             )
         with self._lock:
             self._save(record)
+            self._prune_locked()
         return record
 
     def complete(
@@ -452,6 +519,168 @@ class GenerationLedger:
             logger.error("Failed to delete generation %s: %s", generation_id, error)
             return False
         return True
+
+    def interrupted(self) -> list[GenerationRecord]:
+        """Return interrupted generations, newest first."""
+        return [
+            record
+            for record in self.list(limit=None)
+            if record.status == _STATUS_INTERRUPTED
+        ]
+
+    def children(self, generation_id: str) -> list[GenerationRecord]:
+        """Return forks whose parent is ``generation_id``, newest first."""
+        return [
+            record
+            for record in self.list(limit=None)
+            if record.parent == generation_id
+        ]
+
+    @staticmethod
+    def _queue_event(record: GenerationRecord) -> Optional[GenerationEvent]:
+        for event in reversed(record.events):
+            if event.type == EVENT_QUEUED:
+                return event
+        return None
+
+    @staticmethod
+    def queue_attempt(record: GenerationRecord) -> int:
+        """How many times this record has been queued for retry."""
+        event = GenerationLedger._queue_event(record)
+        if event is None:
+            return 0
+        attempt = event.data.get("attempt")
+        if isinstance(attempt, int) and not isinstance(attempt, bool):
+            return attempt
+        return 0
+
+    @staticmethod
+    def queue_retry_at(record: GenerationRecord) -> float:
+        """When the newest queue entry wants to be retried (epoch seconds)."""
+        event = GenerationLedger._queue_event(record)
+        if event is None:
+            return 0.0
+        retry_at = event.data.get("retry_at")
+        if isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool):
+            return float(retry_at)
+        return 0.0
+
+    def queue(
+        self,
+        record: GenerationRecord,
+        message: str,
+        retry_at: float,
+        attempt: int,
+    ) -> GenerationRecord:
+        """Park a generation for an automatic retry after a quota failure."""
+        record.status = _STATUS_QUEUED
+        self._append(
+            record,
+            EVENT_QUEUED,
+            {"message": message, "retry_at": retry_at, "attempt": attempt},
+        )
+        with self._lock:
+            self._save(record)
+        return record
+
+    def heal(
+        self,
+        record: GenerationRecord,
+        *,
+        from_model: str,
+        to_model: str,
+        resumed_chars: int,
+    ) -> GenerationRecord:
+        """Record that a broken stream was resumed onto a fallback model."""
+        self._append(
+            record,
+            EVENT_HEAL,
+            {
+                "from_model": from_model,
+                "to_model": to_model,
+                "resumed_chars": resumed_chars,
+            },
+        )
+        with self._lock:
+            self._save(record)
+        return record
+
+    def queued(self) -> list[GenerationRecord]:
+        """Return queued generations, earliest retry first."""
+        return sorted(
+            (
+                record
+                for record in self.list(limit=None)
+                if record.status == _STATUS_QUEUED
+            ),
+            key=self.queue_retry_at,
+        )
+
+    def tree(self, generation_id: str, max_depth: int = 8) -> Optional[dict[str, Any]]:
+        """Return a fork lineage: ancestor chain plus the nested subtree.
+
+        The node at ``generation_id`` is expanded with its descendants (bounded
+        by ``max_depth``); ``ancestors`` lists the parent chain root-first so a
+        caller can render the full lineage without extra lookups.
+        """
+        record = self.load(generation_id)
+        if record is None:
+            return None
+
+        def build(record_id: str, depth: int) -> Optional[dict[str, Any]]:
+            current = self.load(record_id)
+            if current is None:
+                return None
+            node: dict[str, Any] = {"record": current.summary(), "children": []}
+            if depth < max_depth:
+                for child in self.children(record_id):
+                    nested = build(child.id, depth + 1)
+                    if nested is not None:
+                        node["children"].append(nested)
+            return node
+
+        ancestors: list[dict[str, Any]] = []
+        seen = {record.id}
+        cursor = record.parent
+        while cursor is not None and cursor not in seen and len(ancestors) < 16:
+            parent = self.load(cursor)
+            if parent is None:
+                break
+            ancestors.append(parent.summary())
+            seen.add(parent.id)
+            cursor = parent.parent
+        ancestors.reverse()
+        return {"id": record.id, "ancestors": ancestors, "node": build(record.id, 0)}
+
+    def prune(self, keep: Optional[int] = None) -> list[str]:
+        """Delete every record except the newest ones.
+
+        Args:
+            keep: How many records to retain; defaults to the ledger's
+                configured cap (``LLMBRIDGE_LEDGER_MAX_RECORDS``, else
+                ``MAX_TRACKED_INTERRUPTED``).
+
+        Returns:
+            The ids of the removed records, oldest first.
+        """
+        with self._lock:
+            return self._prune_locked(keep)
+
+    def _prune_locked(self, keep: Optional[int] = None) -> list[str]:
+        if keep is None:
+            keep = self.max_records
+        if not isinstance(keep, int) or isinstance(keep, bool) or keep < 0:
+            keep = 0
+        removed: list[str] = []
+        # self.list() is newest-first, so the stale tail is walked oldest-first.
+        for record in reversed(self.list(limit=None)[keep:]):
+            if self.delete(record.id):
+                removed.append(record.id)
+        if removed:
+            logger.info(
+                "Pruned %d generation record(s) beyond the newest %d", len(removed), keep
+            )
+        return removed
 
     @staticmethod
     def fork_request(

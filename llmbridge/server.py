@@ -1,7 +1,9 @@
 import hmac
 import ipaddress
 import json
+import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from http.client import HTTPException
@@ -20,6 +22,8 @@ from .protocol import (
 )
 from .routing import ModelRoute, RoutingError, load_model_routes, resolve_model_route
 from .work_tracker import WorkTracker
+
+logger = logging.getLogger(__name__)
 
 # Upstream statuses that usually indicate quota exhaustion, rate limiting, an
 # overloaded backend, or a transient server fault — i.e. work worth resuming
@@ -48,6 +52,41 @@ _DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 180
 # recorded (it always is for runs this server saved, but older state files
 # predate that field).
 _DEFAULT_RESUME_MAX_TOKENS = 4096
+
+# Upstream statuses that mean "quota/rate limit exhausted" rather than "the
+# request was wrong": with LLMBRIDGE_QUEUE_ON_QUOTA=1 these park the request
+# in the ledger for an automatic retry instead of failing immediately.
+_QUEUEABLE_STATUS = frozenset({402, 429})
+_DEFAULT_QUEUE_RETRY_SECONDS = 5.0
+_DEFAULT_QUEUE_MAX_ATTEMPTS = 5
+_QUEUE_POLL_SECONDS = 1.0
+
+
+def _queue_on_quota_enabled() -> bool:
+    return _truthy(os.environ.get("LLMBRIDGE_QUEUE_ON_QUOTA"))
+
+
+def _queue_retry_seconds() -> float:
+    return _env_positive_number(
+        "LLMBRIDGE_QUEUE_RETRY_SECONDS", _DEFAULT_QUEUE_RETRY_SECONDS
+    )
+
+
+def _queue_max_attempts() -> int:
+    raw = os.environ.get("LLMBRIDGE_QUEUE_MAX_ATTEMPTS")
+    if raw is None:
+        return _DEFAULT_QUEUE_MAX_ATTEMPTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_QUEUE_MAX_ATTEMPTS
+    return value if value >= 1 else _DEFAULT_QUEUE_MAX_ATTEMPTS
+
+
+def _self_heal_enabled() -> bool:
+    # Self-healing a broken stream onto a fallback model is the default; it
+    # only changes behaviour when a fallback route is configured anyway.
+    return _truthy(os.environ.get("LLMBRIDGE_SELF_HEAL", "1"))
 
 
 def _is_positive_int(value: Any) -> bool:
@@ -240,6 +279,22 @@ def _build_resume_request(
     return request
 
 
+def _build_heal_body(body: Any, partial_output: str) -> dict[str, Any] | None:
+    """Rebuild a streaming request so a fallback model continues mid-answer.
+
+    The partial text becomes an assistant turn, so the next upstream writes a
+    continuation instead of starting over. Returns None when the original body
+    is not a well-formed Anthropic request.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+        return None
+    healed = dict(body)
+    healed["messages"] = [
+        message for message in body["messages"] if isinstance(message, dict)
+    ] + [{"role": "assistant", "content": partial_output}]
+    return healed
+
+
 def _read_bounded(stream: Any, limit: int) -> bytes:
     """Read an upstream body, refusing to buffer more than ``limit`` bytes.
 
@@ -257,6 +312,10 @@ def _read_bounded(stream: Any, limit: int) -> bytes:
         if total > limit:
             raise ProtocolError("Upstream response exceeded the size limit")
     return b"".join(chunks)
+
+
+def _sse_bytes(event: str, data: dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
 
 def _sse_event_data(event: bytes) -> dict[str, Any] | None:
@@ -377,6 +436,121 @@ class LLMBridgeServer(ThreadingHTTPServer):
         self.client_api_key = client_api_key
         self.work_tracker = work_tracker
         self.ledger = ledger
+        self._queue_stop = threading.Event()
+        self._queue_thread: threading.Thread | None = None
+        if ledger is not None and _queue_on_quota_enabled():
+            # The queue lives in the ledger, so this also re-arms retries that
+            # were pending when the process last exited.
+            self._queue_thread = threading.Thread(
+                target=self._dispatch_queue_loop, daemon=True
+            )
+            self._queue_thread.start()
+
+    def shutdown(self) -> None:
+        self._queue_stop.set()
+        super().shutdown()
+
+    def _dispatch_queue_loop(self) -> None:
+        while not self._queue_stop.wait(_QUEUE_POLL_SECONDS):
+            try:
+                self._dispatch_due_queue()
+            except Exception as error:  # pragma: no cover - defensive
+                logger.error("Queue dispatch failed: %s", error)
+
+    def _dispatch_due_queue(self) -> None:
+        ledger = self.ledger
+        if ledger is None:
+            return
+        now = time.time()
+        for record in ledger.queued():
+            if GenerationLedger.queue_retry_at(record) > now:
+                continue
+            self._run_queued_generation(record)
+
+    def _run_queued_generation(self, record: GenerationRecord) -> None:
+        """Re-send one queued generation to its model route and finalize it."""
+        ledger = self.ledger
+        if ledger is None or record.status != "queued":
+            return
+        try:
+            route, upstream_model = resolve_model_route(
+                record.model, self.model_routes
+            )
+        except RoutingError as error:
+            ledger.fail(record, f"queued model is no longer configured: {error}")
+            return
+        attempt = GenerationLedger.queue_attempt(record)
+        body: dict[str, Any] = dict(record.request)
+        body["model"] = record.model
+        body["stream"] = False
+        if isinstance(record.params, dict) and record.params.get("max_tokens"):
+            body.setdefault("max_tokens", record.params["max_tokens"])
+        payload = anthropic_to_openai(
+            body,
+            upstream_model,
+            reasoning_effort=route.reasoning_effort,
+            supports_images=route.supports_images,
+            supports_tools=route.supports_tools,
+            cache_control=route.cache_control,
+        )
+        try:
+            request = _upstream_request(payload, route)
+        except RoutingError as error:
+            ledger.fail(record, str(error))
+            return
+        try:
+            with urlopen(request, timeout=_upstream_timeout_seconds()) as upstream:
+                reply = json.loads(
+                    _read_bounded(upstream, _MAX_UPSTREAM_RESPONSE_BYTES)
+                )
+        except HTTPError as error:
+            failure = ("http", f"Upstream returned HTTP {error.code}", error.code)
+            error.close()
+            logger.info("Queued generation %s got HTTP %s", record.id, error.code)
+            self._requeue_or_fail(record, attempt, failure)
+            return
+        except (URLError, TimeoutError, OSError) as error:
+            logger.info("Queued generation %s failed: %s", record.id, error)
+            self._requeue_or_fail(
+                record, attempt, ("connect", "Could not connect to the configured upstream", None)
+            )
+            return
+        except (json.JSONDecodeError, ProtocolError) as error:
+            logger.info(
+                "Queued generation %s got an invalid reply: %s", record.id, error
+            )
+            ledger.fail(record, f"upstream returned an invalid response: {error}")
+            return
+        anthropic_response = openai_to_anthropic(reply, record.model)
+        output = _anthropic_text(anthropic_response)
+        tracker = self.work_tracker
+        if tracker is not None and record.prompt:
+            try:
+                tracker.clear_if_matches(record.prompt)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        ledger.complete(record, output, _upstream_output_tokens(reply))
+        logger.info(
+            "Queued generation %s completed (attempt %d)", record.id, attempt
+        )
+
+    def _requeue_or_fail(
+        self, record: GenerationRecord, attempt: int, failure: _Failure
+    ) -> None:
+        """After a failed retry, park it again or give up for good."""
+        ledger = self.ledger
+        if ledger is None:
+            return
+        kind, message, status = failure
+        if (
+            kind == "http"
+            and status in _QUEUEABLE_STATUS
+            and attempt < _queue_max_attempts()
+        ):
+            retry_after = _queue_retry_seconds() * (attempt + 1)
+            ledger.queue(record, message, time.time() + retry_after, attempt + 1)
+            return
+        ledger.fail(record, message)
 
 
 class LLMBridgeHandler(BaseHTTPRequestHandler):
@@ -425,8 +599,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if path == "/v1/generations":
             self._list_generations()
             return
+        if path == "/v1/queue":
+            self._list_queue()
+            return
         if path.startswith("/v1/generations/"):
-            self._send_generation(path)
+            if path.endswith("/tree"):
+                self._generation_tree(path)
+            else:
+                self._send_generation(path)
             return
         self._send_error(404, "not_found", "Endpoint not found")
 
@@ -446,6 +626,9 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if not self._authenticate_client():
             return
         path = urlsplit(self.path).path
+        if path.startswith("/v1/queue/"):
+            self._cancel_queued(path)
+            return
         if path.startswith("/v1/generations/"):
             self._delete_generation(path)
             return
@@ -506,6 +689,57 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             self._send_error(404, "not_found", "Generation not found")
             return
         self._send_json(200, record.to_dict())
+
+    def _generation_tree(self, path: str) -> None:
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        generation_id = self._generation_id_from_path(path, "/tree")
+        tree = ledger.tree(generation_id) if generation_id else None
+        if tree is None:
+            self._send_error(404, "not_found", "Generation not found")
+            return
+        self._send_json(200, tree)
+
+    @staticmethod
+    def _queue_id_from_path(path: str) -> str | None:
+        prefix = "/v1/queue/"
+        if not path.startswith(prefix):
+            return None
+        rest = path[len(prefix):]
+        if not rest or "/" in rest:
+            return None
+        return rest
+
+    def _list_queue(self) -> None:
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        now = time.time()
+        items = []
+        for record in ledger.queued():
+            retry_at = GenerationLedger.queue_retry_at(record)
+            items.append(
+                {
+                    **record.summary(),
+                    "attempt": GenerationLedger.queue_attempt(record),
+                    "retry_at": retry_at,
+                    "retry_in": max(0.0, retry_at - now),
+                }
+            )
+        self._send_json(200, {"object": "list", "data": items})
+
+    def _cancel_queued(self, path: str) -> None:
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        generation_id = self._queue_id_from_path(path)
+        record = ledger.load(generation_id) if generation_id else None
+        if record is None or record.status != "queued":
+            self._send_error(404, "not_found", "No queued generation with that id")
+            return
+        ledger.fail(record, "cancelled from the queue")
+        self._send_json(200, {"cancelled": True, "id": record.id})
 
     def _delete_generation(self, path: str) -> None:
         ledger = self._ledger()
@@ -870,7 +1104,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
     ) -> None:
         payload_error: ValueError | None = None
         failure: _Failure | None = None
-        for route, upstream_model in candidates:
+        for candidate_index, (route, upstream_model) in enumerate(candidates):
             for attempt in range(1, _route_attempts() + 1):
                 try:
                     request = self._build_upstream_request(
@@ -910,8 +1144,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                         continue
                     break
                 # The connection opened, so this route is good enough to start
-                # streaming on. Once the client has bytes it cannot be
-                # re-routed, so mid-stream failures stay on the interrupt path.
+                # streaming on. If it dies mid-stream with text already sent,
+                # _stream_response can still heal onto a later candidate.
                 with upstream:
                     self._stream_response(
                         upstream,
@@ -922,6 +1156,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                         max_tokens=max_tokens,
                         record=record,
                         body=body,
+                        candidates=candidates,
+                        route_index=candidate_index,
                     )
                 return
         self._report_failure(
@@ -938,6 +1174,12 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
 
     def _record_http_failure(self, error: HTTPError) -> _Failure:
         status = error.code
+        retry_after = None
+        if error.headers is not None:
+            raw = error.headers.get("Retry-After")
+            if raw is not None and raw.strip().isdigit():
+                retry_after = float(raw.strip())
+        self._upstream_retry_after = retry_after
         error.close()
         self.log_error("Upstream returned HTTP %s", status)
         return ("http", f"Upstream returned HTTP {status}", status)
@@ -985,6 +1227,15 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             self._finalize_generation(record, "failed", message=message)
             self._send_error(502, "upstream_error", message)
             return
+        if (
+            kind == "http"
+            and status in _QUEUEABLE_STATUS
+            and record is not None
+            and self.server.ledger is not None
+            and _queue_on_quota_enabled()
+        ):
+            if self._queue_for_retry(record, message, status):
+                return
         self._save_interrupted(
             tracker,
             prompt,
@@ -993,6 +1244,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             message,
             max_tokens=max_tokens,
             body=body,
+            record=record,
         )
         self._finalize_generation(record, "interrupted", message=message)
         client_message = message + _generation_recovery_hint(record)
@@ -1000,6 +1252,56 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             self._send_error(504, "upstream_timeout", client_message)
         else:
             self._send_error(502, "upstream_error", client_message)
+
+    def _queue_for_retry(self, record: GenerationRecord, message: str, status: int) -> bool:
+        """Park a quota-failed generation for automatic retry.
+
+        Returns True when the request was queued and answered; False when the
+        attempt budget is exhausted so the caller falls back to the interrupt
+        path. The queue itself lives in the ledger (status "queued"), so a
+        server restart re-arms pending retries automatically.
+        """
+        ledger = self.server.ledger
+        if ledger is None:
+            return False
+        attempt = GenerationLedger.queue_attempt(record) + 1
+        if attempt > _queue_max_attempts():
+            return False
+        retry_after = self._upstream_retry_after or _queue_retry_seconds()
+        retry_at = time.time() + retry_after
+        try:
+            ledger.queue(record, message, retry_at, attempt)
+        except Exception as error:  # pragma: no cover - defensive
+            self.log_error("Could not queue generation %s: %s", record.id, error)
+            return False
+        self.log_message(
+            "queued generation %s (attempt %d, retry in %.1fs)",
+            record.id,
+            attempt,
+            retry_after,
+        )
+        self._send_json(
+            429,
+            {
+                "type": "error",
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": (
+                        message
+                        + f". The request is queued (attempt {attempt}) and will "
+                        + "retry automatically; poll GET /v1/generations/"
+                        + record.id
+                        + " for the result."
+                    ),
+                },
+                "generation_id": record.id,
+                "queued": True,
+                "attempt": attempt,
+                "retry_after": retry_after,
+            },
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+        return True
 
     def _save_interrupted(
         self,
@@ -1012,8 +1314,13 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         partial_output: str = "",
         max_tokens: Any = None,
         body: Any = None,
+        record: GenerationRecord | None = None,
     ) -> None:
         if tracker is None:
+            return
+        if record is not None:
+            # The durable generation record already holds this interruption
+            # (finalized right after us); saving again would duplicate it.
             return
         try:
             tracker.save(
@@ -1087,6 +1394,8 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         max_tokens: Any = None,
         record: GenerationRecord | None = None,
         body: Any = None,
+        candidates: list[tuple[ModelRoute, str]] | None = None,
+        route_index: int = -1,
     ) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1119,6 +1428,29 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     message = "Upstream stream failed"
                 self.log_error("Invalid upstream stream: %s", message)
                 partial_output = "".join(partial_chunks)
+                remaining = (
+                    candidates[route_index + 1:]
+                    if candidates is not None and route_index >= 0
+                    else []
+                )
+                if (
+                    partial_output
+                    and remaining
+                    and _self_heal_enabled()
+                ):
+                    if self._heal_stream(
+                        remaining,
+                        body,
+                        partial_chunks,
+                        reported_tokens,
+                        model,
+                        record,
+                        tracker,
+                        prompt,
+                        system,
+                        max_tokens,
+                    ):
+                        return
                 self._save_interrupted(
                     tracker,
                     prompt,
@@ -1129,6 +1461,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     partial_output=partial_output,
                     max_tokens=max_tokens,
                     body=body,
+                    record=record,
                 )
                 self._finalize_generation(
                     record,
@@ -1177,6 +1510,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                         partial_output=partial_output,
                         max_tokens=max_tokens,
                         body=body,
+                        record=record,
                     )
                 self._finalize_generation(
                     record,
@@ -1186,6 +1520,258 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     message="Client disconnected during streaming response",
                 )
                 return
+
+    def _heal_stream(
+        self,
+        remaining: list[tuple[ModelRoute, str]],
+        body: Any,
+        partial_chunks: list[str],
+        reported_tokens: int | None,
+        model: str,
+        record: GenerationRecord | None,
+        tracker: WorkTracker | None,
+        prompt: str,
+        system: str | None,
+        max_tokens: Any,
+    ) -> bool:
+        """Resume a broken stream on a fallback route, invisibly to the client.
+
+        Tries each remaining candidate once; the first one that opens carries
+        the continuation. Returns True when the outcome (success or a further
+        failure) was fully handled, False when nothing was attempted and the
+        caller should run the normal interrupt path.
+        """
+        partial_output = "".join(partial_chunks)
+        heal_body = _build_heal_body(body, partial_output)
+        if heal_body is None:
+            return False
+        for route, upstream_model in remaining:
+            try:
+                request = self._build_upstream_request(route, upstream_model, heal_body)
+            except ValueError as error:
+                self.log_error(
+                    "Could not rebuild the request for %s: %s", upstream_model, error
+                )
+                continue
+            try:
+                upstream = urlopen(request, timeout=_upstream_timeout_seconds())
+            except (HTTPError, URLError, TimeoutError, OSError) as error:
+                self.log_error("Heal route %s unavailable: %s", upstream_model, error)
+                continue
+            ledger = self.server.ledger
+            if ledger is not None and record is not None:
+                try:
+                    ledger.heal(
+                        record,
+                        from_model=model,
+                        to_model=upstream_model,
+                        resumed_chars=len(partial_output),
+                    )
+                except Exception as error:  # pragma: no cover - defensive
+                    self.log_error("Could not record heal: %s", error)
+            self.log_message(
+                "healing stream onto %s after %d chars", upstream_model, len(partial_output)
+            )
+            with upstream:
+                self._relay_healed_stream(
+                    upstream,
+                    upstream_model,
+                    partial_chunks,
+                    reported_tokens,
+                    model,
+                    record,
+                    tracker,
+                    prompt,
+                    system,
+                    max_tokens,
+                    body,
+                )
+            return True
+        return False
+
+    def _relay_healed_stream(
+        self,
+        upstream: Any,
+        upstream_model: str,
+        partial_chunks: list[str],
+        reported_tokens: int | None,
+        model: str,
+        record: GenerationRecord | None,
+        tracker: WorkTracker | None,
+        prompt: str,
+        system: str | None,
+        max_tokens: Any,
+        body: Any,
+    ) -> None:
+        """Stream a continuation into the client's still-open response.
+
+        Only text deltas are forwarded (the original content block is still
+        open); envelope events from the continuation are swallowed and the
+        bridge emits its own closing message_delta/message_stop.
+        """
+        healed_tokens: int | None = None
+        events = iter(stream_events(upstream, upstream_model))
+        while True:
+            try:
+                event = next(events)
+            except StopIteration:
+                usage: dict[str, Any] = {}
+                if reported_tokens is not None:
+                    usage["output_tokens"] = reported_tokens + (healed_tokens or 0)
+                elif healed_tokens is not None:
+                    usage["output_tokens"] = healed_tokens
+                else:
+                    usage["output_tokens"] = 0
+                closing = [
+                    _sse_bytes(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                            "usage": usage,
+                        },
+                    ),
+                    _sse_bytes("message_stop", {"type": "message_stop"}),
+                ]
+                try:
+                    for chunk in closing:
+                        self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    self._interrupt_after_client_loss(
+                        partial_chunks,
+                        reported_tokens if healed_tokens is None else healed_tokens,
+                        "Client disconnected during streaming response",
+                        model,
+                        record,
+                        tracker,
+                        prompt,
+                        system,
+                        max_tokens,
+                        body,
+                    )
+                    return
+                self._clear_interrupted_on_match(tracker, prompt)
+                self._finalize_generation(
+                    record,
+                    "completed",
+                    output="".join(partial_chunks),
+                    output_tokens=usage.get("output_tokens"),
+                )
+                return
+            except (ProtocolError, TimeoutError, URLError, OSError, HTTPException) as error:
+                if isinstance(error, ProtocolError):
+                    message = str(error)
+                elif isinstance(error, TimeoutError):
+                    message = "Upstream stream timed out"
+                else:
+                    message = "Upstream stream failed"
+                self.log_error("Healed stream failed: %s", message)
+                partial_output = "".join(partial_chunks)
+                progress = _stream_progress(
+                    partial_output, healed_tokens or reported_tokens, max_tokens
+                )
+                self._save_interrupted(
+                    tracker,
+                    prompt,
+                    model,
+                    system,
+                    message,
+                    progress=progress,
+                    partial_output=partial_output,
+                    max_tokens=max_tokens,
+                    body=body,
+                    record=record,
+                )
+                self._finalize_generation(
+                    record,
+                    "interrupted",
+                    output=partial_output,
+                    output_tokens=healed_tokens or reported_tokens,
+                    message=message,
+                    progress=progress,
+                )
+                error_event = json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "upstream_error",
+                            "message": message + _generation_recovery_hint(record),
+                        },
+                    }
+                )
+                try:
+                    self.wfile.write(f"event: error\ndata: {error_event}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    self.log_error("Client disconnected during streaming response")
+                return
+            data = _sse_event_data(event)
+            if data is None:
+                continue
+            event_type = data.get("type")
+            if event_type == "content_block_delta":
+                delta = data.get("delta")
+                if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                    _collect_text_delta(event, partial_chunks)
+                    try:
+                        self.wfile.write(event)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        self._interrupt_after_client_loss(
+                            partial_chunks,
+                            healed_tokens or reported_tokens,
+                            "Client disconnected during streaming response",
+                            model,
+                            record,
+                            tracker,
+                            prompt,
+                            system,
+                            max_tokens,
+                            body,
+                        )
+                        return
+            elif event_type == "message_delta":
+                tokens = _event_output_tokens(event)
+                if tokens is not None:
+                    healed_tokens = tokens
+            # message_start / ping / block start/stop events are swallowed: the
+            # client's original message is still open and must not be restarted.
+
+    def _interrupt_after_client_loss(
+        self,
+        partial_chunks: list[str],
+        reported_tokens: int | None,
+        message: str,
+        model: str,
+        record: GenerationRecord | None,
+        tracker: WorkTracker | None,
+        prompt: str,
+        system: str | None,
+        max_tokens: Any,
+        body: Any,
+    ) -> None:
+        partial_output = "".join(partial_chunks)
+        if partial_output:
+            self._save_interrupted(
+                tracker,
+                prompt,
+                model,
+                system,
+                message,
+                progress=_stream_progress(partial_output, reported_tokens, max_tokens),
+                partial_output=partial_output,
+                max_tokens=max_tokens,
+                body=body,
+                record=record,
+            )
+        self._finalize_generation(
+            record,
+            "interrupted",
+            output=partial_output,
+            output_tokens=reported_tokens,
+            message=message,
+        )
 
     def _authenticate_client(self) -> bool:
         expected_key = self.server.client_api_key
@@ -1202,11 +1788,15 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         self._send_error(401, "authentication_error", "Valid client API key required")
         return False
 
-    def _send_json(self, status: int, value: dict[str, Any]) -> None:
+    def _send_json(
+        self, status: int, value: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> None:
         data = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for key, header_value in (headers or {}).items():
+            self.send_header(key, header_value)
         generation_id = getattr(self, "_generation_id", None)
         if generation_id:
             self.send_header("X-LLMBridge-Generation", generation_id)
@@ -1250,14 +1840,14 @@ def load_server_settings() -> "ServerSettings":
             "  llmbridge setup    # guided configuration\n"
             "  llmbridge doctor   # diagnose the environment"
         ) from error
-    work_tracker = None
-    if _truthy(os.environ.get("LLMBRIDGE_TRACK_INTERRUPTED", "1")):
-        work_tracker = WorkTracker(
-            storage_path=os.environ.get("LLMBRIDGE_PARTIAL_WORK_PATH") or None
-        )
     ledger = None
     if _truthy(os.environ.get("LLMBRIDGE_TRACK_GENERATIONS", "1")):
         ledger = GenerationLedger(os.environ.get("LLMBRIDGE_LEDGER_PATH") or None)
+    work_tracker = None
+    if _truthy(os.environ.get("LLMBRIDGE_TRACK_INTERRUPTED", "1")):
+        # Interrupted work is stored as ledger records; share the server's
+        # ledger so a generation is saved exactly once.
+        work_tracker = WorkTracker(ledger)
     return ServerSettings(
         host=host,
         port=port,

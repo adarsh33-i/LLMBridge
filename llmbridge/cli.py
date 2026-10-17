@@ -7,6 +7,7 @@ launches Claude Code pointed at the bridge.
 """
 
 import argparse
+import difflib
 import json
 import os
 import socket
@@ -121,6 +122,47 @@ def build_parser() -> argparse.ArgumentParser:
     fork.add_argument("--stream", action="store_true", help="Stream the forked response")
     fork.add_argument("--base-url", help="Bridge base URL (default http://127.0.0.1:8787)")
     fork.add_argument("--api-key", help="Bridge API key (or LLMBRIDGE_API_KEY)")
+
+    tree = subparsers.add_parser(
+        "tree", help="Show a generation's fork lineage (ancestors and children)"
+    )
+    tree.add_argument("id", help="Generation id, e.g. gen_1a2b3c4d5e6f")
+    tree.add_argument("--ledger", help="Path to the generation ledger directory")
+    tree.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+
+    diff = subparsers.add_parser(
+        "diff", help="Compare two recorded generations side by side"
+    )
+    diff.add_argument("a", help="First generation id")
+    diff.add_argument("b", help="Second generation id")
+    diff.add_argument("--ledger", help="Path to the generation ledger directory")
+    diff.add_argument(
+        "--context", type=int, default=2, help="Diff context lines (default 2)"
+    )
+
+    replay = subparsers.add_parser(
+        "replay", help="Re-run recorded requests and compare against saved outputs"
+    )
+    replay.add_argument("id", nargs="?", help="Generation id to replay")
+    replay.add_argument(
+        "--all", action="store_true", help="Replay every completed generation"
+    )
+    replay.add_argument(
+        "--limit", type=int, default=10, help="With --all: how many to replay (default 10)"
+    )
+    replay.add_argument(
+        "--model", help="Route alias to replay on (defaults to each record's model)"
+    )
+    replay.add_argument(
+        "--threshold",
+        type=float,
+        default=0.8,
+        help="Similarity ratio that counts as a pass (default 0.8)",
+    )
+    replay.add_argument("--config", help="Path to llmbridge.toml")
+    replay.add_argument("--ledger", help="Path to the generation ledger directory")
 
     setup = subparsers.add_parser(
         "setup", help="Write a model routing config interactively"
@@ -289,6 +331,182 @@ def _fork(args: argparse.Namespace) -> int:
     if generation_id:
         print(f"# forked generation: {generation_id}", file=sys.stderr)
     return 0
+
+
+def _describe(record) -> str:
+    preview = (record.prompt or "")[:48].replace("\n", " ")
+    return f"{record.id} ({record.status}, {record.model}) {preview!r}"
+
+
+def _tree(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    tree = ledger.tree(args.id)
+    if tree is None:
+        print(f"error: generation {args.id} not found", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(tree, indent=2))
+        return 0
+    ancestors = tree.get("ancestors", [])
+    if ancestors:
+        print(" → ".join(record["id"] for record in ancestors))
+        print("↓")
+    node = tree.get("node") or {}
+
+    def render(current: dict, prefix: str = "") -> None:
+        record = current.get("record", {})
+        marker = "└── " if prefix else ""
+        print(f"{prefix}{marker}{_describe_from_summary(record)}")
+        children = current.get("children", [])
+        for index, child in enumerate(children):
+            last = index == len(children) - 1
+            render(child, prefix + ("    " if not prefix or last else "│   "))
+
+    render(node)
+    return 0
+
+
+def _describe_from_summary(summary: dict) -> str:
+    preview = (summary.get("prompt_preview") or "")[:48].replace("\n", " ")
+    return (
+        f"{summary.get('id')} ({summary.get('status')}, {summary.get('model')})"
+        f" {preview!r}"
+    )
+
+
+def _load_generation(ledger: GenerationLedger, generation_id: str):
+    try:
+        return ledger.load(generation_id)
+    except ValueError:
+        return None
+
+
+def _diff(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    first = _load_generation(ledger, args.a)
+    second = _load_generation(ledger, args.b)
+    if first is None or second is None:
+        missing = args.a if first is None else args.b
+        print(f"error: generation {missing} not found", file=sys.stderr)
+        return 1
+    print(f"{'':<12}{'A':<24}{'B':<24}")
+    print(f"{'model':<12}{first.model:<24}{second.model:<24}")
+    print(f"{'status':<12}{first.status:<24}{second.status:<24}")
+    first_tokens = "-" if first.output_tokens is None else str(first.output_tokens)
+    second_tokens = "-" if second.output_tokens is None else str(second.output_tokens)
+    print(f"{'tokens':<12}{first_tokens:<24}{second_tokens:<24}")
+    print(f"{'chars':<12}{len(first.output):<24}{len(second.output):<24}")
+    ratio = difflib.SequenceMatcher(None, first.output, second.output).ratio()
+    print(f"{'similarity':<12}{ratio:.2f}")
+    if first.output != second.output:
+        print()
+        for line in difflib.unified_diff(
+            first.output.splitlines(),
+            second.output.splitlines(),
+            fromfile=first.id,
+            tofile=second.id,
+            lineterm="",
+            n=getattr(args, "context", 2),
+        ):
+            print(line)
+    return 0
+
+
+def _replay_output(routes: dict, alias: str, body: dict) -> tuple[str | None, str | None]:
+    """Send one replay request to a route; return (text, error)."""
+    route = routes.get(alias)
+    if route is None:
+        return None, f"no configured model alias {alias!r}"
+    try:
+        from .protocol import anthropic_to_openai, openai_to_anthropic
+
+        upstream_model = route.model or alias
+        payload = anthropic_to_openai(
+            body,
+            upstream_model,
+            reasoning_effort=route.reasoning_effort,
+            supports_images=route.supports_images,
+            supports_tools=route.supports_tools,
+            cache_control=route.cache_control,
+        )
+        headers = {"Content-Type": "application/json"}
+        api_key = route.api_key()
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
+        request = Request(
+            route.completions_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(request, timeout=120) as response:
+            upstream_reply = json.loads(response.read().decode("utf-8", "replace"))
+    except RoutingError as error:
+        return None, str(error)
+    except HTTPError as error:
+        error.close()
+        return None, f"upstream returned HTTP {error.code}"
+    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        return None, f"upstream request failed: {error}"
+    anthropic_reply = openai_to_anthropic(upstream_reply, alias)
+    text = "".join(
+        block.get("text", "")
+        for block in anthropic_reply.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    return text, None
+
+
+def _replay(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    if getattr(args, "all", False):
+        targets = [
+            record
+            for record in ledger.list(limit=None)
+            if record.status == "completed"
+        ][: max(args.limit, 0)]
+    elif args.id:
+        record = _load_generation(ledger, args.id)
+        if record is None:
+            print(f"error: generation {args.id} not found", file=sys.stderr)
+            return 1
+        targets = [record]
+    else:
+        print("error: give a generation id or --all", file=sys.stderr)
+        return 1
+    if not targets:
+        print("No completed generations to replay.")
+        return 0
+    try:
+        routes = _load_routes(getattr(args, "config", None))
+    except RoutingError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    failures = 0
+    for record in targets:
+        alias = getattr(args, "model", None) or record.model
+        body = dict(record.request)
+        body.setdefault("model", alias)
+        if record.params.get("max_tokens"):
+            body.setdefault("max_tokens", record.params["max_tokens"])
+        text, error = _replay_output(routes, alias, body)
+        if error is not None:
+            failures += 1
+            print(f"FAIL {record.id}: {error}")
+            continue
+        ratio = difflib.SequenceMatcher(None, record.output, text or "").ratio()
+        passed = ratio >= args.threshold
+        if not passed:
+            failures += 1
+        label = "PASS" if passed else "FAIL"
+        print(
+            f"{label} {record.id}: similarity {ratio:.2f} "
+            f"(threshold {args.threshold:.2f}, saved {len(record.output)} chars, "
+            f"replayed {len(text or '')} chars)"
+        )
+    print(f"{len(targets) - failures}/{len(targets)} replay(s) matched")
+    return 0 if failures == 0 else 1
 
 
 def _prompt(label: str, default: str | None = None) -> str:
@@ -545,6 +763,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "generations": _generations,
         "status": _status,
         "fork": _fork,
+        "tree": _tree,
+        "diff": _diff,
+        "replay": _replay,
         "setup": _setup,
         "doctor": _doctor,
         "claude": _claude,

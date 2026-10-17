@@ -4,6 +4,22 @@
 # environment, not this file:
 #   LLMBRIDGE_TRACK_GENERATIONS=1            # record every generation (default on)
 #   LLMBRIDGE_LEDGER_PATH=.llmbridge/generations
+#   LLMBRIDGE_TRACK_INTERRUPTED=1            # save interrupted work for resumption
+#   LLMBRIDGE_LEDGER_MAX_RECORDS=10          # records retained in the ledger
+# Only the newest records are kept; interrupted work is one of them.
+#
+# Self-healing streams (stitch a broken stream back together on a fallback):
+#   LLMBRIDGE_SELF_HEAL=1                    # default on; needs fallbacks below
+#
+# Queue generations on quota errors instead of failing them:
+#   LLMBRIDGE_QUEUE_ON_QUOTA=1               # opt-in (default off)
+#   LLMBRIDGE_QUEUE_RETRY_SECONDS=5          # base delay without an upstream Retry-After
+#   LLMBRIDGE_QUEUE_MAX_ATTEMPTS=5           # dispatch attempts before failing
+#
+# Inspect the results with:
+#   llmbridge tree <id>      # fork lineage
+#   llmbridge diff <idA> <idB>
+#   llmbridge replay <id> | --all   # regression-check outputs against the ledger
 
 [models.nemotron-local]
 base_url = "http://127.0.0.1:11434/v1"

@@ -6,20 +6,52 @@ A local protocol bridge that routes **Anthropic Messages API** requests to **Ope
 
 ## Quick Start
 
+**1. Install** with [uv](https://docs.astral.sh/uv/) — it bootstraps Python and keeps the tool isolated:
+
+macOS / Linux:
+
 ```bash
-pip install -e .
+brew install uv    # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install git+https://github.com/adarsh33-i/LLMBridge
+```
+
+Windows (PowerShell):
+
+```powershell
+winget install Git.Git        # installing from GitHub needs git
+winget install astral-sh.uv
+uv tool install git+https://github.com/adarsh33-i/LLMBridge
+```
+
+Upgrade any time with `uv tool upgrade llmbridge`. Working from a clone instead? `pip install -e .` works the same on both platforms (Python 3.11+).
+
+**2. Configure and start:**
+
+```bash
 llmbridge setup        # guided config (Ollama, OpenAI, OpenRouter, NVIDIA presets)
 llmbridge doctor       # verify config, keys, port
 llmbridge serve        # start server on http://127.0.0.1:8787
 ```
 
-### Point Claude Code at the bridge
+**3. Point Claude Code at the bridge**
+
+macOS / Linux (bash or zsh):
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="local"      # or your LLMBRIDGE_API_KEY
 claude --model nemotron-local             # use a configured alias
 ```
+
+Windows (PowerShell):
+
+```powershell
+$env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8787"
+$env:ANTHROPIC_AUTH_TOKEN = "local"
+claude --model nemotron-local
+```
+
+To persist on Windows across new terminals: `setx ANTHROPIC_BASE_URL "http://127.0.0.1:8787"` (and the same for `ANTHROPIC_AUTH_TOKEN`).
 
 ---
 
@@ -70,6 +102,9 @@ Legacy single-endpoint vars (`LLMBRIDGE_UPSTREAM_*`) still supported.
 | `llmbridge generations` | List recorded generations |
 | `llmbridge status` | Summarize ledger, flag recoverable work |
 | `llmbridge fork <id> --model <alias>` | Continue a generation on another model |
+| `llmbridge tree <id>` | Render a fork lineage (ancestors + descendants) |
+| `llmbridge diff <idA> <idB>` | Compare two generations' outputs side by side |
+| `llmbridge replay <id>\|--all` | Re-send recorded requests; flag output drift |
 
 ---
 
@@ -87,7 +122,10 @@ Legacy single-endpoint vars (`LLMBRIDGE_UPSTREAM_*`) still supported.
 | `GET` | `/v1/generations` | List durable generations |
 | `GET` | `/v1/generations/{id}` | Full generation record |
 | `POST` | `/v1/generations/{id}/fork` | Fork/continue generation on another model |
+| `GET` | `/v1/generations/{id}/tree` | Fork lineage: ancestors + nested subtree |
 | `DELETE` | `/v1/generations/{id}` | Remove generation from ledger |
+| `GET` | `/v1/queue` | List generations parked on quota (queue mode) |
+| `DELETE` | `/v1/queue/{id}` | Cancel a queued generation |
 
 Every `/v1/messages` response includes `X-LLMBridge-Generation` header with the generation ID.
 
@@ -114,23 +152,84 @@ curl ... /v1/generations/gen_1a2b3c4d5e6f/fork -d '{"model":"strong","max_tokens
 # or: llmbridge fork gen_1a2b3c4d5e6f --model strong
 ```
 
-Ledger: atomic writes, file-lock serialized, per-file `0600` permissions. Disable with `LLMBRIDGE_TRACK_GENERATIONS=0`.
+Ledger: atomic writes, file-lock serialized, per-file `0600` permissions. Disable with `LLMBRIDGE_TRACK_GENERATIONS=0`. Only the newest records are kept — 10 by default (`MAX_TRACKED_INTERRUPTED` in `llmbridge/ledger.py`, override with `LLMBRIDGE_LEDGER_MAX_RECORDS`); older ones are pruned as new generations arrive.
+
+### Lineage, diffs, and replay
+
+Forks record their parent, so every generation knows where it grew from:
+
+```bash
+llmbridge tree gen_1a2b3c4d5e6f          # ASCII lineage: ancestors + children
+curl ... /v1/generations/gen_1a2b3c4d5e6f/tree   # same, as JSON
+
+llmbridge diff gen_1a2b3c4d5e6f gen_9f8e7d6c5b4a   # outputs side by side + similarity
+
+# Regression suite: re-send recorded requests and compare against saved output
+llmbridge replay gen_1a2b3c4d5e6f        # one generation
+llmbridge replay --all --limit 20 --threshold 0.8   # newest 20 completed; exit 1 on drift
+```
+
+`replay` sends the exact recorded request back to the configured route and scores the new output against the saved one with `difflib` similarity. Use it after switching models, editing prompts, or upgrading upstreams to catch behavioral drift.
+
+---
+
+## Self-Healing Streams
+
+When a streaming response breaks mid-generation (proxy hiccup, upstream crash, malformed SSE), the bridge does not give the client a truncated answer. If partial text was already sent **and** a fallback route is configured, it:
+
+1. Opens the next fallback with the partial output appended as an assistant turn
+2. Stitches the continuation into the **same SSE stream** — the client sees one unbroken response and one `message_start`
+3. Records a `heal` event in the ledger (from/to model + how many characters were resumed)
+
+The final generation record contains the full stitched output. Disable with:
+
+```bash
+LLMBRIDGE_SELF_HEAL=0
+```
+
+Tool-use blocks are not stitched — healing applies to text output only; without partial text or a fallback the normal interrupted-work flow applies.
+
+---
+
+## Quota-Aware Queue
+
+Opt in to park requests on upstream quota/rate-limit errors instead of failing them:
+
+```bash
+LLMBRIDGE_QUEUE_ON_QUOTA=1        # opt-in (default off)
+LLMBRIDGE_QUEUE_RETRY_SECONDS=5   # base delay when upstream sends no Retry-After
+LLMBRIDGE_QUEUE_MAX_ATTEMPTS=5    # give up after this many dispatch attempts
+```
+
+On a `402`/`429` the bridge:
+
+1. Parks the generation in the ledger (status `queued`, attempt + retry time recorded)
+2. Replies `429` with `Retry-After`, a `generation_id`, and `"queued": true`
+3. A background dispatcher retries the recorded request until the upstream recovers — surviving restarts, because the queue **is** the ledger
+4. The client polls `GET /v1/generations/{id}` for the completed output, or cancels with `DELETE /v1/queue/{id}`
+
+```bash
+curl ... /v1/queue         # what is parked, next retry time, attempt count
+curl -X DELETE ... /v1/queue/gen_1a2b3c4d5e6f   # cancel
+```
 
 ---
 
 ## Partial Work Tracking (Auto)
 
-The bridge automatically saves interrupted work when upstream fails (quota, rate limit, timeout, stream error):
+The bridge automatically saves interrupted work when upstream fails (quota, rate limit, timeout, stream error). Interrupted work is not a separate file — it is stored as an `interrupted` generation record in the same ledger (`.llmbridge/generations/`), so it can be inspected and forked like any other generation:
 
-- **Saved**: prompt, partial output, progress %, error context
+- **Saved**: prompt, partial output, progress %, error context, replayable request
 - **Auto-cleared**: when same prompt succeeds
-- **Inspect**: `GET /v1/interrupted`
+- **Inspect**: `GET /v1/interrupted` (returns the newest interrupted record)
 - **Resume**: `POST /v1/interrupted/resume` — sends partial output as assistant turn
+- **Retention**: among the newest 10 ledger records; resuming creates a new generation record
 
 ```bash
 # Config
 LLMBRIDGE_TRACK_INTERRUPTED=1   # enabled by default
-LLMBRIDGE_PARTIAL_WORK_PATH=.partial_work.json
+LLMBRIDGE_LEDGER_PATH=.llmbridge/generations
+LLMBRIDGE_LEDGER_MAX_RECORDS=10 # records retained in the ledger
 ```
 
 ---
@@ -156,7 +255,7 @@ LLMBRIDGE_PARTIAL_WORK_PATH=.partial_work.json
 - Server binds `127.0.0.1:8787` by default (no auth on loopback)
 - Non-loopback bind requires `LLMBRIDGE_API_KEY` (≥32 chars)
 - Use TLS reverse proxy for network access
-- Ledger & partial work files contain plain-text prompts (`0600` perms)
+- Ledger records contain plain-text prompts (`0600` perms)
 - Anthropic Files API key grants file retrieval access to bridge clients
 
 ---

@@ -494,5 +494,197 @@ class ClaudeCommandTests(unittest.TestCase):
         self.assertIn("not found on PATH", err.getvalue())
 
 
+def _replay_request(prompt="seed prompt", model="primary", **extra):
+    body = {
+        "model": model,
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    body.update(extra)
+    return body
+
+
+class LedgerBackedCommandTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = cli.GenerationLedger(str(Path(self._tmp.name) / "gens"))
+
+    def _completed(self, prompt="seed prompt", output="shared answer", model="primary"):
+        record = self.ledger.create(_replay_request(prompt=prompt), model)
+        self.ledger.complete(record, output, 3)
+        return record
+
+
+class TreeCommandTests(LedgerBackedCommandTests):
+    def test_renders_ancestors_and_children(self):
+        parent = self._completed(prompt="root", output="root answer")
+        child = self.ledger.create(
+            _replay_request(prompt="root"), "backup",
+            parent=parent.id, fork_event_seq=1,
+        )
+        self.ledger.complete(child, "child answer", 4)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(["tree", child.id, "--ledger", str(self.ledger.root)])
+        self.assertEqual(code, 0)
+        rendered = out.getvalue()
+        self.assertIn(parent.id, rendered)
+        self.assertIn(child.id, rendered)
+        self.assertIn("backup", rendered)
+
+    def test_json_output_is_machine_readable(self):
+        parent = self._completed()
+        child = self.ledger.create(
+            _replay_request(), "backup", parent=parent.id, fork_event_seq=1
+        )
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(
+                ["tree", child.id, "--ledger", str(self.ledger.root), "--json"]
+            )
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["id"], child.id)
+        self.assertEqual(payload["ancestors"][0]["id"], parent.id)
+
+    def test_unknown_id_fails(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = cli.main(["tree", "gen_missing", "--ledger", str(self.ledger.root)])
+        self.assertEqual(code, 1)
+        self.assertIn("not found", err.getvalue())
+
+
+class DiffCommandTests(LedgerBackedCommandTests):
+    def test_reports_models_and_similarity(self):
+        first = self._completed(output="alpha beta gamma")
+        second = self._completed(prompt="other", output="alpha delta gamma")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(["diff", first.id, second.id, "--ledger", str(self.ledger.root)])
+        self.assertEqual(code, 0)
+        rendered = out.getvalue()
+        self.assertIn("similarity", rendered)
+        self.assertIn(first.id, rendered)
+        self.assertIn(second.id, rendered)
+        self.assertIn("--- " + first.id, rendered)
+        self.assertIn("+++ " + second.id, rendered)
+
+    def test_identical_outputs_skip_the_unified_diff(self):
+        first = self._completed()
+        second = self._completed(prompt="other")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(["diff", first.id, second.id, "--ledger", str(self.ledger.root)])
+        self.assertEqual(code, 0)
+        rendered = out.getvalue()
+        self.assertIn("similarity", rendered)
+        self.assertNotIn("--- " + first.id, rendered)
+
+    def test_missing_generation_fails(self):
+        existing = self._completed()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = cli.main(
+                ["diff", existing.id, "gen_missing", "--ledger", str(self.ledger.root)]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("gen_missing", err.getvalue())
+
+
+class ReplayCommandTests(LedgerBackedCommandTests):
+    _CONFIG = """
+[models.primary]
+base_url = "http://primary.test/v1"
+model = "primary-model"
+
+[models.backup]
+base_url = "http://backup.test/v1"
+model = "backup-model"
+"""
+
+    def setUp(self):
+        super().setUp()
+        config = Path(self._tmp.name) / "llmbridge.toml"
+        config.write_text(self._CONFIG, encoding="utf-8")
+        self._env = patch.dict(
+            os.environ, {"LLMBRIDGE_CONFIG": str(config)}, clear=False
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main([*argv, "--ledger", str(self.ledger.root)])
+        return code, out.getvalue()
+
+    def test_passes_when_replayed_output_matches(self):
+        record = self._completed(output="the answer")
+        with patch.object(cli, "_replay_output", return_value=("the answer", None)):
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 0)
+        self.assertIn("PASS", rendered)
+        self.assertIn("1/1 replay(s) matched", rendered)
+
+    def test_fails_below_threshold(self):
+        record = self._completed(output="the answer")
+        with patch.object(cli, "_replay_output", return_value=("utterly different", None)):
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL", rendered)
+
+    def test_threshold_option_controls_the_verdict(self):
+        record = self._completed(output="the answer")
+        replayed = "the answer but longer now"
+        with patch.object(cli, "_replay_output", return_value=(replayed, None)):
+            code, _ = self._run("replay", record.id)
+            self.assertEqual(code, 1)
+            code, rendered = self._run(
+                "replay", record.id, "--threshold", "0.2"
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("PASS", rendered)
+
+    def test_upstream_errors_fail_without_raising(self):
+        record = self._completed()
+        with patch.object(cli, "_replay_output", return_value=(None, "upstream down")):
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("upstream down", rendered)
+
+    def test_requires_a_target(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = cli.main(["replay", "--ledger", str(self.ledger.root)])
+        self.assertEqual(code, 1)
+        self.assertIn("generation id or --all", err.getvalue())
+
+    def test_all_replays_only_completed_records(self):
+        done = self._completed(output="done answer")
+        stalled = self.ledger.create(_replay_request(prompt="stalled"), "primary")
+        self.ledger.interrupt(stalled, "quota", output="half", progress=10.0)
+        with patch.object(
+            cli, "_replay_output", return_value=("done answer", None)
+        ) as replay:
+            code, rendered = self._run("replay", "--all")
+        self.assertEqual(code, 0)
+        self.assertEqual(replay.call_count, 1)
+        body = replay.call_args[0][2]
+        self.assertEqual(body["messages"][0]["content"], "seed prompt")
+        self.assertIn("1/1", rendered)
+
+    def test_unknown_model_alias_fails_cleanly(self):
+        record = self.ledger.create(_replay_request(model="ghost"), "ghost")
+        self.ledger.complete(record, "text", 1)
+        code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("ghost", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
