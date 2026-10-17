@@ -1,62 +1,31 @@
 """Track partially finished AI generation work for resumption with different models.
 
 Design philosophy:
-- Track ONLY the interrupted/prompt that was being processed when generation stopped
-- No size limits during ongoing generation (just mark "in progress")
-- When generation stops (quota error, etc.), save the interrupted prompt, any
-  partial output already generated, and a progress estimate
-- After resumption/completion, clear the state
-- State is small (one prompt + partial output + metadata), so no arbitrary KB caps needed
-- Saved state has no expiry — resume the next day if needed
+- Interrupted work is stored as durable generation records in the ledger
+  (``.llmbridge/generations`` by default) — the same records the server
+  already keeps for every request. There is no separate partial-work file.
+- An interrupted generation is a record with status ``interrupted``: it holds
+  the original prompt, the full replayable request, whatever partial output
+  was produced, a progress estimate, and the error that stopped it.
+- Only the newest records are retained (``MAX_TRACKED_INTERRUPTED``), so
+  resumable work is always among the kept records.
+- Saved state has no expiry — resume the next day if needed.
 """
 
-import contextlib
-import hashlib
-import json
 import logging
-import os
-import re
-import tempfile
 import threading
 import time
-from pathlib import Path
-from typing import Any, Iterator, Optional, List
+from typing import Any, Optional
 
-if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
-    import msvcrt
-else:
-    import fcntl
+from .ledger import (
+    EVENT_INTERRUPT,
+    GenerationLedger,
+    GenerationRecord,
+)
 
 logger = logging.getLogger(__name__)
 
 _UNSET: Any = object()
-
-_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-
-def _lock_path_for(storage_path: Path) -> Path:
-    """Return a stable lock-file path in the system temp directory.
-
-    Keeping locks out of the working directory means a tracker never litters
-    the project with ``.lock`` files. The name is derived from the resolved
-    state path so every process targeting the same state file shares a lock.
-    """
-    key = hashlib.sha256(str(storage_path.resolve()).encode("utf-8")).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / "llmbridge-locks" / f"{storage_path.name}.{key}.lock"
-
-
-def _validate_namespace(namespace: str) -> str:
-    """Reject namespaces that could escape the working directory.
-
-    A namespace is interpolated into a filename, so path separators and
-    leading dots (``..``) must be refused to prevent path traversal.
-    """
-    if not isinstance(namespace, str) or not _NAMESPACE_RE.match(namespace):
-        raise ValueError(
-            "namespace must start with an alphanumeric character and contain only "
-            "letters, digits, '.', '_' or '-'"
-        )
-    return namespace
 
 
 def _format_percent(value: Any) -> str:
@@ -67,80 +36,38 @@ def _format_percent(value: Any) -> str:
         return "n/a"
 
 
-@contextlib.contextmanager
-def _exclusive_lock(lock_path: Path) -> Iterator[None]:
-    """Serialize access to the state file across threads and processes.
-
-    Uses an advisory file lock (fcntl on POSIX, msvcrt on Windows) so that
-    concurrent trackers sharing the same state file cannot interleave reads,
-    writes, or deletions. The lock is released automatically if a process
-    exits, so a crash cannot leave the lock permanently held.
-    """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+") as lock_file:
-        if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
 class WorkTracker:
     """Tracks partially finished AI generation work so it can be resumed
     with a different model after quota exhaustion or errors.
 
+    State lives in a :class:`GenerationLedger`: saving interrupted work opens
+    a generation record and closes it with an ``interrupt`` event. Because
+    each interruption is its own record, concurrent generations no longer
+    overwrite one another's saved state; the newest interrupted record is the
+    one surfaced for resumption.
+
     Key design:
     - State is ONLY saved when generation stops (not on every call)
     - The interrupted prompt, the partial output generated so far, and minimal
-      metadata are stored
-    - No arbitrary KB caps — the state is naturally small (one prompt + the
-      partial output of a single generation)
-    - Saved state persists until resumed or explicitly cleared
-    - Clear automatically after resumption or on demand
-    - Access to the state file is serialized with an advisory file lock, so
-      concurrent trackers sharing a path cannot corrupt or interleave writes
-    - In-memory session state is guarded by a lock, so a single instance may be
-      shared across threads
-
-    Note: the default storage path is a single shared slot. If you expect
-    multiple concurrent generations that must resume independently, give each
-    one its own ``storage_path`` (or ``namespace``).
+      metadata are stored in the ledger record
+    - Saved state persists until resumed, cleared, or pruned with older
+      records
+    - Clear automatically after a matching prompt completes, or on demand
+    - In-memory session state is guarded by a lock, so a single instance may
+      be shared across threads
     """
 
-    def __init__(self, storage_path: Optional[str] = None, *, namespace: Optional[str] = None):
+    def __init__(self, ledger: Optional[GenerationLedger] = None):
         """Initialize the work tracker.
 
         Args:
-            storage_path: Path to the JSON file for storing partial work.
-                If None, uses ".partial_work.json" (optionally namespaced) in
-                the session cwd.
-            namespace: Optional name to scope the default state file, producing
-                ".partial_work.<namespace>.json". Ignored when ``storage_path``
-                is provided. Use one namespace per independent generation.
+            ledger: The generation ledger that stores interrupted work. If
+                None, a ledger at the default root (``.llmbridge/generations``,
+                overridable via ``LLMBRIDGE_LEDGER_PATH``) is used.
         """
-        if storage_path is None:
-            if namespace:
-                self.storage_path = Path(f".partial_work.{_validate_namespace(namespace)}.json")
-            else:
-                self.storage_path = Path(".partial_work.json")
-        else:
-            self.storage_path = Path(storage_path)
-        self._ensure_storage_dir()
-        self._lock_path = _lock_path_for(self.storage_path)
+        self.ledger = ledger if ledger is not None else GenerationLedger()
         self._session_lock = threading.RLock()
-
-    def _ensure_storage_dir(self) -> None:
-        """Ensure the directory for the storage file exists."""
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self._session: Optional[dict[str, Any]] = None
 
     def start_tracking(
         self,
@@ -153,8 +80,8 @@ class WorkTracker:
         """Mark the start of a generation session.
 
         This should be called when beginning a generation run. It does NOT
-        save to disk immediately — it just sets internal state. State is saved
-        only when generation stops (via save_interrupted()).
+        save to the ledger immediately — it just sets internal state. State is
+        saved only when generation stops (via save_interrupted()).
 
         Args:
             prompt: The original user prompt that started the generation.
@@ -165,31 +92,31 @@ class WorkTracker:
                 conversation instead of only the last prompt (optional).
         """
         with self._session_lock:
-            self._current_prompt = prompt
-            self._current_model = model_name
-            self._current_system = system
-            self._progress_percent = 0.0
-            self._error: Optional[str] = None
-            self._messages: List[dict[str, Any]] = []
-            self._partial_output = ""
-            self._request = request
-
-        # Do NOT save to disk here — just set internal state
-        # This avoids saving on every intermediate step
+            self._session = {
+                "prompt": prompt,
+                "model_name": model_name,
+                "system": system,
+                "progress_percent": 0.0,
+                "error": None,
+                "messages": [],
+                "partial_output": "",
+                "max_tokens": None,
+                "request": request,
+            }
 
     def update_progress(
         self,
         *,
         progress_percent: float,
         error: Any = _UNSET,
-        messages: Optional[List[dict[str, Any]]] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
         partial_output: Any = _UNSET,
     ) -> None:
         """Update the current generation progress (called during generation).
 
         This can be called periodically during a long generation. It updates
-        internal state but does NOT save to disk. Only the final interrupted
-        state will be saved.
+        internal state but does NOT save to the ledger. Only the final
+        interrupted state will be saved.
 
         Args:
             progress_percent: Current progress percentage (0-100).
@@ -202,56 +129,46 @@ class WorkTracker:
                 values are treated as empty.
         """
         with self._session_lock:
-            # Clamp progress to 0-100 range
+            session = self._require_session()
             try:
-                self._progress_percent = max(0.0, min(100.0, float(progress_percent)))
+                session["progress_percent"] = max(0.0, min(100.0, float(progress_percent)))
             except (TypeError, ValueError):
-                self._progress_percent = 0.0
+                session["progress_percent"] = 0.0
             if error is not _UNSET:
-                self._error = error or None
+                session["error"] = error or None
             if messages is not None:
-                self._messages = messages
+                session["messages"] = messages
             if partial_output is not _UNSET:
-                self._partial_output = partial_output if isinstance(partial_output, str) else ""
+                session["partial_output"] = (
+                    partial_output if isinstance(partial_output, str) else ""
+                )
 
     def save_interrupted(self) -> dict[str, Any]:
-        """Save the interrupted generation state to disk.
+        """Save the interrupted generation state to the ledger.
 
         Call this method when generation stops unexpectedly (quota error,
         rate limit, etc.) so the work can be resumed with a different model.
 
-        The saved state holds the current prompt, any partial output recorded
-        via update_progress(), and minimal metadata — no intermediate progress
-        steps. Message history is only included if it was passed to
-        update_progress(). This keeps the state naturally small (typically
-        500 bytes - a few KB) without needing arbitrary KB caps.
-
-        The write is atomic: the state is written to a temporary file and then
-        moved into place, so a crash mid-write cannot leave a corrupt state
-        file behind.
+        The saved state becomes an interrupted generation record holding the
+        current prompt, any partial output recorded via update_progress(),
+        and minimal metadata.
 
         Returns:
             The saved state dictionary (same format as load_state() returns).
         """
         with self._session_lock:
-            if not hasattr(self, "_current_prompt"):
-                raise RuntimeError("No generation session in progress. Call start_tracking() first.")
-
-            state = {
-                "saved_at": time.time(),
-                "prompt": self._current_prompt,
-                "model_name": self._current_model,
-                "system": self._current_system,
-                "progress_percent": self._progress_percent,
-                "error": self._error,
-                "messages": self._messages,
-                "partial_output": self._partial_output,
-                "request": getattr(self, "_request", None),
-            }
-
-        self._write_state(state)
-        self._log_saved(state)
-        return state
+            session = dict(self._require_session())
+        return self.save(
+            prompt=session["prompt"],
+            model_name=session["model_name"],
+            system=session["system"],
+            progress_percent=session["progress_percent"],
+            error=session["error"],
+            messages=session["messages"],
+            partial_output=session["partial_output"],
+            max_tokens=session["max_tokens"],
+            request=session["request"],
+        )
 
     def save(
         self,
@@ -261,7 +178,7 @@ class WorkTracker:
         system: Optional[str] = None,
         progress_percent: float = 0.0,
         error: Optional[str] = None,
-        messages: Optional[List[dict[str, Any]]] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
         partial_output: str = "",
         max_tokens: Optional[int] = None,
         request: Optional[dict[str, Any]] = None,
@@ -270,10 +187,9 @@ class WorkTracker:
 
         Stateless counterpart to :meth:`save_interrupted` for callers that build
         the state per request instead of using start_tracking()/update_progress()
-        (for example, a server handling concurrent requests). Because it reads
-        no shared session state, two threads calling ``save()`` cannot attribute
-        one request's prompt to another; the on-disk write is still serialized
-        by the advisory file lock.
+        (for example, a server handling concurrent requests). Each call records
+        its own ledger entry, so two threads calling ``save()`` cannot
+        attribute one request's prompt to another.
 
         Args:
             partial_output: Assistant text generated before the interruption
@@ -287,158 +203,180 @@ class WorkTracker:
         Returns:
             The saved state dictionary (same format as ``load_state()``).
         """
-        state = {
-            "saved_at": time.time(),
-            "prompt": prompt,
-            "model_name": model_name,
-            "system": system,
-            "progress_percent": progress_percent,
-            "error": error,
-            "messages": list(messages) if messages is not None else [],
-            "partial_output": partial_output if isinstance(partial_output, str) else "",
-            "max_tokens": max_tokens,
-            "request": request,
-        }
-        self._write_state(state)
+        record = self.ledger.create(
+            self._build_record_body(
+                prompt=prompt,
+                model_name=model_name,
+                system=system,
+                max_tokens=max_tokens,
+                messages=messages,
+                request=request,
+            ),
+            model_name,
+        )
+        self.ledger.interrupt(
+            record,
+            error if isinstance(error, str) else ("" if error is None else str(error)),
+            output=partial_output if isinstance(partial_output, str) else "",
+            progress=progress_percent if isinstance(progress_percent, (int, float)) else 0.0,
+        )
+        state = self._state_from_record(record)
         self._log_saved(state)
         return state
 
-    def _write_state(self, state: dict[str, Any]) -> None:
-        # Write atomically — no size cap needed because this stores only:
-        # - One prompt string (the original user prompt)
-        # - Model name (short string)
-        # - Progress percentage (number)
-        # - Error message (optional, usually short)
-        # - Partial output (the text streamed before the stop)
-        # - Optional message history (only if provided)
-        # Typical total: 500 bytes - a few KB
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self.storage_path.parent),
-            prefix=f".{self.storage_path.name}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                with _exclusive_lock(self._lock_path):
-                    json.dump(state, f, indent=2)
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except OSError:
-                        logger.debug(
-                            "fsync unavailable for %s; skipping durability flush",
-                            self.storage_path,
-                        )
-                    os.replace(tmp_path, self.storage_path)
-        except BaseException:
+    @staticmethod
+    def _build_record_body(
+        *,
+        prompt: str,
+        model_name: str,
+        system: Optional[str],
+        max_tokens: Optional[int],
+        messages: Optional[list[dict[str, Any]]],
+        request: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build an Anthropic-style body that a ledger record can capture."""
+        replay = request if isinstance(request, dict) else {}
+        replay_messages = replay.get("messages")
+        if isinstance(replay_messages, list) and replay_messages:
+            body_messages = [item for item in replay_messages if isinstance(item, dict)]
+        elif isinstance(messages, list) and messages:
+            body_messages = [item for item in messages if isinstance(item, dict)]
+        else:
+            body_messages = [{"role": "user", "content": prompt if isinstance(prompt, str) else ""}]
+
+        body: dict[str, Any] = {
+            "model": model_name,
+            "messages": body_messages,
+            "stream": False,
+        }
+        resolved_system = system if isinstance(system, str) and system else replay.get("system")
+        if isinstance(resolved_system, str) and resolved_system:
+            body["system"] = resolved_system
+        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
+            body["max_tokens"] = max_tokens
+        tools = replay.get("tools")
+        if isinstance(tools, list) and tools:
+            body["tools"] = tools
+        if replay.get("tool_choice") is not None:
+            body["tool_choice"] = replay["tool_choice"]
+        return body
+
+    @staticmethod
+    def _state_from_record(record: GenerationRecord) -> dict[str, Any]:
+        """Map an interrupted ledger record to the partial-work state shape."""
+        error: Optional[str] = None
+        progress = 0.0
+        for event in reversed(record.events):
+            if event.type != EVENT_INTERRUPT:
+                continue
+            message = event.data.get("message")
+            error = message if isinstance(message, str) and message else None
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                progress = float(event.data.get("progress_percent") or 0.0)
+            except (TypeError, ValueError):
+                progress = 0.0
+            break
+        replay = record.request if isinstance(record.request, dict) else {}
+        messages = replay.get("messages")
+        params = record.params if isinstance(record.params, dict) else {}
+        max_tokens = params.get("max_tokens")
+        return {
+            "saved_at": record.updated_at,
+            "prompt": record.prompt if isinstance(record.prompt, str) else "",
+            "model_name": record.model,
+            "system": record.system,
+            "progress_percent": progress,
+            "error": error,
+            "messages": messages if isinstance(messages, list) else [],
+            "partial_output": record.output if isinstance(record.output, str) else "",
+            "max_tokens": (
+                max_tokens
+                if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+                else None
+            ),
+            "request": replay or None,
+            "generation_id": record.id,
+        }
+
+    def _require_session(self) -> dict[str, Any]:
+        if self._session is None:
+            raise RuntimeError(
+                "No generation session in progress. Call start_tracking() first."
+            )
+        return self._session
 
     def _log_saved(self, state: dict[str, Any]) -> None:
         prompt = state["prompt"]
         prompt_preview = prompt[:50] if isinstance(prompt, str) else ""
         logger.info(
-            "Saved interrupted work to %s (prompt=%r, progress=%s, error=%r)",
-            self.storage_path,
+            "Saved interrupted work as %s in %s (prompt=%r, progress=%s, error=%r)",
+            state["generation_id"],
+            self.ledger.root,
             prompt_preview,
             _format_percent(state["progress_percent"]),
             state["error"],
         )
 
     def load_state(self) -> Optional[dict[str, Any]]:
-        """Load the previously saved interrupted work state.
+        """Load the most recently interrupted generation's state.
 
         Returns:
-            The saved state dictionary, or None if no state is saved
-            or the file doesn't exist.
+            The saved state dictionary, or None if no interrupted work
+            is recorded in the ledger.
         """
-        if not self.storage_path.exists():
+        records = self.ledger.interrupted()
+        if not records:
             return None
-
-        try:
-            with _exclusive_lock(self._lock_path):
-                with open(self.storage_path, "r") as f:
-                    state = json.load(f)
-
-            if not isinstance(state, dict):
-                logger.error(
-                    "Ignoring interrupted work at %s: expected a JSON object, got %s",
-                    self.storage_path,
-                    type(state).__name__,
-                )
-                return None
-
-            prompt = state.get("prompt")
-            prompt_preview = prompt[:50] if isinstance(prompt, str) else ""
-            logger.info(
-                "Loaded interrupted work from %s (prompt=%r, progress=%s)",
-                self.storage_path,
-                prompt_preview,
-                _format_percent(state.get("progress_percent")),
-            )
-            return state
-
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to load interrupted work from %s: %s", self.storage_path, e)
-            return None
+        state = self._state_from_record(records[0])
+        prompt = state["prompt"]
+        prompt_preview = prompt[:50] if isinstance(prompt, str) else ""
+        logger.info(
+            "Loaded interrupted work %s from %s (prompt=%r, progress=%s)",
+            state["generation_id"],
+            self.ledger.root,
+            prompt_preview,
+            _format_percent(state["progress_percent"]),
+        )
+        return state
 
     def clear_state(self) -> bool:
-        """Clear the saved interrupted work state.
+        """Clear the newest saved interrupted work record.
 
         Returns:
-            True if the state was cleared, False if there was nothing to clear.
+            True if a record was cleared, False if there was nothing to clear.
         """
-        if not self.storage_path.exists():
-            logger.info("No interrupted work state to clear at %s", self.storage_path)
+        records = self.ledger.interrupted()
+        if not records:
+            logger.info("No interrupted work state to clear in %s", self.ledger.root)
             self._reset_session()
             return False
-
-        with _exclusive_lock(self._lock_path):
-            try:
-                self.storage_path.unlink()
-            except FileNotFoundError:
-                logger.info("No interrupted work state to clear at %s", self.storage_path)
-                self._reset_session()
-                return False
-        logger.info("Cleared interrupted work state from %s", self.storage_path)
-        self._reset_session()
-        return True
-
-    def clear_if_matches(self, prompt: str) -> bool:
-        """Clear the saved state only when its prompt matches ``prompt``.
-
-        Unlike :meth:`clear_state`, the read-compare-delete happens under a
-        single advisory lock. That closes the check-then-act window where a
-        concurrent :meth:`save` of *different* work could slip in between a
-        :meth:`load_state` and an unconditional :meth:`clear_state` and be
-        silently deleted.
-
-        Returns:
-            True if a state with a matching prompt was cleared, else False.
-        """
-        if not self.storage_path.exists():
-            self._reset_session()
-            return False
-        cleared = False
-        with _exclusive_lock(self._lock_path):
-            try:
-                with open(self.storage_path, "r") as state_file:
-                    state = json.load(state_file)
-            except (json.JSONDecodeError, OSError):
-                state = None
-            if isinstance(state, dict) and state.get("prompt") == prompt:
-                try:
-                    self.storage_path.unlink()
-                    cleared = True
-                except FileNotFoundError:
-                    cleared = False
+        cleared = self.ledger.delete(records[0].id)
         if cleared:
             logger.info(
-                "Cleared interrupted work state from %s (prompt match)",
-                self.storage_path,
+                "Cleared interrupted work %s from %s", records[0].id, self.ledger.root
+            )
+        self._reset_session()
+        return cleared
+
+    def clear_if_matches(self, prompt: str) -> bool:
+        """Clear the newest interrupted record whose prompt matches ``prompt``.
+
+        Called once the same prompt completes successfully, so finished work
+        is no longer offered for resumption. Only the matched record is
+        removed; older interrupted records are left untouched.
+
+        Returns:
+            True if a record with a matching prompt was cleared, else False.
+        """
+        cleared = False
+        for record in self.ledger.interrupted():
+            if record.prompt == prompt:
+                cleared = self.ledger.delete(record.id)
+                break
+        if cleared:
+            logger.info(
+                "Cleared interrupted work from %s (prompt match)",
+                self.ledger.root,
             )
         self._reset_session()
         return cleared
@@ -446,18 +384,7 @@ class WorkTracker:
     def _reset_session(self) -> None:
         """Forget any in-memory generation session."""
         with self._session_lock:
-            for attribute in (
-                "_current_prompt",
-                "_current_model",
-                "_current_system",
-                "_progress_percent",
-                "_error",
-                "_messages",
-                "_partial_output",
-                "_request",
-            ):
-                if hasattr(self, attribute):
-                    delattr(self, attribute)
+            self._session = None
 
     def get_progress_summary(self) -> str:
         """Get a human-readable summary of the current interrupted work state.
@@ -479,6 +406,7 @@ class WorkTracker:
 
         lines = [
             "Interrupted work in progress:",
+            f"  Record: {state.get('generation_id') or 'unknown'}",
             f"  Model: {model}",
             f"  Stage: {stage}",
             f"  Progress: {progress:.1f}%",
@@ -507,8 +435,7 @@ def track_generation(
     prompt: str,
     model_name: str,
     system: Optional[str] = None,
-    storage_path: Optional[str] = None,
-    namespace: Optional[str] = None,
+    ledger: Optional[GenerationLedger] = None,
 ) -> WorkTracker:
     """Quick-track a generation session for later resumption.
 
@@ -520,16 +447,13 @@ def track_generation(
         prompt: The original user prompt.
         model_name: The model being used.
         system: System prompt/instructions (optional).
-        storage_path: Path to the JSON state file (optional; defaults to
-            ".partial_work.json" in the current working directory).
-        namespace: Optional name to scope the default state file so independent
-            generations do not share one slot. Ignored when ``storage_path``
-            is provided.
+        ledger: The generation ledger that stores interrupted work (optional;
+            defaults to ``.llmbridge/generations``).
 
     Returns:
         A WorkTracker instance with the session started.
     """
-    tracker = WorkTracker(storage_path=storage_path, namespace=namespace)
+    tracker = WorkTracker(ledger)
     tracker.start_tracking(
         prompt=prompt,
         model_name=model_name,

@@ -3,28 +3,47 @@ import io
 import json
 import os
 import threading
-import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import mock
 
-from llmbridge.work_tracker import WorkTracker, _exclusive_lock, track_generation
+from llmbridge.ledger import EVENT_INTERRUPT, EVENT_START, GenerationLedger
+from llmbridge.work_tracker import WorkTracker, track_generation
 
 
 class WorkTrackerTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.path = Path(self._tmp.name) / ".partial_work.json"
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
 
     def _tracker(self):
-        return WorkTracker(storage_path=str(self.path))
+        return WorkTracker(self.ledger)
+
+    def _record_files(self):
+        return list(self.ledger.root.glob("gen_*.json"))
 
     def test_start_tracking_does_not_write_to_disk(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="hello", model_name="model-a")
-        self.assertFalse(self.path.exists())
+        self.assertEqual(self._record_files(), [])
+
+    def test_save_interrupted_creates_interrupted_ledger_record(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="do the thing", model_name="model-a", system="be terse")
+        tracker.update_progress(progress_percent=42.5, error="quota exhausted")
+        state = tracker.save_interrupted()
+
+        files = self._record_files()
+        self.assertEqual(len(files), 1)
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(data["status"], "interrupted")
+        self.assertEqual(data["prompt"], "do the thing")
+        self.assertEqual(
+            [event["type"] for event in data["events"]], [EVENT_START, EVENT_INTERRUPT]
+        )
+        self.assertTrue(state["generation_id"].startswith("gen_"))
+        self.assertEqual(state["generation_id"], data["id"])
 
     def test_save_and_load_round_trip(self):
         tracker = self._tracker()
@@ -32,7 +51,6 @@ class WorkTrackerTests(unittest.TestCase):
         tracker.update_progress(progress_percent=42.5, error="quota exhausted")
         tracker.save_interrupted()
 
-        self.assertTrue(self.path.exists())
         loaded = self._tracker().load_state()
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded["prompt"], "do the thing")
@@ -40,17 +58,6 @@ class WorkTrackerTests(unittest.TestCase):
         self.assertEqual(loaded["system"], "be terse")
         self.assertEqual(loaded["progress_percent"], 42.5)
         self.assertEqual(loaded["error"], "quota exhausted")
-
-    def test_saved_state_is_valid_json(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="json check", model_name="model-a")
-        tracker.save_interrupted()
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(data["prompt"], "json check")
-
-    def test_save_interrupted_without_session_raises(self):
-        with self.assertRaises(RuntimeError):
-            self._tracker().save_interrupted()
 
     def test_save_writes_state_without_a_session(self):
         tracker = self._tracker()
@@ -60,7 +67,7 @@ class WorkTrackerTests(unittest.TestCase):
             system="be brief",
             error="quota exhausted",
         )
-        self.assertTrue(self.path.exists())
+        self.assertEqual(len(self._record_files()), 1)
         self.assertEqual(saved["prompt"], "direct save")
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["prompt"], "direct save")
@@ -68,7 +75,17 @@ class WorkTrackerTests(unittest.TestCase):
         self.assertEqual(loaded["system"], "be brief")
         self.assertEqual(loaded["progress_percent"], 0.0)
         self.assertEqual(loaded["error"], "quota exhausted")
-        self.assertEqual(loaded["messages"], [])
+        self.assertEqual(
+            loaded["messages"], [{"role": "user", "content": "direct save"}]
+        )
+
+    def test_save_interrupted_without_session_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._tracker().save_interrupted()
+
+    def test_update_progress_without_session_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._tracker().update_progress(progress_percent=1.0)
 
     def test_save_does_not_disturb_an_active_session(self):
         tracker = self._tracker()
@@ -83,6 +100,16 @@ class WorkTrackerTests(unittest.TestCase):
         self.assertEqual(loaded["model_name"], "model-a")
         self.assertEqual(loaded["progress_percent"], 10.0)
 
+    def test_concurrent_saves_do_not_overwrite_each_other(self):
+        first = self._tracker()
+        first.save(prompt="first", model_name="m", error="quota")
+        second = self._tracker()
+        second.save(prompt="second", model_name="m", error="rate limited")
+
+        self.assertEqual(len(self._record_files()), 2)
+        # The newest interrupted record is the one offered for resumption.
+        self.assertEqual(self._tracker().load_state()["prompt"], "second")
+
     def test_save_copies_messages(self):
         tracker = self._tracker()
         messages = [{"role": "user", "content": "hi"}]
@@ -91,17 +118,16 @@ class WorkTrackerTests(unittest.TestCase):
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["messages"], [{"role": "user", "content": "hi"}])
 
-    def test_save_defaults_messages_to_empty_list(self):
+    def test_save_defaults_messages_to_prompt_fallback(self):
         tracker = self._tracker()
         tracker.save(prompt="p", model_name="m")
         loaded = self._tracker().load_state()
-        self.assertEqual(loaded["messages"], [])
-
-    def test_save_defaults_partial_output_to_empty_string(self):
-        tracker = self._tracker()
-        tracker.save(prompt="p", model_name="m")
-        loaded = self._tracker().load_state()
-        self.assertEqual(loaded["partial_output"], "")
+        # The record keeps the prompt as a replayable user turn.
+        self.assertEqual(
+            loaded["messages"], [{"role": "user", "content": "p"}]
+        )
+        record = self.ledger.load(loaded["generation_id"])
+        self.assertEqual(record.prompt, "p")
 
     def test_save_persists_partial_output(self):
         tracker = self._tracker()
@@ -114,6 +140,17 @@ class WorkTrackerTests(unittest.TestCase):
         tracker.save(prompt="p", model_name="m", partial_output=123)  # type: ignore[arg-type]
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["partial_output"], "")
+
+    def test_save_persists_max_tokens(self):
+        tracker = self._tracker()
+        tracker.save(prompt="p", model_name="m", max_tokens=512)
+        self.assertEqual(self._tracker().load_state()["max_tokens"], 512)
+
+    def test_save_ignores_invalid_max_tokens(self):
+        tracker = self._tracker()
+        for bad in (0, -5, "big", True, None):
+            state = tracker.save(prompt="p", model_name="m", max_tokens=bad)
+            self.assertIsNone(state["max_tokens"])
 
     def test_update_progress_persists_partial_output(self):
         tracker = self._tracker()
@@ -141,28 +178,39 @@ class WorkTrackerTests(unittest.TestCase):
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["partial_output"], "")
 
-    def test_save_interrupted_defaults_partial_output_to_empty_string(self):
+    def test_update_progress_coerces_non_string_partial_output(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
+        tracker.update_progress(progress_percent=10.0, partial_output=42)  # type: ignore[arg-type]
         tracker.save_interrupted()
-        loaded = self._tracker().load_state()
-        self.assertEqual(loaded["partial_output"], "")
+        self.assertEqual(self._tracker().load_state()["partial_output"], "")
 
-    def test_load_state_returns_none_when_missing(self):
+    def test_load_state_returns_none_when_nothing_interrupted(self):
         self.assertIsNone(self._tracker().load_state())
 
-    def test_load_state_returns_none_on_corrupt_file(self):
-        self.path.write_text("{ not valid json", encoding="utf-8")
+    def test_load_state_ignores_completed_generations(self):
+        record = self.ledger.create(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            "m",
+        )
+        self.ledger.complete(record, "done", 3)
         self.assertIsNone(self._tracker().load_state())
+
+    def test_load_state_tolerates_corrupt_records(self):
+        tracker = self._tracker()
+        tracker.save(prompt="good", model_name="m")
+        (self.ledger.root / "gen_broken.json").write_text("{ not valid json", encoding="utf-8")
+        self.assertEqual(self._tracker().load_state()["prompt"], "good")
 
     def test_state_has_no_expiry(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="old work", model_name="model-a")
         tracker.save_interrupted()
 
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        data["saved_at"] = 0  # ancient timestamp
-        self.path.write_text(json.dumps(data), encoding="utf-8")
+        path = self._record_files()[0]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["updated_at"] = 0  # ancient timestamp
+        path.write_text(json.dumps(data), encoding="utf-8")
 
         loaded = self._tracker().load_state()
         self.assertIsNotNone(loaded)
@@ -172,14 +220,7 @@ class WorkTrackerTests(unittest.TestCase):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
         tracker.update_progress(progress_percent=90.0)
-        self.assertFalse(self.path.exists())
-
-    def test_messages_are_optional(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        tracker.save_interrupted()
-        loaded = self._tracker().load_state()
-        self.assertEqual(loaded["messages"], [])
+        self.assertEqual(self._record_files(), [])
 
     def test_messages_are_persisted_when_provided(self):
         tracker = self._tracker()
@@ -189,13 +230,13 @@ class WorkTrackerTests(unittest.TestCase):
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["messages"], [{"role": "user", "content": "hi"}])
 
-    def test_clear_state_removes_file_and_resets_session(self):
+    def test_clear_state_removes_record_and_resets_session(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
         tracker.save_interrupted()
 
         self.assertTrue(tracker.clear_state())
-        self.assertFalse(self.path.exists())
+        self.assertEqual(self._record_files(), [])
         self.assertIsNone(tracker.load_state())
         # Clearing twice reports nothing to clear.
         self.assertFalse(tracker.clear_state())
@@ -203,36 +244,58 @@ class WorkTrackerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             tracker.save_interrupted()
 
-    def test_clear_state_without_file_returns_false(self):
+    def test_clear_state_without_records_returns_false(self):
         self.assertFalse(self._tracker().clear_state())
 
-    def test_clear_state_without_file_resets_session(self):
+    def test_clear_state_without_records_resets_session(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
         self.assertFalse(tracker.clear_state())
         with self.assertRaises(RuntimeError):
             tracker.save_interrupted()
 
+    def test_clear_state_only_removes_interrupted_records(self):
+        tracker = self._tracker()
+        completed = self.ledger.create(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "done"}]},
+            "m",
+        )
+        self.ledger.complete(completed, "done", 3)
+        tracker.save(prompt="interrupted work", model_name="m")
+
+        self.assertTrue(tracker.clear_state())
+        remaining = self.ledger.list(limit=None)
+        self.assertEqual([record.id for record in remaining], [completed.id])
+        self.assertEqual(remaining[0].status, "completed")
+
     def test_clear_if_matches_clears_matching_prompt(self):
         tracker = self._tracker()
         tracker.save(prompt="Hello", model_name="m")
         self.assertTrue(tracker.clear_if_matches("Hello"))
-        self.assertFalse(self.path.exists())
+        self.assertEqual(self._record_files(), [])
 
     def test_clear_if_matches_keeps_other_prompt(self):
         tracker = self._tracker()
         tracker.save(prompt="Hello", model_name="m")
         self.assertFalse(tracker.clear_if_matches("Other"))
-        self.assertTrue(self.path.exists())
+        self.assertEqual(len(self._record_files()), 1)
         self.assertEqual(self._tracker().load_state()["prompt"], "Hello")
 
-    def test_clear_if_matches_without_file_returns_false(self):
+    def test_clear_if_matches_without_records_returns_false(self):
         self.assertFalse(self._tracker().clear_if_matches("Hello"))
 
     def test_clear_if_matches_tolerates_corrupt_state(self):
-        self.path.write_text("{ not json", encoding="utf-8")
+        (self.ledger.root / "gen_broken.json").write_text("{ not json", encoding="utf-8")
         self.assertFalse(self._tracker().clear_if_matches("Hello"))
-        self.assertTrue(self.path.exists())
+
+    def test_clear_if_matches_clears_only_the_matching_record(self):
+        tracker = self._tracker()
+        tracker.save(prompt="Stale", model_name="m")
+        tracker.save(prompt="Hello", model_name="m")
+
+        self.assertTrue(tracker.clear_if_matches("Hello"))
+        prompts = [record.prompt for record in self.ledger.list(limit=None)]
+        self.assertEqual(prompts, ["Stale"])
 
     def test_save_persists_replayable_request(self):
         tracker = self._tracker()
@@ -253,29 +316,21 @@ class WorkTrackerTests(unittest.TestCase):
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["request"], request)
 
-    def test_replayable_request_defaults_to_none(self):
+    def test_replayable_request_defaults_to_recorded_prompt_turn(self):
         tracker = self._tracker()
         tracker.save(prompt="hi", model_name="m")
-        self.assertIsNone(self._tracker().load_state()["request"])
-
-    def test_load_state_returns_none_for_non_dict_json(self):
-        for content in ("[1, 2, 3]", "42", '"a string"', "null"):
-            self.path.write_text(content, encoding="utf-8")
-            self.assertIsNone(self._tracker().load_state())
-
-    def test_load_state_survives_null_prompt(self):
-        self.path.write_text('{"prompt": null, "saved_at": 1}', encoding="utf-8")
-        loaded = self._tracker().load_state()
-        self.assertEqual(loaded, {"prompt": None, "saved_at": 1})
-
-    def test_get_progress_summary_survives_invalid_field_types(self):
-        self.path.write_text(
-            '{"prompt": null, "progress_percent": null, "model_name": null, "saved_at": "x"}',
-            encoding="utf-8",
+        self.assertEqual(
+            self._tracker().load_state()["request"],
+            {"messages": [{"role": "user", "content": "hi"}]},
         )
-        summary = self._tracker().get_progress_summary()
-        self.assertIn("0.0%", summary)
-        self.assertIn("unknown", summary)
+
+    def test_state_survives_a_new_tracker_and_ledger_instance(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="durable", model_name="model-a")
+        tracker.save_interrupted()
+
+        reopened = WorkTracker(GenerationLedger(str(self.ledger.root)))
+        self.assertEqual(reopened.load_state()["prompt"], "durable")
 
     def test_update_progress_can_clear_error(self):
         tracker = self._tracker()
@@ -295,14 +350,6 @@ class WorkTrackerTests(unittest.TestCase):
         loaded = self._tracker().load_state()
         self.assertEqual(loaded["error"], "boom")
 
-    def test_saved_state_omits_dead_metadata_field(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        tracker.save_interrupted()
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertNotIn("metadata", data)
-        self.assertFalse(hasattr(tracker, "_started_at"))
-
     def test_get_progress_summary_without_state(self):
         self.assertEqual(self._tracker().get_progress_summary(), "No interrupted work in progress")
 
@@ -317,127 +364,22 @@ class WorkTrackerTests(unittest.TestCase):
         self.assertIn("33.0%", summary)
         self.assertIn("rate limited", summary)
         self.assertIn("summarize me", summary)
+        self.assertIn("gen_", summary)
         # saved_at is surfaced rather than being dead metadata.
         self.assertIn("Saved:", summary)
 
-    def test_save_is_atomic_and_leaves_no_temp_files(self):
+    def test_get_progress_summary_survives_invalid_field_types(self):
         tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        tracker.save_interrupted()
-        leftovers = [
-            p.name
-            for p in self.path.parent.iterdir()
-            if p != self.path and not p.name.endswith(".lock")
-        ]
-        self.assertEqual(leftovers, [])
+        tracker.save(prompt="p", model_name="m")
+        path = self._record_files()[0]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["model"] = ""
+        data["events"][-1]["data"]["progress_percent"] = None
+        path.write_text(json.dumps(data), encoding="utf-8")
 
-    def test_namespace_scopes_default_state_file(self):
-        with TemporaryDirectory() as directory:
-            cwd = os.getcwd()
-            os.chdir(directory)
-            try:
-                tracker = WorkTracker(namespace="session-a")
-                self.assertEqual(tracker.storage_path.name, ".partial_work.session-a.json")
-                other = WorkTracker(namespace="session-b")
-                self.assertNotEqual(tracker.storage_path, other.storage_path)
-            finally:
-                os.chdir(cwd)
-
-    def test_namespace_ignored_when_storage_path_given(self):
-        tracker = WorkTracker(storage_path=str(self.path), namespace="ignored")
-        self.assertEqual(tracker.storage_path, self.path)
-
-    def test_default_storage_path_is_cwd_partial_work(self):
-        with TemporaryDirectory() as directory:
-            cwd = os.getcwd()
-            os.chdir(directory)
-            try:
-                tracker = WorkTracker()
-                self.assertEqual(tracker.storage_path, Path(".partial_work.json"))
-            finally:
-                os.chdir(cwd)
-
-    def test_update_progress_coerces_non_string_partial_output(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        tracker.update_progress(progress_percent=10.0, partial_output=42)  # type: ignore[arg-type]
-        tracker.save_interrupted()
-        self.assertEqual(self._tracker().load_state()["partial_output"], "")
-
-    def test_state_file_is_locked_during_save(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        tracker.save_interrupted()
-        self.assertTrue(tracker._lock_path.exists())
-
-    def test_save_and_load_do_not_write_to_stdout(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            tracker.save_interrupted()
-            self._tracker().load_state()
-        self.assertEqual(buffer.getvalue(), "")
-
-    def test_save_emits_log_record(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        with self.assertLogs("llmbridge.work_tracker", level="INFO") as captured:
-            tracker.save_interrupted()
-        self.assertTrue(any("Saved interrupted work" in line for line in captured.output))
-
-    def test_track_generation_convenience_uses_custom_path(self):
-        tracker = track_generation(prompt="p", model_name="m", storage_path=str(self.path))
-        self.assertEqual(tracker.storage_path, self.path)
-        tracker.save_interrupted()
-        self.assertTrue(self.path.exists())
-
-    def test_track_generation_namespace(self):
-        with TemporaryDirectory() as directory:
-            cwd = os.getcwd()
-            os.chdir(directory)
-            try:
-                tracker = track_generation(prompt="p", model_name="m", namespace="xyz")
-                self.assertEqual(tracker.storage_path.name, ".partial_work.xyz.json")
-            finally:
-                os.chdir(cwd)
-
-    def test_invalid_namespace_is_rejected(self):
-        for namespace in ["../evil", "foo/../../escape", "a/b", "..", ".hidden", "a b", 123]:
-            with self.subTest(namespace=namespace):
-                with self.assertRaises(ValueError):
-                    WorkTracker(namespace=namespace)
-
-    def test_valid_namespace_is_accepted(self):
-        for namespace in ["session-a", "abc123", "a.b_c-1", "A9"]:
-            with self.subTest(namespace=namespace):
-                tracker = WorkTracker(namespace=namespace)
-                self.assertEqual(tracker.storage_path.name, f".partial_work.{namespace}.json")
-
-    def test_namespaces_do_not_interfere(self):
-        with TemporaryDirectory() as directory:
-            cwd = os.getcwd()
-            os.chdir(directory)
-            try:
-                first = WorkTracker(namespace="a")
-                first.start_tracking(prompt="A", model_name="ma")
-                first.save_interrupted()
-
-                second = WorkTracker(namespace="b")
-                second.start_tracking(prompt="B", model_name="mb")
-                second.save_interrupted()
-
-                self.assertEqual(first.load_state()["prompt"], "A")
-                self.assertEqual(second.load_state()["prompt"], "B")
-            finally:
-                os.chdir(cwd)
-
-    def test_save_survives_non_string_prompt(self):
-        tracker = self._tracker()
-        tracker.start_tracking(prompt=None, model_name="m")  # type: ignore[arg-type]
-        tracker.save_interrupted()
-        loaded = self._tracker().load_state()
-        self.assertIsNone(loaded["prompt"])
+        summary = self._tracker().get_progress_summary()
+        self.assertIn("0.0%", summary)
+        self.assertIn("unknown", summary)
 
     def test_summary_truncates_long_prompt(self):
         tracker = self._tracker()
@@ -461,88 +403,70 @@ class WorkTrackerTests(unittest.TestCase):
         tracker.save_interrupted()
         self.assertNotIn("Partial output:", self._tracker().get_progress_summary())
 
-    def test_get_progress_summary_survives_unparseable_progress(self):
-        self.path.write_text(
-            '{"prompt": "p", "progress_percent": "not-a-number"}',
-            encoding="utf-8",
-        )
-        summary = self._tracker().get_progress_summary()
-        self.assertIn("0.0%", summary)
-
-    def test_failed_save_cleans_up_temp_file(self):
+    def test_save_is_atomic_and_leaves_no_temp_files(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
-        with mock.patch("llmbridge.work_tracker.json.dump", side_effect=ValueError("boom")):
-            with self.assertRaises(ValueError):
-                tracker.save_interrupted()
-        leftovers = [p.name for p in self.path.parent.iterdir() if p.name.endswith(".tmp")]
+        tracker.save_interrupted()
+        leftovers = [
+            p.name
+            for p in self.ledger.root.iterdir()
+            if not p.name.endswith(".json")
+        ]
         self.assertEqual(leftovers, [])
-        self.assertFalse(self.path.exists())
 
-    def test_failed_save_tolerates_cleanup_failure(self):
+    def test_save_and_load_do_not_write_to_stdout(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
-        with (
-            mock.patch("llmbridge.work_tracker.json.dump", side_effect=ValueError("boom")),
-            mock.patch("llmbridge.work_tracker.os.unlink", side_effect=OSError("locked")),
-        ):
-            with self.assertRaises(ValueError):
-                tracker.save_interrupted()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            tracker.save_interrupted()
+            self._tracker().load_state()
+        self.assertEqual(buffer.getvalue(), "")
 
-    def test_load_state_returns_none_on_oserror(self):
-        self.path.write_text('{"prompt": "x"}', encoding="utf-8")
-        with mock.patch("llmbridge.work_tracker.json.load", side_effect=OSError("nope")):
-            self.assertIsNone(self._tracker().load_state())
-
-    def test_clear_state_handles_file_vanishing(self):
+    def test_save_emits_log_record(self):
         tracker = self._tracker()
         tracker.start_tracking(prompt="p", model_name="m")
+        with self.assertLogs("llmbridge.work_tracker", level="INFO") as captured:
+            tracker.save_interrupted()
+        self.assertTrue(any("Saved interrupted work" in line for line in captured.output))
+
+    def test_track_generation_convenience_uses_custom_ledger(self):
+        tracker = track_generation(prompt="p", model_name="m", ledger=self.ledger)
+        self.assertIs(tracker.ledger, self.ledger)
         tracker.save_interrupted()
-        with mock.patch.object(Path, "unlink", side_effect=FileNotFoundError):
-            self.assertFalse(tracker.clear_state())
+        self.assertEqual(len(self._record_files()), 1)
 
-    def test_exclusive_lock_serializes_threads(self):
-        lock_path = self.path.with_name(self.path.name + ".lock")
-        guard = threading.Lock()
-        state = {"active": 0, "max_active": 0}
-        workers = 5
-        start = threading.Barrier(workers)
+    def test_track_generation_defaults_to_default_ledger(self):
+        with TemporaryDirectory() as directory:
+            cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                tracker = track_generation(prompt="p", model_name="m")
+                self.assertEqual(tracker.ledger.root, Path(".llmbridge/generations"))
+            finally:
+                os.chdir(cwd)
 
-        def worker():
-            start.wait()
-            with _exclusive_lock(lock_path):
-                with guard:
-                    state["active"] += 1
-                    state["max_active"] = max(state["max_active"], state["active"])
-                time.sleep(0.02)
-                with guard:
-                    state["active"] -= 1
-
-        threads = [threading.Thread(target=worker) for _ in range(workers)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        self.assertEqual(state["max_active"], 1)
-
-    def test_lock_file_is_not_created_next_to_state_file(self):
-        import tempfile
-
+    def test_save_survives_non_string_prompt(self):
         tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
+        tracker.start_tracking(prompt=None, model_name="m")  # type: ignore[arg-type]
         tracker.save_interrupted()
-        siblings = [p.name for p in self.path.parent.iterdir() if p.name.endswith(".lock")]
-        self.assertEqual(siblings, [])
-        self.assertTrue(str(tracker._lock_path).startswith(tempfile.gettempdir()))
+        loaded = self._tracker().load_state()
+        self.assertEqual(loaded["prompt"], "")
 
-    def test_fsync_failure_does_not_abort_save(self):
+    def test_load_state_survives_missing_record_fields(self):
         tracker = self._tracker()
-        tracker.start_tracking(prompt="p", model_name="m")
-        with mock.patch("llmbridge.work_tracker.os.fsync", side_effect=OSError("unsupported")):
-            state = tracker.save_interrupted()
-        self.assertTrue(self.path.exists())
-        self.assertEqual(state["prompt"], "p")
+        tracker.save(prompt="p", model_name="m")
+        path = self._record_files()[0]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("events", None)
+        data.pop("request", None)
+        data.pop("params", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        loaded = self._tracker().load_state()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["prompt"], "p")
+        self.assertEqual(loaded["progress_percent"], 0.0)
+        self.assertIsNone(loaded["max_tokens"])
 
     def test_shared_instance_is_thread_safe(self):
         tracker = self._tracker()
