@@ -33,6 +33,21 @@ llmbridge doctor       # verify config, keys, port
 llmbridge serve        # start server on http://127.0.0.1:8787
 ```
 
+The wizard asks these questions:
+
+| Prompt | What to enter |
+|--------|---------------|
+| Provider preset | `nvidia`, `ollama`, `openai` or `openrouter` |
+| Model alias | A short name **you invent** — this is what clients request. No dots, no slashes (see [Troubleshooting](#troubleshooting)) |
+| Upstream base URL | Press Enter to accept the preset default |
+| Upstream model name | The provider's **real model ID**, e.g. `nvidia/nemotron-3.5-super-vl-120b-a12b` |
+| API key environment variable | Only asked for presets without a built-in key (Ollama). Blank = no key. NVIDIA/OpenAI/OpenRouter use `NVIDIA_API_KEY`/`OPENAI_API_KEY`/`OPENROUTER_API_KEY` automatically |
+
+Prefer no prompts? Pass it all in one line:
+`llmbridge setup --preset nvidia --alias claude-sonnet-4-5 --model nvidia/nemotron-3.5-super-vl-120b-a12b` (add `--force` to replace an existing file).
+
+If Claude Code should use a route automatically, name the alias exactly what Claude Code requests: `claude-sonnet-4-5`, `claude-opus-4-5`, or `claude-haiku-4-5`. Any other name must be passed explicitly with `claude --model <alias>`.
+
 **3. Point Claude Code at the bridge**
 
 macOS / Linux (bash or zsh):
@@ -40,7 +55,7 @@ macOS / Linux (bash or zsh):
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="local"      # or your LLMBRIDGE_API_KEY
-claude --model nemotron-local             # use a configured alias
+claude --model claude-sonnet-4-5         # any alias defined in your config
 ```
 
 Windows (PowerShell):
@@ -48,7 +63,7 @@ Windows (PowerShell):
 ```powershell
 $env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8787"
 $env:ANTHROPIC_AUTH_TOKEN = "local"
-claude --model nemotron-local
+claude --model claude-sonnet-4-5
 ```
 
 To persist on Windows across new terminals: `setx ANTHROPIC_BASE_URL "http://127.0.0.1:8787"` (and the same for `ANTHROPIC_AUTH_TOKEN`).
@@ -77,21 +92,39 @@ Or skip the exports entirely: `llmbridge claude` launches Claude Code wired to t
 
 ## Configuration
 
-`llmbridge.toml` (searched: `--config`, `./llmbridge.toml`, `~/.config/llmbridge/llmbridge.toml`):
+`llmbridge.toml` (searched in order: `--config` flag, `$LLMBRIDGE_CONFIG`, `./llmbridge.toml`, `~/.config/llmbridge/llmbridge.toml` — honouring `$XDG_CONFIG_HOME`):
 
 ```toml
-[models.nemotron-local]
-base_url = "http://127.0.0.1:11434/v1"   # Ollama
-model = "nemotron"
-reasoning_effort = "high"                 # enables thinking
+# What `llmbridge setup` writes (nvidia preset), with a local safety net added.
+# One [models.<alias>] block per route.
 
-[models.claude-sonnet-4-5]
+[models.claude-sonnet-4-5]                 # Claude Code requests this exact name
 base_url = "https://integrate.api.nvidia.com/v1"
-model = "nvidia/nemotron-3-ultra-550b-a55b"
+model = "nvidia/nemotron-3.5-super-vl-120b-a12b"   # real upstream model ID
 api_key_env = "NVIDIA_API_KEY"
 reasoning_effort = "high"
-fallbacks = ["claude-haiku-4-5"]
+fallbacks = ["claude-haiku-4-5", "claude-local"]   # tried in order on failure
+
+[models.claude-haiku-4-5]
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+api_key_env = "NVIDIA_API_KEY"
+reasoning_effort = "high"
+fallbacks = ["claude-local"]
+
+[models.claude-local]                      # no key needed — keeps working when
+base_url = "http://127.0.0.1:11434/v1"     # NVIDIA is down or the key dies
+model = "qwen3:8b"                         # any model you have pulled in Ollama
+
+[models."nemotron-3.5-super"]              # dots in an alias need a quoted key
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+api_key_env = "NVIDIA_API_KEY"
+fallbacks = ["claude-local"]
 ```
+
+Use these aliases in Claude Code: `claude --model nemotron-3.5-super`, or just let
+Claude Code's Sonnet/Opus/Haiku picks land on the matching `claude-*` blocks above.
 
 **Key fields per route:**
 | Field | Purpose |
@@ -105,6 +138,51 @@ fallbacks = ["claude-haiku-4-5"]
 | `cache_control` | `"strip"` (default) or `"passthrough"` |
 
 Legacy single-endpoint vars (`LLMBRIDGE_UPSTREAM_*`) still supported.
+
+**How the config file is picked — three rules that explain most confusion:**
+
+1. The file depends on **where you start `llmbridge serve`**, not where you ran `setup`. A `./llmbridge.toml` in the serve folder wins over `~/.config/llmbridge/llmbridge.toml`. Run `llmbridge models` from the same folder you serve from to see the live route set. `setup` follows the same order when choosing where to **write**: an existing `./llmbridge.toml` wins, otherwise it writes to the user-level file.
+2. The config is read **once at startup**. After every edit, restart `llmbridge serve` — a running server never sees your changes.
+3. `fallbacks` may only list aliases **defined in the same file**. A fallback to a missing alias stops the server from starting.
+
+A model alias with dots needs a quoted key, because TOML reads dots as nesting:
+
+```toml
+[models."nemotron-3.5-super"]   # correct
+# [models.nemotron-3.5-super]  # wrong — parses as a route named "nemotron-3"
+```
+
+**Environment variables that tune the bridge** (all optional):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LLMBRIDGE_HOST` | `127.0.0.1` | Bind address. Non-loopback requires `LLMBRIDGE_API_KEY` |
+| `LLMBRIDGE_PORT` | `8787` | Listen port (also settable with `--port`) |
+| `LLMBRIDGE_CONFIG` | unset | Config file path; overrides the search order above |
+| `LLMBRIDGE_BASE_URL` | `http://127.0.0.1:8787` | Which bridge URL the read-only CLI commands (`check`, `generations`, `status`, `fork`, …) talk to |
+| `LLMBRIDGE_CLIENT_TIMEOUT_SECONDS` | `300` | How long one client request may stream |
+| `LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS` | `180` | Timeout for each upstream call |
+| `LLMBRIDGE_ROUTE_ATTEMPTS` | `1` | Tries on one route before falling through to the next fallback (max 10) |
+| `LLMBRIDGE_ROUTE_RETRY_BACKOFF` | `0.5` | Base seconds between attempts; doubles each try |
+| `LLMBRIDGE_DOCUMENT_ROOTS` | unset | Directories allowed as local `file:` document sources (`os.pathsep`-separated). Unset disables local file documents |
+| `LLMBRIDGE_ANTHROPIC_FILES_API_KEY` | unset | Enables document sources that reference the Anthropic Files API |
+
+Feature-specific vars (`LLMBRIDGE_SELF_HEAL`, `LLMBRIDGE_QUEUE_*`, `LLMBRIDGE_TRACK_*`, `LLMBRIDGE_LEDGER_*`, `LLMBRIDGE_ENABLE_OCR`) are documented with their features below.
+
+---
+
+## Troubleshooting
+
+Real errors and what they mean:
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Unknown model 'claude-opus-4-5'. Configured model aliases: ...` | Claude Code requests exact model names; the live config has no alias with that name | Add that alias to the config file the server reads, restart serve. The alias list in the error tells you exactly what is live |
+| `Route 'x' falls back to unknown model 'y'` (server refuses to start) | `fallbacks` references an alias not defined in the same file | Define the fallback alias in the same file, or remove it from `fallbacks` |
+| `Route 'nemotron-3' needs a base_url` | Alias contains dots — TOML split the table name | Quote the key: `[models."nemotron-3.5-super"]` |
+| `error: ...llmbridge.toml already exists (use --force to overwrite)` | `setup` refuses to clobber an existing file | Re-run `llmbridge setup --force` — it **replaces the whole file**, so re-add any other routes afterwards |
+| `Upstream returned HTTP 403` → client sees `502`, work saved as `gen_...` | The provider rejected your API key (expired or revoked). The bridge behaved correctly: retried, saved the interrupted work, told you | Confirm with `curl` against the provider using the same key; generate a fresh key; add a local Ollama route to `fallbacks` so requests survive a dead key |
+| Request fails with `404` from Ollama | The `model` ID is not pulled locally | `ollama list` to check, `ollama pull <model>` to fix |
 
 ---
 
