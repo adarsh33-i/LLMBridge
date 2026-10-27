@@ -101,6 +101,83 @@ class GenerationLedgerTests(unittest.TestCase):
         reloaded = self.ledger.load(record.id)
         self.assertEqual(reloaded.events[-1].type, EVENT_FAIL)
 
+    def test_settle_running_interrupts_orphaned_records(self):
+        running = self.ledger.create(_request(), "nemotron")
+        done = self.ledger.create(_request(prompt="Finished"), "nemotron")
+        self.ledger.complete(done, "ok", 1)
+
+        settled = self.ledger.settle_running("Bridge stopped before the generation finished")
+
+        self.assertEqual([record.id for record in settled], [running.id])
+        reloaded = self.ledger.load(running.id)
+        self.assertEqual(reloaded.status, "interrupted")
+        self.assertEqual(reloaded.events[-1].type, EVENT_INTERRUPT)
+        self.assertEqual(
+            reloaded.events[-1].data["message"],
+            "Bridge stopped before the generation finished",
+        )
+        self.assertEqual(self.ledger.load(done.id).status, "completed")
+
+    def test_settle_running_can_skip_recent_records(self):
+        record = self.ledger.create(_request(), "nemotron")
+        now = time.time()
+
+        self.assertEqual(self.ledger.settle_running("restarted", older_than=300, now=now), [])
+        self.assertEqual(self.ledger.load(record.id).status, "running")
+
+        settled = self.ledger.settle_running("restarted", older_than=300, now=now + 301)
+        self.assertEqual([item.id for item in settled], [record.id])
+        self.assertEqual(self.ledger.load(record.id).status, "interrupted")
+
+    def test_stats_reports_statuses_tokens_and_wall_time(self):
+        done = self.ledger.create(_request(), "nemotron")
+        self.ledger.complete(done, "answer", 12)
+        waiting = self.ledger.create(_request(prompt="later"), "nemotron")
+        self.ledger.interrupt(waiting, "quota", output="half", progress=10.0)
+
+        stats = self.ledger.stats()
+
+        self.assertEqual(stats["generations"]["total"], 2)
+        self.assertEqual(
+            stats["generations"]["by_status"], {"completed": 1, "interrupted": 1}
+        )
+        self.assertEqual(stats["generations"]["recoverable"], 1)
+        self.assertEqual(stats["tokens"], {"output": 12, "records_with_tokens": 1})
+        self.assertEqual(stats["wall_time_ms"]["n"], 1)
+        self.assertIsNone(stats["heals"]["suspect_rate"])
+
+    def test_stats_separates_working_set_from_digest_heals(self):
+        record = self.ledger.create(_request(), "nemotron")
+        self.ledger.heal(record, from_model="a", to_model="b", resumed_chars=10)
+        self.ledger.heal_seam(
+            record,
+            from_model="a",
+            to_model="b",
+            seam_at=10,
+            audit={
+                "continuation_chars": 20,
+                "overlap_chars": 12,
+                "overlap_ratio": 0.5,
+                "duplicated": False,
+                "restarted": False,
+                "suspect": False,
+            },
+        )
+        self.ledger.complete(record, "text", 3)
+
+        stats = self.ledger.stats()
+        self.assertEqual(stats["heals"]["healed"], 1)
+        self.assertEqual(stats["heals"]["audited"], 1)
+        self.assertEqual(stats["heals"]["suspect_rate"], 0.0)
+        self.assertEqual(stats["heals"]["digest_entries"], 0)
+        self.assertEqual(stats["heals"]["unconsolidated"], 1)
+
+        self.ledger.consolidate()
+        stats = self.ledger.stats()
+        self.assertEqual(stats["heals"]["digest_entries"], 1)
+        self.assertEqual(stats["heals"]["digest_suspect"], 0)
+        self.assertEqual(stats["heals"]["unconsolidated"], 0)
+
     def test_forked_child_records_parent_and_fork_event(self):
         parent = self.ledger.create(_request(), "nemotron")
         self.ledger.complete(parent, "partial", 3)

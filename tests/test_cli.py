@@ -483,7 +483,34 @@ class ClaudeCommandTests(unittest.TestCase):
         with redirect_stdout(out):
             code = cli.main(["claude", "--print-env", "--", "--model", "local"])
         self.assertEqual(code, 0)
-        self.assertIn("claude --model local", out.getvalue())
+        rendered = out.getvalue()
+        self.assertIn("--model local", rendered)
+        self.assertIn("claude --settings", rendered)
+
+    def test_launch_passes_a_settings_layer_that_pins_the_bridge(self):
+        calls = {}
+
+        def fake_exec(program, argv, env):
+            calls["program"] = program
+            calls["argv"] = argv
+            calls["env"] = env
+            raise FileNotFoundError()
+
+        with patch("llmbridge.cli.os.execvpe", side_effect=fake_exec):
+            with redirect_stderr(io.StringIO()):
+                code = cli.main(["claude", "--port", "9100", "--", "--model", "local"])
+
+        self.assertEqual(code, 1)
+        argv = calls["argv"]
+        self.assertEqual(argv[:2], ["claude", "--settings"])
+        settings = json.loads(argv[2])
+        self.assertEqual(
+            settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9100"
+        )
+        self.assertEqual(argv[3:], ["--model", "local"])
+        self.assertEqual(
+            calls["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9100"
+        )
 
     def test_reports_missing_claude_cli(self):
         err = io.StringIO()
@@ -710,6 +737,24 @@ model = "backup-model"
         self.assertEqual(code, 1)
         self.assertIn("upstream down", rendered)
 
+    def test_a_saved_empty_answer_is_skipped_not_passed(self):
+        record = self._completed(output="")
+        with patch.object(cli, "_replay_output", return_value=("", None)) as replay:
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 0)
+        self.assertIn("SKIP", rendered)
+        self.assertIn("no saved output", rendered)
+        self.assertNotIn("PASS", rendered)
+        replay.assert_not_called()
+
+    def test_an_empty_replay_fails(self):
+        record = self._completed(output="the answer")
+        with patch.object(cli, "_replay_output", return_value=("", None)):
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL", rendered)
+        self.assertIn("returned no text", rendered)
+
     def test_requires_a_target(self):
         err = io.StringIO()
         with redirect_stderr(err):
@@ -798,6 +843,21 @@ class HealSeamStatusTests(LedgerBackedCommandTests):
         self.assertEqual(code, 0)
         self.assertIn("not yet consolidated: run `llmbridge audit`", rendered)
 
+    def test_stats_reports_counts_and_machine_readable_json(self):
+        self._completed(output="the answer")
+        code, rendered = self._run("stats")
+        self.assertEqual(code, 0)
+        self.assertIn("completed=1", rendered)
+        self.assertIn("Output tokens: 3", rendered)
+        self.assertIn("Wall time", rendered)
+
+        code, rendered = self._run("stats", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["object"], "stats")
+        self.assertEqual(payload["generations"]["total"], 1)
+        self.assertEqual(payload["tokens"]["output"], 3)
+
 
 class AuditCommandTests(LedgerBackedCommandTests):
     def test_audit_writes_a_digest_and_reports_the_full_history_rate(self):
@@ -818,7 +878,7 @@ class AuditCommandTests(LedgerBackedCommandTests):
 
         code, rendered = self._run("status")
         self.assertEqual(code, 0)
-        self.assertIn("Consolidated audits: 2 (1 suspect, 50%)", rendered)
+        self.assertIn("Digest: 2 seam(s) (1 suspect, 50%)", rendered)
 
     def test_audit_repeats_without_duplicating_a_seam(self):
         record = self._completed()

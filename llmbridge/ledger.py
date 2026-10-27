@@ -96,6 +96,15 @@ def _env_max_recoverable() -> int:
     return value if value >= 0 else MAX_KEPT_RECOVERABLE
 
 
+def _percentile(values: list[float], fraction: float) -> Optional[float]:
+    """Nearest-rank percentile, or None for an empty sample."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[index]
+
+
 def _lock_path_for(storage_path: Path) -> Path:
     """Return a stable lock-file path in the system temp directory.
 
@@ -645,6 +654,34 @@ class GenerationLedger:
             if record.status == _STATUS_INTERRUPTED
         ]
 
+    def settle_running(
+        self,
+        message: str,
+        *,
+        older_than: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> list[GenerationRecord]:
+        """Interrupt ``running`` records that no live request can still finish.
+
+        A record is only ``running`` while its request is in flight, and only the
+        serving process ever finalizes it. If that process exits mid-stream the
+        record keeps claiming the work is happening and never shows up as
+        recoverable, so a restart has to settle it here.
+
+        ``older_than`` skips records touched more recently than that many
+        seconds, which keeps a startup sweep from claiming a request another
+        process is still serving from the same ledger.
+        """
+        timestamp = time.time() if now is None else now
+        settled: list[GenerationRecord] = []
+        for record in self.list(limit=None):
+            if record.status != _STATUS_RUNNING:
+                continue
+            if older_than is not None and timestamp - record.updated_at < older_than:
+                continue
+            settled.append(self.interrupt(record, message))
+        return settled
+
     @staticmethod
     def is_recoverable(record: GenerationRecord) -> bool:
         """Whether this record holds work that can still be finished or retried."""
@@ -863,6 +900,81 @@ class GenerationLedger:
             "total_entries": total,
             "suspect_entries": suspect,
             "suspect_rate": round(suspect / total, 3) if total else None,
+        }
+
+    def stats(self) -> dict[str, Any]:
+        """Summarise the ledger in the numbers an operator asks for.
+
+        Rates are reported next to their denominators because the working set is
+        small by design (records are pruned), and a suspect rate over three heals
+        is not the same claim as one over three hundred. ``digest_entries`` is the
+        durable count that outlives pruning; ``unconsolidated`` says how many
+        seam audits are still only in records.
+        """
+        records = self.list(limit=None)
+        by_status: dict[str, int] = {}
+        tokens = 0
+        token_counts = 0
+        wall_times: list[float] = []
+        healed = 0
+        audit_events = 0
+        audited = 0
+        suspect = 0
+        duplicated = 0
+        restarted = 0
+        for record in records:
+            by_status[record.status] = by_status.get(record.status, 0) + 1
+            if isinstance(record.output_tokens, int):
+                tokens += record.output_tokens
+                token_counts += 1
+            if any(event.type == EVENT_HEAL for event in record.events):
+                healed += 1
+            audit_events += sum(1 for event in record.events if event.type == EVENT_HEAL_SEAM)
+            audit = self.heal_seam_audit(record)
+            if audit is not None:
+                audited += 1
+                if audit.get("suspect"):
+                    suspect += 1
+                duplicated += 1 if audit.get("duplicated") else 0
+                restarted += 1 if audit.get("restarted") else 0
+            complete = next(
+                (event for event in record.events if event.type == EVENT_COMPLETE), None
+            )
+            if complete is not None and complete.at >= record.created_at:
+                wall_times.append(round((complete.at - record.created_at) * 1000, 1))
+
+        digest = self.read_audit_digest(self.audit_digest_path)
+        digest_suspect = sum(1 for entry in digest if entry.get("suspect"))
+        return {
+            "object": "stats",
+            "ledger": {"path": str(self.root), "records": len(records)},
+            "generations": {
+                "total": len(records),
+                "by_status": by_status,
+                "recoverable": sum(1 for record in records if self.is_recoverable(record)),
+            },
+            "tokens": {"output": tokens, "records_with_tokens": token_counts},
+            "wall_time_ms": {
+                "n": len(wall_times),
+                "p50": _percentile(wall_times, 0.50),
+                "p95": _percentile(wall_times, 0.95),
+                "max": max(wall_times) if wall_times else None,
+            },
+            "heals": {
+                "healed": healed,
+                "audited": audited,
+                "suspect": suspect,
+                "clean": audited - suspect,
+                "suspect_rate": round(suspect / audited, 3) if audited else None,
+                "duplicated": duplicated,
+                "restarted": restarted,
+                "digest_entries": len(digest),
+                "digest_suspect": digest_suspect,
+                "digest_suspect_rate": (
+                    round(digest_suspect / len(digest), 3) if digest else None
+                ),
+                "unconsolidated": max(0, audit_events - len(digest)),
+            },
         }
 
     def queued(self) -> list[GenerationRecord]:

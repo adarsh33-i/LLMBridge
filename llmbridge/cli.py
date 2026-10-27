@@ -113,6 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.add_argument("--ledger", help="Path to the generation ledger directory")
 
+    stats = subparsers.add_parser(
+        "stats",
+        help="Show status counts, wall time, and heal verdicts from the ledger",
+    )
+    stats.add_argument("--ledger", help="Path to the generation ledger directory")
+    stats.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
     fork = subparsers.add_parser(
         "fork", help="Continue a recorded generation (requires a running server)"
     )
@@ -330,6 +337,66 @@ def _generations(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_ms(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value / 1000:.1f}s" if value >= 1000 else f"{value:.0f}ms"
+
+
+def _stats(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    stats = ledger.stats()
+    if getattr(args, "json", False):
+        print(json.dumps(stats, indent=2))
+        return 0
+    generations = stats["generations"]
+    print(f"Ledger: {stats['ledger']['path']} ({generations['total']} records)")
+    if not generations["total"]:
+        print("No generations recorded yet — make a request to /v1/messages.")
+        return 0
+    statuses = ", ".join(
+        f"{name}={count}" for name, count in sorted(generations["by_status"].items())
+    )
+    print(f"Statuses: {statuses}")
+    print(f"Recoverable: {generations['recoverable']}")
+    tokens = stats["tokens"]
+    print(f"Output tokens: {tokens['output']} over {tokens['records_with_tokens']} record(s)")
+    wall = stats["wall_time_ms"]
+    if wall["n"]:
+        print(
+            f"Wall time: p50 {_format_ms(wall['p50'])}, p95 {_format_ms(wall['p95'])}, "
+            f"max {_format_ms(wall['max'])} (n={wall['n']})"
+        )
+    heals = stats["heals"]
+    if heals["audited"] or heals["healed"]:
+        rate = (
+            f", {heals['suspect_rate']:.0%} suspect"
+            if heals["suspect_rate"] is not None
+            else ""
+        )
+        print(
+            f"Heals: {heals['healed']} healed, {heals['audited']} audited"
+            f" ({heals['suspect']} suspect{rate}); duplicated {heals['duplicated']}, "
+            f"restarted {heals['restarted']}"
+        )
+    if heals["digest_entries"]:
+        digest_rate = (
+            f", {heals['digest_suspect_rate']:.0%}"
+            if heals["digest_suspect_rate"] is not None
+            else ""
+        )
+        print(
+            f"Digest: {heals['digest_entries']} seam(s)"
+            f" ({heals['digest_suspect']} suspect{digest_rate})"
+        )
+    if heals["unconsolidated"]:
+        print(
+            f"  {heals['unconsolidated']} audit(s) not yet consolidated: "
+            "run `llmbridge audit`"
+        )
+    return 0
+
+
 def _status(args: argparse.Namespace) -> int:
     ledger = GenerationLedger(getattr(args, "ledger", None))
     records = ledger.list(limit=100000)
@@ -374,16 +441,27 @@ def _status(args: argparse.Namespace) -> int:
             )
         if suspect:
             print("  flag only: review with `llmbridge replay <id>`")
-    digest = GenerationLedger.read_audit_digest(ledger.audit_digest_path)
-    if digest:
-        consolidated_suspects = sum(1 for entry in digest if entry.get("suspect"))
-        rate = consolidated_suspects / len(digest)
-        print(
-            f"Consolidated audits: {len(digest)} ({consolidated_suspects} suspect, "
-            f"{rate:.0%})"
+    # The digest outlives records, so its count can exceed the audits still on
+    # disk. Say which is which instead of printing two numbers that disagree.
+    heals = ledger.stats()["heals"]
+    if heals["digest_entries"]:
+        digest_rate = (
+            f", {heals['digest_suspect_rate']:.0%}"
+            if heals["digest_suspect_rate"] is not None
+            else ""
         )
-    elif audited:
-        print("  not yet consolidated: run `llmbridge audit` before these records age out")
+        print(
+            f"Digest: {heals['digest_entries']} seam(s) "
+            f"({heals['digest_suspect']} suspect{digest_rate})"
+        )
+        pruned = heals["digest_entries"] - heals["audited"]
+        if pruned > 0:
+            print(f"  {pruned} digest entry(ies) came from generations already pruned")
+    if heals["unconsolidated"]:
+        print(
+            f"  {heals['unconsolidated']} audit(s) not yet consolidated: "
+            "run `llmbridge audit` before these records age out"
+        )
     return 0
 
 
@@ -580,7 +658,14 @@ def _replay(args: argparse.Namespace) -> int:
         return 1
 
     failures = 0
+    skipped = 0
     for record in targets:
+        if not record.output:
+            # Two empty answers are trivially "identical"; comparing them would
+            # report a pass that verified nothing.
+            skipped += 1
+            print(f"SKIP {record.id}: the saved generation has no output to compare")
+            continue
         alias = getattr(args, "model", None) or record.model
         body = dict(record.request)
         body.setdefault("model", alias)
@@ -591,7 +676,11 @@ def _replay(args: argparse.Namespace) -> int:
             failures += 1
             print(f"FAIL {record.id}: {error}")
             continue
-        ratio = difflib.SequenceMatcher(None, record.output, text or "").ratio()
+        if not text:
+            failures += 1
+            print(f"FAIL {record.id}: the replay returned no text")
+            continue
+        ratio = difflib.SequenceMatcher(None, record.output, text).ratio()
         passed = ratio >= args.threshold
         if not passed:
             failures += 1
@@ -599,9 +688,16 @@ def _replay(args: argparse.Namespace) -> int:
         print(
             f"{label} {record.id}: similarity {ratio:.2f} "
             f"(threshold {args.threshold:.2f}, saved {len(record.output)} chars, "
-            f"replayed {len(text or '')} chars)"
+            f"replayed {len(text)} chars)"
         )
-    print(f"{len(targets) - failures}/{len(targets)} replay(s) matched")
+    compared = len(targets) - skipped
+    if compared == 0:
+        print(f"No replayable generations: {skipped} had no saved output")
+        return 0
+    summary = f"{compared - failures}/{compared} replay(s) matched"
+    if skipped:
+        summary += f", {skipped} skipped (nothing to compare)"
+    print(summary)
     return 0 if failures == 0 else 1
 
 
@@ -1140,19 +1236,27 @@ def _claude(args: argparse.Namespace) -> int:
     forwarded = list(args.claude_args)
     if forwarded and forwarded[0] == "--":
         forwarded = forwarded[1:]
+    # Claude Code lets a settings-pinned env override inherited variables, which
+    # is why exporting ANTHROPIC_BASE_URL alone can still send traffic elsewhere.
+    # A CLI settings layer outranks every file, so the bridge URL wins.
+    settings = json.dumps(
+        {"env": {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_AUTH_TOKEN": api_key}}
+    )
+    launch: list[str] = []
+    if "--settings" not in forwarded:
+        launch += ["--settings", settings]
 
     if args.print_env:
         print(f"ANTHROPIC_BASE_URL={base_url}")
         print(f"ANTHROPIC_AUTH_TOKEN={api_key}")
-        if forwarded:
-            print("claude " + " ".join(forwarded))
+        print(f"claude --settings '{settings}'" + (" " + " ".join(forwarded) if forwarded else ""))
         return 0
 
     env = dict(os.environ)
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = api_key
     try:
-        os.execvpe("claude", ["claude", *forwarded], env)
+        os.execvpe("claude", ["claude", *launch, *forwarded], env)
     except FileNotFoundError:
         print(
             "error: the `claude` CLI was not found on PATH. Install Claude Code, "
@@ -1196,6 +1300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "init": _init,
         "generations": _generations,
         "status": _status,
+        "stats": _stats,
         "fork": _fork,
         "tree": _tree,
         "diff": _diff,

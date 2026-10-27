@@ -69,6 +69,9 @@ _DEFAULT_QUEUE_RETRY_SECONDS = 5.0
 _DEFAULT_QUEUE_MAX_ATTEMPTS = 5
 _QUEUE_POLL_SECONDS = 1.0
 
+# How often a running server looks for generations orphaned by a dead process.
+_STALE_SWEEP_SECONDS = 60.0
+
 # Two identical non-streaming requests in flight at once normally cost two
 # upstream calls. ``LLMBRIDGE_COALESCE_REQUESTS`` lets the second attach to the
 # first and share its answer. ``deterministic`` only merges requests that pin
@@ -186,6 +189,31 @@ def _upstream_timeout_seconds() -> float:
     return _env_positive_number(
         "LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS", _DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     )
+
+
+def stale_generation_seconds() -> float:
+    """How old a ``running`` record must be before a restart may claim it.
+
+    Twice the upstream timeout, never under five minutes: a generation that is
+    genuinely in flight updates its record at most once, so the margin has to be
+    wider than any one upstream call before a sweep treats the record as orphaned.
+    """
+    return max(2 * _upstream_timeout_seconds(), 300.0)
+
+
+def settle_stale_generations(
+    ledger: GenerationLedger, *, now: float | None = None
+) -> list[Any]:
+    """Interrupt ``running`` records left behind by a process that exited."""
+    try:
+        return ledger.settle_running(
+            "Bridge restarted before the generation finished",
+            older_than=stale_generation_seconds(),
+            now=now,
+        )
+    except Exception as error:  # pragma: no cover - defensive
+        logger.error("Could not settle stale generations: %s", error)
+        return []
 
 
 def _route_attempts() -> int:
@@ -390,12 +418,28 @@ def _build_heal_body(body: Any, partial_output: str) -> dict[str, Any] | None:
 _SEAM_WINDOW = 160
 _SEAM_MIN_OVERLAP_CHARS = 12
 _SEAM_MIN_OVERLAP_RATIO = 0.25
+# Models decorate the start of a fresh answer with markdown, quotes or list
+# markers. Strip that layer before asking whether the text opens like a restart.
+_SEAM_DECORATION_RE = re.compile(r"^[\s>*_#`~\"'\-\u2022\d.)\]]*")
 _SEAM_RESTART_RE = re.compile(
-    r"^\s*(?:sure\b|certainly\b|of course\b|no problem\b|here(?:'s| is)\b|"
-    r"i can (?:help|absolutely|do that)\b|i'?ll (?:help|start|begin|answer)\b|"
-    r"let me (?:help|start|look))",
+    r"^(?:sure\b|certainly\b|of course\b|no problem\b|absolutely\b|"
+    r"great question\b|happy to help\b|okay\b|alright\b|as an ai language model\b|"
+    r"here(?:'s| is)\b|below is\b|continuing\b|resuming\b|picking up\b|"
+    r"to continue\b|next\b|in summary\b|"
+    r"i can (?:help|absolutely|do that)\b|"
+    r"i'?ll (?:help|continue|start|begin|answer|pick)\b|"
+    r"let me (?:help|start|look|continue|pick))",
     re.IGNORECASE,
 )
+
+
+def _strip_seam_decoration(text: str) -> str:
+    return _SEAM_DECORATION_RE.sub("", text, count=1)
+
+
+def is_restart_opener(continuation: str) -> bool:
+    """Whether text opens like a fresh answer rather than a continuation."""
+    return bool(_SEAM_RESTART_RE.match(_strip_seam_decoration(continuation)))
 
 
 def score_seam(partial_output: str, continuation: str) -> dict[str, Any]:
@@ -408,13 +452,20 @@ def score_seam(partial_output: str, continuation: str) -> dict[str, Any]:
     before = partial_output[-_SEAM_WINDOW:].lower()
     after = continuation[:_SEAM_WINDOW].lower()
     matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
-    overlap = matcher.find_longest_match(0, len(before), 0, len(after)).size
+    match = matcher.find_longest_match(0, len(before), 0, len(after))
+    overlap = match.size
     shortest = min(len(before), len(after))
     ratio = round(overlap / shortest, 3) if shortest else 0.0
+    # Only a match that joins the tail of the partial text to the head of the
+    # continuation is evidence of re-emission. A shared phrase in the middle of
+    # a short continuation is ordinary language, not a bad seam.
+    anchored = match.a + match.size == len(before) and match.b == 0
     duplicated = (
-        overlap >= _SEAM_MIN_OVERLAP_CHARS and ratio >= _SEAM_MIN_OVERLAP_RATIO
+        anchored
+        and overlap >= _SEAM_MIN_OVERLAP_CHARS
+        and ratio >= _SEAM_MIN_OVERLAP_RATIO
     )
-    restarted = bool(_SEAM_RESTART_RE.match(continuation))
+    restarted = is_restart_opener(continuation)
     return {
         "continuation_chars": len(continuation),
         "overlap_chars": overlap,
@@ -581,6 +632,16 @@ class LLMBridgeServer(ThreadingHTTPServer):
         self._queue_thread: threading.Thread | None = None
         self._inflight: dict[str, _Inflight] = {}
         self._inflight_lock = threading.Lock()
+        if ledger is not None:
+            # A process that died mid-stream leaves ``running`` records behind.
+            # Sweep for them while serving too, so one created just before a
+            # crash is settled once it is old enough instead of staying stuck.
+            self._sweep_thread = threading.Thread(
+                target=self._stale_sweep_loop, daemon=True
+            )
+            self._sweep_thread.start()
+        else:
+            self._sweep_thread = None
         if ledger is not None and _queue_on_quota_enabled():
             # The queue lives in the ledger, so this also re-arms retries that
             # were pending when the process last exited.
@@ -634,13 +695,29 @@ class LLMBridgeServer(ThreadingHTTPServer):
             return None
 
     def stop(self) -> None:
-        """Stop background work and flush the audit digest."""
+        """Stop background work, settle unfinished records, flush the digest."""
         self._queue_stop.set()
+        ledger = self.ledger
+        if ledger is not None:
+            # The process is exiting, so anything still ``running`` will never be
+            # finished by this one; leaving it that way hides the work from every
+            # resume surface. A handler that does finish afterwards re-completes
+            # the record, which is the truthful outcome.
+            try:
+                ledger.settle_running("Bridge stopped before the generation finished")
+            except Exception as error:  # pragma: no cover - defensive
+                logger.error("Could not settle running generations: %s", error)
         self.consolidate_audits()
 
     def shutdown(self) -> None:
         self.stop()
         super().shutdown()
+
+    def _stale_sweep_loop(self) -> None:
+        while not self._queue_stop.wait(_STALE_SWEEP_SECONDS):
+            ledger = self.ledger
+            if ledger is not None:
+                settle_stale_generations(ledger)
 
     def _dispatch_queue_loop(self) -> None:
         while not self._queue_stop.wait(_QUEUE_POLL_SECONDS):
@@ -834,6 +911,9 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if path == "/v1/interrupted":
             self._send_interrupted()
             return
+        if path == "/v1/stats":
+            self._send_stats()
+            return
         if path == "/v1/generations":
             self._list_generations()
             return
@@ -930,6 +1010,12 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             200,
             {"object": "list", "data": [record.summary() for record in records]},
         )
+
+    def _send_stats(self) -> None:
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        self._send_json(200, ledger.stats())
 
     def _send_generation(self, path: str) -> None:
         ledger = self._ledger()
@@ -2291,6 +2377,13 @@ def load_server_settings() -> "ServerSettings":
 
 def main() -> None:  # pragma: no cover - process entrypoint, blocks in serve_forever
     settings = load_server_settings()
+    if settings.ledger is not None:
+        settled = settle_stale_generations(settings.ledger)
+        if settled:
+            print(
+                f"Settled {len(settled)} generation(s) left running by a previous "
+                "process as interrupted; resume them with `llmbridge fork <id>`"
+            )
     server = LLMBridgeServer(
         (settings.host, settings.port),
         LLMBridgeHandler,

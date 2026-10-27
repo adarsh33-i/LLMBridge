@@ -86,7 +86,7 @@ To persist on Windows across new terminals: `setx ANTHROPIC_BASE_URL "http://127
 
 For a per-project setup, put the same `"env"` block in that project's `.claude/settings.json`.
 
-Or skip the exports entirely: `llmbridge claude` launches Claude Code wired to the bridge (add `--print-env` to just see the values).
+Or skip the exports entirely: `llmbridge claude` launches Claude Code wired to the bridge (add `--print-env` to just see the values). It passes the URL and token as a CLI settings layer as well as environment variables: Claude Code lets a settings-pinned env outrank inherited exports, which is how a launch can look correct and still send traffic elsewhere. The CLI layer wins over every settings file.
 
 ---
 
@@ -139,6 +139,10 @@ Claude Code's Sonnet/Opus/Haiku picks land on the matching `claude-*` blocks abo
 
 Legacy single-endpoint vars (`LLMBRIDGE_UPSTREAM_*`) still supported.
 
+Client `thinking` blocks follow the route: `enabled` maps to `reasoning_effort` when the route sets one and is dropped otherwise; `disabled` stays off. A thinking type the bridge does not recognise — newer clients already send them — is treated as enabled rather than rejected, so a client-version bump cannot turn every request into a 400.
+
+A Claude Code turn carries roughly 28.6k input tokens of context, so a local route spends most of its wall time in prefill: measured at 1.7–19.7 tok/s on `qwen3:8b` against 38.8–60.4 tok/s on a hosted route. Keep a local alias as a fallback for resilience, but point long agent sessions at a hosted route.
+
 **How the config file is picked — three rules that explain most confusion:**
 
 1. The file depends on **where you start `llmbridge serve`**, not where you ran `setup`. A `./llmbridge.toml` in the serve folder wins over `~/.config/llmbridge/llmbridge.toml`. Run `llmbridge models` from the same folder you serve from to see the live route set. `setup` follows the same order when choosing where to **write**: an existing `./llmbridge.toml` wins, otherwise it writes to the user-level file.
@@ -183,6 +187,7 @@ Real errors and what they mean:
 | `error: ...llmbridge.toml already exists (use --force to overwrite)` | `setup` refuses to clobber an existing file | Re-run `llmbridge setup --force` — it **replaces the whole file**, so re-add any other routes afterwards |
 | `Upstream returned HTTP 403` → client sees `502`, work saved as `gen_...` | The provider rejected your API key (expired or revoked). The bridge behaved correctly: retried, saved the interrupted work, told you | Confirm with `curl` against the provider using the same key; generate a fresh key; add a local Ollama route to `fallbacks` so requests survive a dead key |
 | Request fails with `404` from Ollama | The `model` ID is not pulled locally | `ollama list` to check, `ollama pull <model>` to fix |
+| `502 ... Upstream returned an empty answer (reasoning alone is not text output)` | A reasoning model spent the whole `max_tokens` budget thinking and emitted no text — common with `qwen3` at small budgets | Raise `max_tokens`, or continue the saved generation with `llmbridge fork <id> --model <alias>`; an empty answer is never passed off as success |
 
 ---
 
@@ -199,6 +204,7 @@ Real errors and what they mean:
 | `llmbridge init` | Write starter config |
 | `llmbridge generations` | List recorded generations |
 | `llmbridge status` | Summarize ledger, flag recoverable work |
+| `llmbridge stats` | Status counts, tokens, p50/p95 wall time, heal verdicts (`--json`) |
 | `llmbridge fork <id> --model <alias>` | Continue a generation on another model |
 | `llmbridge tree <id>` | Render a fork lineage (ancestors + descendants) |
 | `llmbridge diff <idA> <idB>` | Compare two generations' outputs side by side |
@@ -218,6 +224,7 @@ Real errors and what they mean:
 | `POST` | `/v1/messages` | Anthropic-compatible completion |
 | `POST` | `/v1/messages/count_tokens` | Approximate input-token estimate |
 | `GET` | `/v1/interrupted` | Newest interrupted record + `recoverable_count`, `other_recoverable` (404 if none) |
+| `GET` | `/v1/stats` | Ledger stats: statuses, tokens, wall time, heal verdicts and digest rate |
 | `POST` | `/v1/interrupted/resume` | Resume interrupted work on a model; marks the source `resumed` |
 | `DELETE` | `/v1/interrupted` | Delete the newest record, returns `remaining_recoverable` |
 | `GET` | `/v1/generations` | List durable generations |
@@ -256,6 +263,8 @@ curl ... /v1/generations/gen_1a2b3c4d5e6f/fork -d '{"model":"strong","max_tokens
 
 Ledger: atomic writes, file-lock serialized, per-file `0600` permissions. Disable with `LLMBRIDGE_TRACK_GENERATIONS=0`. Only the newest records are kept — 10 by default (`MAX_TRACKED_INTERRUPTED` in `llmbridge/ledger.py`, override with `LLMBRIDGE_LEDGER_MAX_RECORDS`); older ones are pruned as new generations arrive. Two things are exempt from that window, each with its own budget: a record whose newest heal audit is `suspect` (up to 25, `LLMBRIDGE_AUDIT_MAX_SUSPECT`) and work that is still unfinished — `interrupted` or `queued` (up to 10, `LLMBRIDGE_LEDGER_MAX_RECOVERABLE`). Set either to `0` to restore the plain window. Without those exemptions the bridge forgets an invisible heal, or stops offering work it could still finish, for a reason that has nothing to do with memory policy. See [What the audit remembers](#what-the-audit-remembers).
 
+Work in flight when the process exits is settled, not forgotten: a graceful stop marks any `running` record `interrupted`, and a sweep at startup — repeated every minute while serving — settles records left behind by a hard kill once they are older than twice the upstream timeout (five minutes minimum). Either way the request surfaces as recoverable work instead of claiming to still be running forever.
+
 ### Lineage, diffs, and replay
 
 Forks record their parent, so every generation knows where it grew from:
@@ -271,7 +280,7 @@ llmbridge replay gen_1a2b3c4d5e6f        # one generation
 llmbridge replay --all --limit 20 --threshold 0.8   # newest 20 completed; exit 1 on drift
 ```
 
-`replay` sends the exact recorded request back to the configured route and scores the new output against the saved one with `difflib` similarity. Use it after switching models, editing prompts, or upgrading upstreams to catch behavioral drift.
+`replay` sends the exact recorded request back to the configured route and scores the new output against the saved one with `difflib` similarity. Use it after switching models, editing prompts, or upgrading upstreams to catch behavioral drift. It compares real text only: a record with no saved output is `SKIP`ped (two empty answers are trivially identical), and a replay that comes back empty is a `FAIL`, not a silent pass.
 
 ---
 
@@ -303,14 +312,33 @@ A seam is flagged `suspect` when either half genuinely looks wrong:
 
 | flag | what it catches |
 |---|---|
-| `duplicated` | the continuation re-emits text from before the break (12+ characters shared with the boundary) |
-| `restarted` | the continuation opens with a fresh preamble such as "Sure, here's…" — it ignored the appended assistant turn and began a new answer |
+| `duplicated` | the continuation re-emits text that started where the first model stopped (12+ characters shared, and the repeat has to be anchored at the joint — a phrase reused mid-continuation is ordinary language) |
+| `restarted` | the continuation opens with a fresh preamble such as "Sure, here's…" — it ignored the appended assistant turn and began a new answer. Markdown, quotes, list markers, and leading numbers are stripped before the check, so `**Sure,**` and `> Of course!` are caught too |
 
 ```bash
 llmbridge status
 # Healed streams audited: 2 (1 suspect)
 #   gen_x1a2b3: nemotron -> qwen at char 480, 31 chars repeated (duplicated)
 #   flag only: review with `llmbridge replay <id>`
+# Digest: 2 seam(s) (1 suspect, 50%)
+```
+
+The two counts answer different questions: `Healed streams audited` is the working set
+(records still on disk), `Digest` is every seam ever consolidated, including ones whose
+records the retention window has since pruned. `llmbridge stats` reports both side by side.
+
+`llmbridge stats` also prints status counts, recorded output tokens, and p50/p95 wall time
+over completed generations; `--json` emits the same numbers (also served at `GET /v1/stats`).
+
+```bash
+llmbridge stats
+# Ledger: .llmbridge/generations (12 records)
+# Statuses: completed=10, interrupted=2
+# Recoverable: 2
+# Output tokens: 4120 over 10 record(s)
+# Wall time: p50 2.4s, p95 9.8s, max 12.1s (n=10)
+# Heals: 2 healed, 2 audited (1 suspect, 50% suspect); duplicated 1, restarted 0
+# Digest: 2 seam(s) (1 suspect, 50%)
 ```
 
 This is an **audit, not a gate**. A suspect seam is still delivered — the whole point of

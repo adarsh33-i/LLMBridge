@@ -20,6 +20,8 @@ from llmbridge.server import (
     _anthropic_text,
     _upstream_output_tokens,
     score_seam,
+    settle_stale_generations,
+    stale_generation_seconds,
 )
 from llmbridge.work_tracker import WorkTracker
 
@@ -111,6 +113,25 @@ class GenerationServerTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_stats_endpoint_reports_ledger_counts(self):
+        record = self.ledger.create(
+            {
+                "model": "nemotron",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            "nemotron",
+        )
+        self.ledger.complete(record, "Hello", 3)
+
+        status, _, body = self._call("GET", "/v1/stats")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["object"], "stats")
+        self.assertEqual(body["generations"]["total"], 1)
+        self.assertEqual(body["generations"]["by_status"], {"completed": 1})
+        self.assertEqual(body["tokens"]["output"], 3)
 
     def _call(self, method, path, body=None):
         data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -1056,6 +1077,48 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIsNone(_upstream_output_tokens({"usage": {"completion_tokens": -1}}))
 
 
+class RunningGenerationSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+
+    def _create(self, prompt="Hello"):
+        return self.ledger.create(
+            {
+                "model": "nemotron",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            "nemotron",
+        )
+
+    def test_stop_settles_records_left_running(self):
+        server = LLMBridgeServer(
+            ("127.0.0.1", 0), LLMBridgeHandler, {}, ledger=self.ledger
+        )
+        self.addCleanup(server.server_close)
+        record = self._create()
+
+        server.stop()
+
+        reloaded = self.ledger.load(record.id)
+        self.assertEqual(reloaded.status, "interrupted")
+        self.assertIn("Bridge stopped", reloaded.events[-1].data["message"])
+
+    def test_startup_sweep_skips_records_younger_than_the_margin(self):
+        record = self._create()
+
+        self.assertEqual(settle_stale_generations(self.ledger), [])
+        self.assertEqual(self.ledger.load(record.id).status, "running")
+
+        settled = settle_stale_generations(
+            self.ledger, now=time.time() + stale_generation_seconds() + 1
+        )
+        self.assertEqual([item.id for item in settled], [record.id])
+        self.assertEqual(self.ledger.load(record.id).status, "interrupted")
+
+
 class SeamScoringTests(unittest.TestCase):
     def test_a_plain_join_is_not_suspect(self):
         audit = score_seam(
@@ -1082,6 +1145,29 @@ class SeamScoringTests(unittest.TestCase):
         ):
             with self.subTest(continuation=continuation):
                 self.assertTrue(score_seam("totally different prefix text", continuation)["restarted"])
+
+    def test_a_shared_phrase_inside_the_continuation_is_not_duplicated(self):
+        # The repeated words sit mid-continuation, which is ordinary phrasing
+        # reuse; only a match that starts at the continuation cannot be that.
+        audit = score_seam(
+            "In 2023 revenue increased sharply and then the market cooled",
+            "Overall revenue increased by 12 percent last year.",
+        )
+        self.assertGreaterEqual(audit["overlap_chars"], 12)
+        self.assertGreaterEqual(audit["overlap_ratio"], 0.25)
+        self.assertFalse(audit["duplicated"])
+        self.assertFalse(audit["suspect"])
+
+    def test_a_decorated_fresh_preamble_is_flagged_as_a_restart(self):
+        for continuation in (
+            "**Sure!** The capital of France is Paris.",
+            "- Certainly, continuing where it stopped.",
+            "> Of course!",
+        ):
+            with self.subTest(continuation=continuation):
+                self.assertTrue(
+                    score_seam("totally different prefix text", continuation)["restarted"]
+                )
 
     def test_a_normal_word_continuation_is_not_a_restart(self):
         self.assertFalse(score_seam("The total rev", "enue for the quarter was 12 percent.")["restarted"])

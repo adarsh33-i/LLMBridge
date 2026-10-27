@@ -244,6 +244,30 @@ class ProtocolTests(unittest.TestCase):
             result["usage"], {"input_tokens": 0, "output_tokens": 0}
         )
 
+    def test_rejects_a_reasoning_only_empty_answer(self):
+        # A model that spends its whole budget on reasoning sends content "" and
+        # reasoning_content; an empty content list is not a displayable answer.
+        with self.assertRaisesRegex(ProtocolError, "empty answer"):
+            openai_to_anthropic(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "", "reasoning_content": "thinking..."},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                "nemotron",
+            )
+
+    def test_rejects_a_reasoning_only_empty_stream(self):
+        events = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+        ]
+        with self.assertRaisesRegex(ProtocolError, "produced no content"):
+            list(stream_events(events, "nemotron"))
+
     def test_rejects_unknown_stream_finish_reason(self):
         events = [
             b'data: {"choices":[{"delta":{},"finish_reason":"made_up_reason"}]}\n',
@@ -403,6 +427,44 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", request)
         # Content is a plain string when only text is present
         self.assertEqual(request["messages"][0]["content"], "Think this through")
+
+    def test_accepts_an_unknown_thinking_type_as_enabled(self):
+        # Claude Code sends a thinking type this bridge does not know; treating
+        # it as enabled keeps the request alive instead of answering 400.
+        for kind in ("adaptive", "summarized"):
+            with self.subTest(kind=kind):
+                request = anthropic_to_openai(
+                    {
+                        "model": "client-model",
+                        "max_tokens": 100,
+                        "thinking": {"type": kind},
+                        "messages": [{"role": "user", "content": "Think this through"}],
+                    },
+                    reasoning_effort="medium",
+                )
+                self.assertEqual(request["reasoning_effort"], "medium")
+
+    def test_drops_an_unknown_thinking_type_without_route_mapping(self):
+        request = anthropic_to_openai(
+            {
+                "model": "client-model",
+                "max_tokens": 100,
+                "thinking": {"type": "adaptive"},
+                "messages": [{"role": "user", "content": "Think this through"}],
+            }
+        )
+        self.assertNotIn("reasoning_effort", request)
+
+    def test_rejects_thinking_that_is_not_an_object(self):
+        with self.assertRaisesRegex(ProtocolError, "thinking must be an object"):
+            anthropic_to_openai(
+                {
+                    "model": "client-model",
+                    "max_tokens": 100,
+                    "thinking": "enabled",
+                    "messages": [{"role": "user", "content": "Think this through"}],
+                }
+            )
 
     def test_rejects_images_when_route_declares_no_image_support(self):
         with self.assertRaisesRegex(ProtocolError, "does not support images"):
