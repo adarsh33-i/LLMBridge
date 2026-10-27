@@ -1137,7 +1137,9 @@ def openai_to_anthropic(
 
     finish_reason = choice.get("finish_reason")
     stop_reason = _stop_reason(finish_reason)
-    usage = response.get("usage", {})
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
     return {
         "id": response.get("id", f"msg_{uuid4().hex}"),
         "type": "message",

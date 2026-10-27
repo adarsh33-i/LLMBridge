@@ -158,8 +158,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(state["error"], "Upstream returned HTTP 429")
         self.assertEqual(self._record_count(), 1)
 
-        # 2. The same prompt succeeding clears the interruption; its own
-        # record is completed and the stale one is gone.
+        # 2. Re-sending the same request resolves the interruption: the dead
+        # run is marked resumed and stays on disk as the evidence that this
+        # answer needed a second attempt.
         _MockUpstream.mode = "ok"
         status, _, headers = self.req(
             "POST",
@@ -171,7 +172,11 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.req("GET", "/v1/interrupted")[0], 404)
         completed = self.req("GET", "/v1/generations/" + headers["X-LLMBridge-Generation"])[1]
         self.assertEqual(completed["status"], "completed")
-        self.assertEqual(self.req("GET", "/v1/generations/" + state["generation_id"])[0], 404)
+        stale = self.req("GET", "/v1/generations/" + state["generation_id"])[1]
+        self.assertEqual(stale["status"], "resumed")
+        resumes = [event for event in stale["events"] if event["type"] == "resume"]
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(resumes[0]["data"]["resumed_by"], headers["X-LLMBridge-Generation"])
 
         # 3. Fourteen creates later the ledger holds only the newest ten.
         for index in range(12):

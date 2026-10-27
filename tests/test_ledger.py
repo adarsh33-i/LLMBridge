@@ -17,10 +17,13 @@ from llmbridge.ledger import (
     EVENT_FAIL,
     EVENT_FORK,
     EVENT_HEAL,
+    EVENT_HEAL_SEAM,
     EVENT_INTERRUPT,
     EVENT_QUEUED,
     EVENT_START,
     MAX_TRACKED_INTERRUPTED,
+    MAX_KEPT_RECOVERABLE,
+    MAX_KEPT_SUSPECT_AUDITS,
     GenerationLedger,
     GenerationRecord,
     _exclusive_lock,
@@ -264,6 +267,33 @@ class ForkRequestTests(unittest.TestCase):
         request = GenerationLedger.fork_request(self._record())
         self.assertEqual(request["messages"][0], {"role": "user", "content": "Hello"})
 
+    def test_merges_into_a_trailing_assistant_prefill(self):
+        history = [
+            {"role": "user", "content": "write the function"},
+            {"role": "assistant", "content": "def f():"},
+        ]
+        request = GenerationLedger.fork_request(
+            self._record(request={"messages": history})
+        )
+        # A prefill is joined, not duplicated: two assistant turns in a row
+        # would be rejected upstream.
+        self.assertEqual(len(request["messages"]), 2)
+        self.assertEqual(request["messages"][-1]["content"], "def f():Half")
+        self.assertEqual(history[-1]["content"], "def f():")
+
+    def test_merges_into_a_trailing_assistant_block_list(self):
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "Sure"}]},
+        ]
+        request = GenerationLedger.fork_request(
+            self._record(request={"messages": history})
+        )
+        self.assertEqual(
+            request["messages"][-1]["content"],
+            [{"type": "text", "text": "Sure"}, {"type": "text", "text": "Half"}],
+        )
+
 
 class LedgerHelperTests(unittest.TestCase):
     def test_validate_generation_id_rejects_traversal(self):
@@ -348,18 +378,100 @@ class LedgerPruneTests(unittest.TestCase):
             )
         self.assertEqual(len(self._files()), MAX_TRACKED_INTERRUPTED)
 
-    def test_interrupted_records_among_pruned_are_gone(self):
+    def _interrupted_run(self, ledger, prompt):
+        record = ledger.create(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]},
+            "m",
+        )
+        ledger.interrupt(record, "quota", output="half", progress=10.0)
+        return record
+
+    def test_recoverable_work_survives_the_retention_window(self):
         clock = itertools.count()
         with mock.patch("llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))):
-            for index in range(MAX_TRACKED_INTERRUPTED + 1):
-                record = self.ledger.create(
+            made = [
+                self._interrupted_run(self.ledger, f"p{index}")
+                for index in range(MAX_TRACKED_INTERRUPTED + 1)
+            ]
+        # The oldest of these sits outside the window, but it is still unfinished
+        # work the bridge could offer to resume.
+        interrupted = self.ledger.interrupted()
+        self.assertEqual(
+            [record.id for record in interrupted], [record.id for record in reversed(made)]
+        )
+        for record in made:
+            self.assertTrue(self.ledger._path(record.id).exists())
+
+    def test_queued_work_survives_the_retention_window(self):
+        clock = itertools.count()
+        with mock.patch("llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))):
+            first = self.ledger.create(
+                {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "wait"}]},
+                "m",
+            )
+            self.ledger.queue(first, "over quota", time.time() + 60, 1)
+            for index in range(MAX_TRACKED_INTERRUPTED + 4):
+                done = self.ledger.create(
                     {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": f"p{index}"}]},
                     "m",
                 )
-                self.ledger.interrupt(record, "quota", output="half", progress=10.0)
-        interrupted = self.ledger.interrupted()
-        self.assertEqual(len(interrupted), MAX_TRACKED_INTERRUPTED)
-        self.assertEqual(interrupted[0].prompt, f"p{MAX_TRACKED_INTERRUPTED}")
+                self.ledger.complete(done, "fine", 1)
+        kept = self.ledger.load(first.id)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept.status, "queued")
+        self.assertEqual([record.id for record in self.ledger.queued()], [first.id])
+
+    def test_recoverable_exemption_is_bounded_and_freshest_first(self):
+        clock = itertools.count()
+        with mock.patch("llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))):
+            made = [
+                self._interrupted_run(self.ledger, f"p{index}")
+                for index in range(MAX_TRACKED_INTERRUPTED + MAX_KEPT_RECOVERABLE + 2)
+            ]
+        retained = [record.id for record in self.ledger.interrupted()]
+        self.assertEqual(
+            retained,
+            [
+                record.id
+                for record in reversed(
+                    made[-(MAX_TRACKED_INTERRUPTED + MAX_KEPT_RECOVERABLE):]
+                )
+            ],
+        )
+        self.assertEqual(
+            len(self.ledger.list(limit=None)),
+            MAX_TRACKED_INTERRUPTED + MAX_KEPT_RECOVERABLE,
+        )
+        for record in made[:2]:
+            self.assertIsNone(self.ledger.load(record.id))
+
+    def test_zero_recoverable_budget_restores_the_plain_window(self):
+        with mock.patch.dict(
+            os.environ, {"LLMBRIDGE_LEDGER_MAX_RECOVERABLE": "0"}
+        ):
+            ledger = GenerationLedger(str(Path(self._tmp.name) / "no-recover"))
+        self.assertEqual(ledger.max_recoverable, 0)
+        clock = itertools.count()
+        with mock.patch("llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))):
+            first = self._interrupted_run(ledger, "p0")
+            for index in range(1, MAX_TRACKED_INTERRUPTED + 3):
+                self._interrupted_run(ledger, f"p{index}")
+        self.assertIsNone(ledger.load(first.id))
+        self.assertEqual(len(ledger.list(limit=None)), MAX_TRACKED_INTERRUPTED)
+
+    def test_bad_recoverable_env_value_falls_back_to_the_default(self):
+        with mock.patch.dict(os.environ, {"LLMBRIDGE_LEDGER_MAX_RECOVERABLE": "many"}):
+            ledger = GenerationLedger(str(Path(self._tmp.name) / "bad-recover"))
+        self.assertEqual(ledger.max_recoverable, MAX_KEPT_RECOVERABLE)
+
+    def test_explicit_prune_window_is_a_hard_cut(self):
+        made = [self._interrupted_run(self.ledger, f"p{index}") for index in range(4)]
+        removed = self.ledger.prune(keep=2)
+        self.assertEqual(removed, [made[0].id, made[1].id])
+        self.assertEqual(
+            [record.id for record in self.ledger.interrupted()],
+            [made[3].id, made[2].id],
+        )
 
     def test_interrupted_lists_only_interrupted_records_newest_first(self):
         first = self.ledger.create({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "a"}]}, "m")
@@ -668,6 +780,367 @@ class LedgerQueueTests(unittest.TestCase):
 
         reloaded = GenerationLedger(str(self.ledger.root)).load(record.id)
         self.assertEqual(reloaded.events[-1].type, EVENT_HEAL)
+
+    def test_heal_seam_appends_audit_without_changing_status(self):
+        record = self._record()
+        self.ledger.heal_seam(
+            record,
+            from_model="nemotron",
+            to_model="qwen-local",
+            seam_at=120,
+            audit={
+                "continuation_chars": 64,
+                "overlap_chars": 31,
+                "overlap_ratio": 0.194,
+                "duplicated": True,
+                "restarted": False,
+                "suspect": True,
+            },
+        )
+        self.assertEqual(record.status, "running")
+        event = record.events[-1]
+        self.assertEqual(event.type, EVENT_HEAL_SEAM)
+        self.assertEqual(event.data["seam_at"], 120)
+        self.assertTrue(event.data["duplicated"])
+
+        reloaded = GenerationLedger(str(self.ledger.root)).load(record.id)
+        self.assertEqual(reloaded.events[-1].type, EVENT_HEAL_SEAM)
+        self.assertTrue(GenerationLedger.heal_seam_suspect(reloaded))
+
+    def test_seam_readers_report_the_newest_audit(self):
+        record = self._record()
+        self.assertIsNone(GenerationLedger.heal_seam_audit(record))
+        self.assertFalse(GenerationLedger.heal_seam_suspect(record))
+
+        clean = {"overlap_chars": 2, "duplicated": False, "restarted": False,
+                 "suspect": False}
+        self.ledger.heal_seam(
+            record, from_model="a", to_model="b", seam_at=10, audit=clean
+        )
+        self.assertEqual(
+            GenerationLedger.heal_seam_audit(record), {**clean, "seam_at": 10,
+                                                       "from_model": "a", "to_model": "b"}
+        )
+        self.assertFalse(GenerationLedger.heal_seam_suspect(record))
+
+        self.ledger.heal_seam(
+            record,
+            from_model="a",
+            to_model="c",
+            seam_at=30,
+            audit={**clean, "suspect": True, "to_model": "ignored"},
+        )
+        newest = GenerationLedger.heal_seam_audit(record)
+        self.assertEqual(newest["seam_at"], 30)
+        self.assertTrue(GenerationLedger.heal_seam_suspect(record))
+
+
+def _seam_audit(suspect, **overrides):
+    audit = {
+        "continuation_chars": 60,
+        "overlap_chars": 31 if suspect else 3,
+        "overlap_ratio": 0.4 if suspect else 0.05,
+        "duplicated": bool(suspect),
+        "restarted": False,
+        "suspect": bool(suspect),
+    }
+    audit.update(overrides)
+    return audit
+
+
+class SuspectAuditRetentionTests(unittest.TestCase):
+    """Forgetting a suspect seam has to be a decision, not a side effect."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        os.environ.pop("LLMBRIDGE_LEDGER_MAX_RECORDS", None)
+        os.environ.pop("LLMBRIDGE_AUDIT_MAX_SUSPECT", None)
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+
+    def _plain(self, ledger, prompt):
+        record = ledger.create(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]},
+            "m",
+        )
+        ledger.complete(record, "fine", 1)
+        return record
+
+    def _healed(self, ledger, prompt, suspect):
+        record = self._plain(ledger, prompt)
+        ledger.heal(
+            record, from_model="primary", to_model="backup", resumed_chars=8
+        )
+        ledger.heal_seam(
+            record,
+            from_model="primary",
+            to_model="backup",
+            seam_at=8,
+            audit=_seam_audit(suspect),
+        )
+        return record
+
+    def test_suspect_seam_audit_survives_fifty_later_generations(self):
+        clock = itertools.count()
+        with mock.patch(
+            "llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))
+        ):
+            suspect = self._healed(self.ledger, "bad join", suspect=True)
+            clean = self._healed(self.ledger, "good join", suspect=False)
+            for index in range(50):
+                self._plain(self.ledger, f"p{index}")
+        kept = self.ledger.load(suspect.id)
+        self.assertIsNotNone(kept)
+        self.assertTrue(GenerationLedger.heal_seam_suspect(kept))
+        self.assertIsNone(self.ledger.load(clean.id))
+        self.assertEqual(
+            len(self.ledger.list(limit=None)), MAX_TRACKED_INTERRUPTED + 1
+        )
+
+    def test_exempted_suspects_are_bounded_and_freshest_first(self):
+        os.environ["LLMBRIDGE_AUDIT_MAX_SUSPECT"] = "2"
+        ledger = GenerationLedger(str(Path(self._tmp.name) / "bounded"))
+        clock = itertools.count()
+        with mock.patch(
+            "llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))
+        ):
+            made = [self._healed(ledger, f"seam {i}", suspect=True) for i in range(5)]
+            for index in range(20):
+                self._plain(ledger, f"p{index}")
+        retained = [
+            record.id
+            for record in ledger.list(limit=None)
+            if GenerationLedger.heal_seam_suspect(record)
+        ]
+        self.assertEqual(retained, [made[4].id, made[3].id])
+        self.assertEqual(len(ledger.list(limit=None)), MAX_TRACKED_INTERRUPTED + 2)
+
+    def test_zero_budget_restores_the_plain_window(self):
+        os.environ["LLMBRIDGE_AUDIT_MAX_SUSPECT"] = "0"
+        ledger = GenerationLedger(str(Path(self._tmp.name) / "no-budget"))
+        self.assertEqual(ledger.max_suspect_audits, 0)
+        clock = itertools.count()
+        with mock.patch(
+            "llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))
+        ):
+            suspect = self._healed(ledger, "bad join", suspect=True)
+            for index in range(20):
+                self._plain(ledger, f"p{index}")
+        self.assertIsNone(ledger.load(suspect.id))
+
+    def test_invalid_budget_falls_back_to_the_default(self):
+        for raw in ["not-a-number", "-1", ""]:
+            with self.subTest(raw=raw):
+                os.environ["LLMBRIDGE_AUDIT_MAX_SUSPECT"] = raw
+                ledger = GenerationLedger(
+                    str(Path(self._tmp.name) / f"bad-budget-{abs(hash(raw))}")
+                )
+                self.assertEqual(ledger.max_suspect_audits, MAX_KEPT_SUSPECT_AUDITS)
+
+    def test_explicit_prune_window_is_a_hard_window(self):
+        clock = itertools.count()
+        with mock.patch(
+            "llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))
+        ):
+            suspect = self._healed(self.ledger, "bad join", suspect=True)
+            for index in range(3):
+                self._plain(self.ledger, f"p{index}")
+            removed = self.ledger.prune(keep=1)
+        self.assertIn(suspect.id, removed)
+        self.assertIsNone(self.ledger.load(suspect.id))
+
+
+class AuditConsolidationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+
+    def _healed(self, ledger, prompt, suspect, seam_at=8):
+        record = ledger.create(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]},
+            "primary",
+        )
+        ledger.heal(record, from_model="primary", to_model="backup", resumed_chars=seam_at)
+        ledger.heal_seam(
+            record,
+            from_model="primary",
+            to_model="backup",
+            seam_at=seam_at,
+            audit=_seam_audit(suspect),
+        )
+        ledger.complete(record, "stitched", 2)
+        return record
+
+    def _plain(self, ledger, prompt):
+        record = ledger.create(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": prompt}]},
+            "m",
+        )
+        ledger.complete(record, "fine", 1)
+        return record
+
+    def test_consolidate_writes_one_line_per_seam_audit(self):
+        first = self._healed(self.ledger, "a", suspect=False, seam_at=12)
+        second = self._healed(self.ledger, "b", suspect=True, seam_at=24)
+        stats = self.ledger.consolidate()
+        self.assertEqual(stats["audits_on_disk"], 2)
+        self.assertEqual(stats["new_entries"], 2)
+        self.assertEqual(stats["total_entries"], 2)
+        self.assertEqual(stats["suspect_entries"], 1)
+        self.assertEqual(stats["suspect_rate"], 0.5)
+        entries = GenerationLedger.read_audit_digest(self.ledger.audit_digest_path)
+        self.assertEqual(
+            [(entry["generation_id"], entry["seam_at"]) for entry in entries],
+            [(first.id, 12), (second.id, 24)],
+        )
+        self.assertEqual(entries[1]["to_model"], "backup")
+        self.assertTrue(entries[1]["suspect"])
+
+    def test_consolidate_is_idempotent(self):
+        self._healed(self.ledger, "a", suspect=True)
+        self.ledger.consolidate()
+        stats = self.ledger.consolidate()
+        self.assertEqual(stats["new_entries"], 0)
+        self.assertEqual(stats["total_entries"], 1)
+        self.assertEqual(
+            len(self.ledger.audit_digest_path.read_text(encoding="utf-8").splitlines()),
+            1,
+        )
+
+    def test_digest_keeps_the_rate_after_the_records_age_out(self):
+        clock = itertools.count()
+        with mock.patch(
+            "llmbridge.ledger.time.time", side_effect=lambda: float(next(clock))
+        ):
+            for index in range(20):
+                self._healed(self.ledger, f"heal {index}", suspect=index < 5)
+                # Consolidating while the records still exist is what keeps a
+                # denominator; run late and the clean seams are already gone.
+                self.ledger.consolidate()
+            for index in range(40):
+                self._plain(self.ledger, f"p{index}")
+            stats = self.ledger.consolidate()
+        # Only the five suspect audits are still on disk; the digest remembers all twenty.
+        self.assertEqual(stats["audits_on_disk"], 5)
+        self.assertEqual(stats["new_entries"], 0)
+        self.assertEqual(stats["total_entries"], 20)
+        self.assertEqual(stats["suspect_entries"], 5)
+        self.assertEqual(stats["suspect_rate"], 0.25)
+
+    def test_rate_is_unmeasured_without_any_audit(self):
+        self._plain(self.ledger, "only")
+        stats = self.ledger.consolidate()
+        self.assertIsNone(stats["suspect_rate"])
+        self.assertEqual(stats["total_entries"], 0)
+        self.assertFalse(self.ledger.audit_digest_path.exists())
+
+    def test_pruning_consolidates_a_clean_seam_before_it_is_deleted(self):
+        # Never consolidated by hand: the clean seams must survive because the
+        # prune that deletes their records copies them first. Otherwise the
+        # suspect count keeps its numerator and loses its denominator. The
+        # suspect exemption is switched off so every seam is actually pruned.
+        with mock.patch.dict(os.environ, {"LLMBRIDGE_AUDIT_MAX_SUSPECT": "0"}):
+            ledger = GenerationLedger(str(self.ledger.root))
+            for index in range(20):
+                self._healed(ledger, f"heal {index}", suspect=index < 5)
+            for index in range(40):
+                self._plain(ledger, f"p{index}")
+        stats = self.ledger.consolidate()
+        self.assertEqual(stats["audits_on_disk"], 0)
+        self.assertEqual(stats["new_entries"], 0)
+        self.assertEqual(stats["total_entries"], 20)
+        self.assertEqual(stats["suspect_entries"], 5)
+
+    def test_pruning_records_without_audits_writes_no_digest(self):
+        for index in range(15):
+            self._plain(self.ledger, f"p{index}")
+        self.assertEqual(len(self.ledger.list(limit=None)), 10)
+        self.assertFalse(self.ledger.audit_digest_path.exists())
+
+    def test_reader_skips_a_partial_or_corrupt_line(self):
+        self._healed(self.ledger, "a", suspect=True)
+        self.ledger.consolidate()
+        with open(self.ledger.audit_digest_path, "a", encoding="utf-8") as handle:
+            handle.write('{"generation_id": "truncated\n')
+        entries = GenerationLedger.read_audit_digest(self.ledger.audit_digest_path)
+        self.assertEqual(len(entries), 1)
+
+
+class DreamRequestTests(unittest.TestCase):
+    ANSWER = "Hello world, this answer keeps going for a while."
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+
+    def _completed(self, model="primary", output=ANSWER):
+        record = self.ledger.create(
+            {
+                "model": model,
+                "max_tokens": 64,
+                "system": "be brief",
+                "messages": [
+                    {"role": "user", "content": "say something"},
+                    {"role": "assistant", "content": "earlier turn"},
+                    {"role": "user", "content": "keep going"},
+                ],
+            },
+            model,
+        )
+        self.ledger.complete(record, output, 8)
+        return record
+
+    def test_cut_output_becomes_the_assistant_turn_to_continue(self):
+        record = self._completed()
+        body = GenerationLedger.dream_request(record, at=len("Hello world,"))
+        self.assertEqual(
+            body["messages"],
+            [
+                {"role": "user", "content": "say something"},
+                {"role": "assistant", "content": "earlier turn"},
+                {"role": "user", "content": "keep going"},
+                {"role": "assistant", "content": "Hello world,"},
+            ],
+        )
+        self.assertEqual(body["model"], "primary")
+        self.assertEqual(body["max_tokens"], 64)
+        self.assertEqual(body["system"], "be brief")
+        self.assertFalse(body["stream"])
+
+    def test_record_and_cut_are_not_mutated(self):
+        record = self._completed()
+        GenerationLedger.dream_request(record, at=5)
+        self.assertEqual(record.output, DreamRequestTests.ANSWER)
+        self.assertEqual(len(record.events), 2)
+
+    def test_model_and_token_limit_can_be_overridden(self):
+        record = self._completed()
+        body = GenerationLedger.dream_request(record, at=10, model="backup", max_tokens=32)
+        self.assertEqual(body["model"], "backup")
+        self.assertEqual(body["max_tokens"], 32)
+
+    def test_cuts_are_clamped_into_the_stored_output(self):
+        record = self._completed()
+        late = GenerationLedger.dream_request(record, at=len(self.ANSWER) + 50)
+        self.assertEqual(
+            late["messages"][-1]["content"], self.ANSWER
+        )
+        early = GenerationLedger.dream_request(record, at=-10)
+        self.assertEqual(early["messages"][-1]["role"], "user")
+        self.assertEqual(len(early["messages"]), 3)
+
+    def test_needs_a_stored_output_to_cut(self):
+        record = self.ledger.create(
+            {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "p"}]},
+            "m",
+        )
+        with self.assertRaises(ValueError):
+            GenerationLedger.dream_request(record, at=4)
 
 
 if __name__ == "__main__":

@@ -230,6 +230,20 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(result["stop_reason"], "end_turn")
 
+    def test_tolerates_a_null_usage_object(self):
+        # Some OpenAI-compatible servers send "usage": null; that must read as
+        # zero usage, not crash the translation with an AttributeError.
+        result = openai_to_anthropic(
+            {
+                "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                "usage": None,
+            },
+            "nemotron",
+        )
+        self.assertEqual(
+            result["usage"], {"input_tokens": 0, "output_tokens": 0}
+        )
+
     def test_rejects_unknown_stream_finish_reason(self):
         events = [
             b'data: {"choices":[{"delta":{},"finish_reason":"made_up_reason"}]}\n',

@@ -1,11 +1,13 @@
+import difflib
 import hmac
 import ipaddress
 import json
 import logging
 import os
+import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -13,7 +15,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from .ledger import GenerationLedger, GenerationRecord, request_replay
+from .ledger import (
+    GenerationLedger,
+    GenerationRecord,
+    _fingerprint,
+    append_assistant_turn,
+    request_replay,
+)
 from .protocol import (
     ProtocolError,
     anthropic_to_openai,
@@ -60,6 +68,69 @@ _QUEUEABLE_STATUS = frozenset({402, 429})
 _DEFAULT_QUEUE_RETRY_SECONDS = 5.0
 _DEFAULT_QUEUE_MAX_ATTEMPTS = 5
 _QUEUE_POLL_SECONDS = 1.0
+
+# Two identical non-streaming requests in flight at once normally cost two
+# upstream calls. ``LLMBRIDGE_COALESCE_REQUESTS`` lets the second attach to the
+# first and share its answer. ``deterministic`` only merges requests that pin
+# temperature to 0 - the only case where two identical requests must agree -
+# while ``1``/``always`` also merges retries at higher temperatures.
+_COALESCE_OFF = "off"
+_COALESCE_DETERMINISTIC = "deterministic"
+_COALESCE_ALWAYS = "always"
+
+
+def _coalesce_mode() -> str:
+    """Read the duplicate-request policy; anything unrecognised means off."""
+    raw = os.environ.get("LLMBRIDGE_COALESCE_REQUESTS")
+    if raw is None:
+        return _COALESCE_OFF
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on", "always"):
+        return _COALESCE_ALWAYS
+    if value in ("deterministic", "temp0", "temperature0"):
+        return _COALESCE_DETERMINISTIC
+    return _COALESCE_OFF
+
+
+def _pins_temperature(body: Any) -> bool:
+    """Whether this request asks for a temperature that makes output repeatable."""
+    if not isinstance(body, dict):
+        return False
+    temperature = body.get("temperature")
+    return (
+        isinstance(temperature, (int, float))
+        and not isinstance(temperature, bool)
+        and temperature == 0
+    )
+
+
+def _coalescible(body: Any, *, stream: bool) -> bool:
+    """Whether a duplicate of this request may ride on the in-flight one."""
+    mode = _coalesce_mode()
+    if mode == _COALESCE_OFF or stream:
+        return False
+    if mode == _COALESCE_DETERMINISTIC and not _pins_temperature(body):
+        return False
+    return True
+
+
+def _route_candidates(
+    model_routes: dict[str, ModelRoute],
+    primary_route: ModelRoute,
+    primary_model: str,
+) -> list[tuple[ModelRoute, str]]:
+    """Primary route followed by its configured fallbacks, in order."""
+    candidates: list[tuple[ModelRoute, str]] = [(primary_route, primary_model)]
+    for alias in primary_route.fallbacks:
+        try:
+            route, upstream_model = resolve_model_route(alias, model_routes)
+        except RoutingError as error:
+            logger.warning("Skipping unusable fallback %s: %s", alias, error)
+            continue
+        candidate = (route, upstream_model)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
 
 
 def _queue_on_quota_enabled() -> bool:
@@ -150,6 +221,23 @@ def _retry_sleep(attempt: int) -> None:
 def _is_retryable_status(status: int) -> bool:
     return status in _RESUMABLE_HTTP_STATUS or status >= 500
 
+
+# A retry that failed for one of these reasons can plausibly succeed later
+# without the request changing: quota, a server-side 5xx, a dropped connection,
+# a timeout, or a reply the upstream mangled. A deterministic 4xx (bad key,
+# bad request) cannot, so it stops the retry loop instead of burning the budget.
+_QUEUE_TRANSIENT_KINDS = frozenset({"connect", "timeout", "invalid"})
+
+
+def _queue_retryable(failure: "_Failure") -> bool:
+    kind, _, status = failure
+    if kind == "http":
+        return (
+            isinstance(status, int)
+            and not isinstance(status, bool)
+            and (status in _QUEUEABLE_STATUS or status >= 500 or status == 408)
+        )
+    return kind in _QUEUE_TRANSIENT_KINDS
 
 
 def _truthy(value: str | None) -> bool:
@@ -259,7 +347,7 @@ def _build_resume_request(
         messages = [{"role": "user", "content": state["prompt"]}]
     partial_output = state.get("partial_output")
     if isinstance(partial_output, str) and partial_output:
-        messages.append({"role": "assistant", "content": partial_output})
+        messages = append_assistant_turn(messages, partial_output)
     request: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
@@ -289,10 +377,52 @@ def _build_heal_body(body: Any, partial_output: str) -> dict[str, Any] | None:
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return None
     healed = dict(body)
-    healed["messages"] = [
-        message for message in body["messages"] if isinstance(message, dict)
-    ] + [{"role": "assistant", "content": partial_output}]
+    healed["messages"] = append_assistant_turn(
+        [message for message in body["messages"] if isinstance(message, dict)],
+        partial_output,
+    )
     return healed
+
+
+# A healed stream joins two models inside one response, so a bad join is invisible
+# to the client by design. These checks score the boundary and flag the suspicious
+# ones in the ledger; they never block or alter a heal.
+_SEAM_WINDOW = 160
+_SEAM_MIN_OVERLAP_CHARS = 12
+_SEAM_MIN_OVERLAP_RATIO = 0.25
+_SEAM_RESTART_RE = re.compile(
+    r"^\s*(?:sure\b|certainly\b|of course\b|no problem\b|here(?:'s| is)\b|"
+    r"i can (?:help|absolutely|do that)\b|i'?ll (?:help|start|begin|answer)\b|"
+    r"let me (?:help|start|look))",
+    re.IGNORECASE,
+)
+
+
+def score_seam(partial_output: str, continuation: str) -> dict[str, Any]:
+    """Score the joint between a truncated answer and its healed continuation.
+
+    ``duplicated`` catches the classic stitching artifact: the fallback re-emits text
+    the first model already produced. ``restarted`` catches a fallback that ignored
+    the appended assistant turn and began a fresh answer instead.
+    """
+    before = partial_output[-_SEAM_WINDOW:].lower()
+    after = continuation[:_SEAM_WINDOW].lower()
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    overlap = matcher.find_longest_match(0, len(before), 0, len(after)).size
+    shortest = min(len(before), len(after))
+    ratio = round(overlap / shortest, 3) if shortest else 0.0
+    duplicated = (
+        overlap >= _SEAM_MIN_OVERLAP_CHARS and ratio >= _SEAM_MIN_OVERLAP_RATIO
+    )
+    restarted = bool(_SEAM_RESTART_RE.match(continuation))
+    return {
+        "continuation_chars": len(continuation),
+        "overlap_chars": overlap,
+        "overlap_ratio": ratio,
+        "duplicated": duplicated,
+        "restarted": restarted,
+        "suspect": duplicated or restarted,
+    }
 
 
 def _read_bounded(stream: Any, limit: int) -> bytes:
@@ -421,6 +551,17 @@ def _validate_listener_auth(host: str, client_api_key: str | None) -> None:
         )
 
 
+@dataclass
+class _Inflight:
+    """One in-flight request that an identical duplicate may attach to."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    generation_id: str | None = None
+    status: int = 502
+    payload: dict[str, Any] | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+
+
 class LLMBridgeServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -438,6 +579,8 @@ class LLMBridgeServer(ThreadingHTTPServer):
         self.ledger = ledger
         self._queue_stop = threading.Event()
         self._queue_thread: threading.Thread | None = None
+        self._inflight: dict[str, _Inflight] = {}
+        self._inflight_lock = threading.Lock()
         if ledger is not None and _queue_on_quota_enabled():
             # The queue lives in the ledger, so this also re-arms retries that
             # were pending when the process last exited.
@@ -446,8 +589,57 @@ class LLMBridgeServer(ThreadingHTTPServer):
             )
             self._queue_thread.start()
 
-    def shutdown(self) -> None:
+    def join_inflight(self, fingerprint: str) -> tuple[bool, _Inflight]:
+        """Lead this request, or attach to the identical one already running."""
+        with self._inflight_lock:
+            entry = self._inflight.get(fingerprint)
+            if entry is not None:
+                return False, entry
+            entry = _Inflight()
+            self._inflight[fingerprint] = entry
+            return True, entry
+
+    def finish_inflight(
+        self,
+        fingerprint: str,
+        entry: _Inflight,
+        result: tuple[int, dict[str, Any], dict[str, str], str | None] | None,
+    ) -> None:
+        """Publish the leader's answer to waiting duplicates and stop accepting joins."""
+        with self._inflight_lock:
+            if self._inflight.get(fingerprint) is entry:
+                del self._inflight[fingerprint]
+        if result is None:
+            entry.status = 502
+            entry.payload = {
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "message": "The original request failed before producing a response",
+                },
+            }
+        else:
+            entry.status, entry.payload, entry.headers, entry.generation_id = result
+        entry.done.set()
+
+    def consolidate_audits(self) -> dict[str, Any] | None:
+        """Flush seam audits into the durable digest; never raises."""
+        ledger = self.ledger
+        if ledger is None:
+            return None
+        try:
+            return ledger.consolidate()
+        except Exception as error:  # pragma: no cover - defensive
+            logger.error("Could not consolidate heal audits: %s", error)
+            return None
+
+    def stop(self) -> None:
+        """Stop background work and flush the audit digest."""
         self._queue_stop.set()
+        self.consolidate_audits()
+
+    def shutdown(self) -> None:
+        self.stop()
         super().shutdown()
 
     def _dispatch_queue_loop(self) -> None:
@@ -468,7 +660,7 @@ class LLMBridgeServer(ThreadingHTTPServer):
             self._run_queued_generation(record)
 
     def _run_queued_generation(self, record: GenerationRecord) -> None:
-        """Re-send one queued generation to its model route and finalize it."""
+        """Re-send one queued generation, following its fallbacks, and finalize it."""
         ledger = self.ledger
         if ledger is None or record.status != "queued":
             return
@@ -485,53 +677,103 @@ class LLMBridgeServer(ThreadingHTTPServer):
         body["stream"] = False
         if isinstance(record.params, dict) and record.params.get("max_tokens"):
             body.setdefault("max_tokens", record.params["max_tokens"])
-        payload = anthropic_to_openai(
-            body,
-            upstream_model,
-            reasoning_effort=route.reasoning_effort,
-            supports_images=route.supports_images,
-            supports_tools=route.supports_tools,
-            cache_control=route.cache_control,
-        )
-        try:
-            request = _upstream_request(payload, route)
-        except RoutingError as error:
-            ledger.fail(record, str(error))
-            return
-        try:
-            with urlopen(request, timeout=_upstream_timeout_seconds()) as upstream:
-                reply = json.loads(
-                    _read_bounded(upstream, _MAX_UPSTREAM_RESPONSE_BYTES)
-                )
-        except HTTPError as error:
-            failure = ("http", f"Upstream returned HTTP {error.code}", error.code)
-            error.close()
-            logger.info("Queued generation %s got HTTP %s", record.id, error.code)
-            self._requeue_or_fail(record, attempt, failure)
-            return
-        except (URLError, TimeoutError, OSError) as error:
-            logger.info("Queued generation %s failed: %s", record.id, error)
-            self._requeue_or_fail(
-                record, attempt, ("connect", "Could not connect to the configured upstream", None)
-            )
-            return
-        except (json.JSONDecodeError, ProtocolError) as error:
-            logger.info(
-                "Queued generation %s got an invalid reply: %s", record.id, error
-            )
-            ledger.fail(record, f"upstream returned an invalid response: {error}")
-            return
-        anthropic_response = openai_to_anthropic(reply, record.model)
-        output = _anthropic_text(anthropic_response)
-        tracker = self.work_tracker
-        if tracker is not None and record.prompt:
+        failure: _Failure | None = None
+        quota_failure: _Failure | None = None
+        for candidate_route, candidate_model in _route_candidates(
+            self.model_routes, route, upstream_model
+        ):
             try:
-                tracker.clear_if_matches(record.prompt)
-            except Exception:  # pragma: no cover - defensive
-                pass
-        ledger.complete(record, output, _upstream_output_tokens(reply))
-        logger.info(
-            "Queued generation %s completed (attempt %d)", record.id, attempt
+                payload = anthropic_to_openai(
+                    body,
+                    candidate_model,
+                    reasoning_effort=candidate_route.reasoning_effort,
+                    supports_images=candidate_route.supports_images,
+                    supports_tools=candidate_route.supports_tools,
+                    cache_control=candidate_route.cache_control,
+                )
+                request = _upstream_request(payload, candidate_route)
+            except (ValueError, RoutingError) as error:
+                # The saved request can no longer be translated (or the route's
+                # key is gone). Another poll cannot fix that, so fail once
+                # instead of retrying every second forever.
+                ledger.fail(record, f"queued request can no longer be sent: {error}")
+                return
+            try:
+                with urlopen(request, timeout=_upstream_timeout_seconds()) as upstream:
+                    reply = json.loads(
+                        _read_bounded(upstream, _MAX_UPSTREAM_RESPONSE_BYTES)
+                    )
+            except HTTPError as error:
+                failure = ("http", f"Upstream returned HTTP {error.code}", error.code)
+                if error.code in _QUEUEABLE_STATUS:
+                    quota_failure = failure
+                error.close()
+                logger.info(
+                    "Queued generation %s got HTTP %s from %s",
+                    record.id,
+                    error.code,
+                    candidate_model,
+                )
+                continue
+            except (URLError, TimeoutError, OSError) as error:
+                logger.info("Queued generation %s failed: %s", record.id, error)
+                failure = (
+                    "connect",
+                    "Could not connect to the configured upstream",
+                    None,
+                )
+                continue
+            except (json.JSONDecodeError, ProtocolError) as error:
+                logger.info(
+                    "Queued generation %s got an invalid reply: %s", record.id, error
+                )
+                failure = (
+                    "invalid",
+                    f"upstream returned an invalid response: {error}",
+                    None,
+                )
+                continue
+            try:
+                anthropic_response = openai_to_anthropic(reply, record.model)
+            except ValueError as error:
+                # A reply the gateway cannot translate is not an answer. Treat it
+                # like a broken stream so the attempt budget still applies to it.
+                logger.info(
+                    "Queued generation %s got an untranslatable reply: %s",
+                    record.id,
+                    error,
+                )
+                failure = (
+                    "invalid",
+                    f"upstream returned an invalid response: {error}",
+                    None,
+                )
+                continue
+            output = _anthropic_text(anthropic_response)
+            ledger.complete(record, output, _upstream_output_tokens(reply))
+            # Only after the work is finished: a failure between the two writes
+            # must leave it recoverable, never marked resumed but incomplete.
+            tracker = self.work_tracker
+            if tracker is not None:
+                try:
+                    tracker.resolve_matching(
+                        record.fingerprint, by=record.id, model=record.model
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            logger.info(
+                "Queued generation %s completed on %s (attempt %d)",
+                record.id,
+                candidate_model,
+                attempt,
+            )
+            return
+        self._requeue_or_fail(
+            record,
+            attempt,
+            quota_failure
+            or failure
+            or ("invalid", "no usable model route is configured", None),
         )
 
     def _requeue_or_fail(
@@ -541,12 +783,8 @@ class LLMBridgeServer(ThreadingHTTPServer):
         ledger = self.ledger
         if ledger is None:
             return
-        kind, message, status = failure
-        if (
-            kind == "http"
-            and status in _QUEUEABLE_STATUS
-            and attempt < _queue_max_attempts()
-        ):
+        _, message, _ = failure
+        if _queue_retryable(failure) and attempt < _queue_max_attempts():
             retry_after = _queue_retry_seconds() * (attempt + 1)
             ledger.queue(record, message, time.time() + retry_after, attempt + 1)
             return
@@ -637,7 +875,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             return
         tracker = self.server.work_tracker
         cleared = bool(tracker is not None and tracker.clear_state())
-        self._send_json(200, {"cleared": cleared})
+        # Name what is still waiting, in the same shape GET /v1/interrupted
+        # uses, so a client that cleared one job can see the others.
+        remaining = (
+            [record.id for record in tracker.ledger.interrupted()]
+            if tracker is not None
+            else []
+        )
+        self._send_json(200, {"cleared": cleared, "remaining_recoverable": remaining})
 
     def _send_interrupted(self) -> None:
         tracker = self.server.work_tracker
@@ -645,6 +890,13 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if state is None:
             self._send_error(404, "not_found", "No interrupted work is recorded")
             return
+        # Resume serves only the newest job, so say how many others are waiting
+        # and name them; each is addressable by id via /v1/generations/{id}/fork.
+        pending = tracker.ledger.interrupted()
+        state["recoverable_count"] = len(pending)
+        state["other_recoverable"] = [
+            record.id for record in pending if record.id != state.get("generation_id")
+        ]
         self._send_json(200, state)
 
     def _ledger(self) -> GenerationLedger | None:
@@ -791,8 +1043,27 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if not _is_positive_int(max_tokens):
             max_tokens = None
         at_event = body.get("at_event")
-        if not isinstance(at_event, int) or isinstance(at_event, bool):
+        if at_event is not None and (
+            not isinstance(at_event, int) or isinstance(at_event, bool)
+        ):
+            # Silently ignoring a malformed sequence would label the fork with a
+            # different step than the caller asked for.
+            self._send_error(
+                400, "invalid_request_error", "at_event must be an integer event sequence"
+            )
+            return
+        if at_event is None:
             at_event = record.events[-1].seq if record.events else None
+        elif not record.events or not 0 <= at_event < len(record.events):
+            # Lineage points at a step that exists; a bogus sequence number would
+            # record a fork of a generation state that never happened.
+            last = len(record.events) - 1
+            self._send_error(
+                400,
+                "invalid_request_error",
+                f"at_event must be an event sequence between 0 and {last}",
+            )
+            return
         fork_body = GenerationLedger.fork_request(
             record,
             model=model,
@@ -802,7 +1073,12 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         child = ledger.create(
             fork_body, model, parent=record.id, fork_event_seq=at_event
         )
-        self._handle_messages(fork_body, model, route, upstream_model, record=child)
+        # A fork of an interrupted run settles that run once it succeeds, the
+        # same way a resume does. Forking a completed generation changes nothing.
+        resolves = record if record.status == "interrupted" else None
+        self._handle_messages(
+            fork_body, model, route, upstream_model, record=child, resolves=resolves
+        )
 
     def _resume_interrupted(self) -> None:
         """Re-issue saved interrupted work to a (possibly different) model."""
@@ -859,7 +1135,29 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if max_tokens == 0:
             max_tokens = _coerce_positive_int(state.get("max_tokens"), _DEFAULT_RESUME_MAX_TOKENS)
         resume_body = _build_resume_request(state, model, max_tokens)
-        self._handle_messages(resume_body, model, route, upstream_model)
+        ledger = self.server.ledger
+        if ledger is None:
+            # Without a generation ledger there is no lineage to attach the
+            # second run to, so keep the earlier contract: replay the work and
+            # drop the record it came from.
+            tracker.clear_state()
+            self._handle_messages(resume_body, model, route, upstream_model)
+            return
+        source = ledger.load(state["generation_id"])
+        child: GenerationRecord | None = None
+        if source is not None:
+            child = ledger.create(
+                resume_body,
+                model,
+                parent=source.id,
+                fork_event_seq=source.events[-1].seq if source.events else None,
+            )
+        # Settling the interruption happens inside the run: deleting the source
+        # would erase the only evidence that this answer needed a second try,
+        # which is what keeps resume outcomes measurable.
+        self._handle_messages(
+            resume_body, model, route, upstream_model, record=child, resolves=source
+        )
 
     def do_POST(self) -> None:
         if not self._authenticate_client():
@@ -888,7 +1186,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         except (ValueError, RoutingError) as error:
             self._send_error(400, "invalid_request_error", str(error))
             return
-        self._handle_messages(body, model, route, upstream_model)
+        self._handle_messages(body, model, route, upstream_model, coalesce=True)
 
     def _read_json_body(self) -> Any:
         size = int(self.headers.get("Content-Length", "0"))
@@ -900,19 +1198,9 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         self, primary_route: ModelRoute, primary_model: str
     ) -> list[tuple[ModelRoute, str]]:
         """Primary route followed by its configured fallbacks, in order."""
-        candidates: list[tuple[ModelRoute, str]] = [(primary_route, primary_model)]
-        for alias in primary_route.fallbacks:
-            try:
-                route, upstream_model = resolve_model_route(
-                    alias, self.server.model_routes
-                )
-            except RoutingError as error:
-                self.log_error("Skipping unusable fallback %s: %s", alias, error)
-                continue
-            candidate = (route, upstream_model)
-            if candidate not in candidates:
-                candidates.append(candidate)
-        return candidates
+        return _route_candidates(
+            self.server.model_routes, primary_route, primary_model
+        )
 
     def _handle_messages(
         self,
@@ -921,22 +1209,54 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         primary_route: ModelRoute,
         primary_model: str,
         record: GenerationRecord | None = None,
+        resolves: GenerationRecord | None = None,
+        coalesce: bool = False,
     ) -> None:
-        """Translate, call upstream (following fallbacks), and answer the client."""
+        """Translate, call upstream (following fallbacks), and answer the client.
+
+        ``resolves`` is the interrupted record this request replays: when it
+        completes, that record is settled by id instead of by request identity.
+        ``coalesce`` lets a duplicate of this request share the answer instead
+        of paying for a second upstream call.
+        """
         tracker = self.server.work_tracker
+        self._request_fingerprint = _fingerprint(body)
+        self._resolves = resolves
+        self._last_response = None
         prompt = ""
         system_prompt: str | None = None
         if tracker is not None and isinstance(body, dict):
             prompt, system_prompt = _extract_prompt_and_system(body)
         display_model = model or primary_model
-        if record is None:
-            record = self._begin_generation(body, display_model)
-        self._generation_id = record.id if record is not None else None
-        candidates = self._route_candidates(primary_route, primary_model)
-        max_tokens = body.get("max_tokens") if isinstance(body, dict) else None
         stream = isinstance(body, dict) and bool(body.get("stream"))
-        if stream:
-            self._stream_with_fallback(
+        entry: _Inflight | None = None
+        if coalesce and _coalescible(body, stream=stream):
+            leader, entry = self.server.join_inflight(self._request_fingerprint)
+            if not leader:
+                if self._serve_coalesced(entry):
+                    return
+                # The first request outlived the client timeout, so serve this
+                # one independently rather than hang; entry stays unowned.
+                entry = None
+        try:
+            if record is None:
+                record = self._begin_generation(body, display_model)
+            self._generation_id = record.id if record is not None else None
+            candidates = self._route_candidates(primary_route, primary_model)
+            max_tokens = body.get("max_tokens") if isinstance(body, dict) else None
+            if stream:
+                self._stream_with_fallback(
+                    candidates,
+                    body,
+                    display_model,
+                    tracker,
+                    prompt,
+                    system_prompt,
+                    max_tokens,
+                    record,
+                )
+                return
+            self._respond_with_fallback(
                 candidates,
                 body,
                 display_model,
@@ -946,17 +1266,36 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 max_tokens,
                 record,
             )
-            return
-        self._respond_with_fallback(
-            candidates,
-            body,
-            display_model,
-            tracker,
-            prompt,
-            system_prompt,
-            max_tokens,
-            record,
+        finally:
+            if entry is not None:
+                self.server.finish_inflight(
+                    self._request_fingerprint, entry, self._last_response
+                )
+
+    def _serve_coalesced(self, entry: _Inflight) -> bool:
+        """Replay the leader's response to a waiting duplicate.
+
+        Returns False when the leader did not finish within the client timeout,
+        leaving the caller to serve the request independently.
+        """
+        if not entry.done.wait(_client_timeout_seconds()):
+            return False
+        if entry.payload is None:
+            self._send_error(
+                502,
+                "upstream_error",
+                "The original request failed before producing a response",
+            )
+            return True
+        headers = dict(entry.headers)
+        headers["X-LLMBridge-Coalesced"] = "1"
+        if entry.generation_id:
+            headers["X-LLMBridge-Generation"] = entry.generation_id
+        self.log_message(
+            "coalesced a duplicate request into %s", entry.generation_id or "an in-flight run"
         )
+        self._send_json(entry.status, entry.payload, headers=headers)
+        return True
 
     def _begin_generation(
         self, body: Any, display_model: str
@@ -1069,14 +1408,25 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 response, failure = self._read_json_reply(upstream)
                 if failure is not None:
                     break
-                anthropic_response = openai_to_anthropic(response, display_model)
-                self._clear_interrupted_on_match(tracker, prompt)
+                try:
+                    anthropic_response = openai_to_anthropic(response, display_model)
+                except ValueError as error:
+                    # The upstream said 200 but the body is not a completion.
+                    # Try the next candidate rather than dropping the connection.
+                    self.log_error("Upstream returned an invalid response: %s", error)
+                    failure = (
+                        "invalid",
+                        f"upstream returned an invalid response: {error}",
+                        None,
+                    )
+                    break
                 self._finalize_generation(
                     record,
                     "completed",
                     output=_anthropic_text(anthropic_response),
                     output_tokens=_upstream_output_tokens(response),
                 )
+                self._settle_interrupted_work(tracker, record, display_model)
                 self._send_json(200, anthropic_response)
                 return
         self._report_failure(
@@ -1332,18 +1682,57 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 partial_output=partial_output,
                 max_tokens=max_tokens if isinstance(max_tokens, int) else None,
                 request=request_replay(body) or None,
+                fingerprint=getattr(self, "_request_fingerprint", "") or None,
             )
         except Exception as error:
             self.log_error("Could not record interrupted work: %s", error)
 
-    def _clear_interrupted_on_match(self, tracker: WorkTracker | None, prompt: str) -> None:
-        """Clear a saved interruption once the same prompt completes successfully."""
-        if tracker is None or not prompt:
+    def _work_ledger(self, tracker: WorkTracker | None) -> GenerationLedger | None:
+        """The ledger interrupted work should be settled in."""
+        ledger = self.server.ledger
+        if ledger is None and tracker is not None:
+            # A tracker always owns a ledger, even when generation tracking
+            # was not configured separately.
+            return tracker.ledger
+        return ledger
+
+    def _settle_interrupted_work(
+        self,
+        tracker: WorkTracker | None,
+        record: GenerationRecord | None,
+        model: str,
+    ) -> None:
+        """Close out the interrupted work this successful request answers for.
+
+        A resume passes the record it replayed, so that interruption is settled
+        by id. Any other successful request settles by its own request identity:
+        a client that re-sends a dead request should stop being offered it. The
+        match is a fingerprint, not prompt text, because two conversations can
+        share a prompt and finishing one must not erase the other's work.
+        """
+        source = getattr(self, "_resolves", None)
+        if source is not None:
+            if record is None or record.status != "completed":
+                return
+            ledger = self._work_ledger(tracker)
+            if ledger is None:
+                return
+            try:
+                ledger.resume(source, by=record.id, model=model)
+            except Exception as error:
+                self.log_error("Could not mark interrupted work resumed: %s", error)
+            return
+        if tracker is None:
+            return
+        fingerprint = getattr(self, "_request_fingerprint", "")
+        if not fingerprint:
             return
         try:
-            tracker.clear_if_matches(prompt)
+            tracker.resolve_matching(
+                fingerprint, by=getattr(self, "_generation_id", None), model=model
+            )
         except Exception as error:
-            self.log_error("Could not clear completed interrupted work: %s", error)
+            self.log_error("Could not mark interrupted work resumed: %s", error)
 
     def _count_tokens(self) -> None:
         try:
@@ -1411,13 +1800,13 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             try:
                 event = next(events)
             except StopIteration:
-                self._clear_interrupted_on_match(tracker, prompt)
                 self._finalize_generation(
                     record,
                     "completed",
                     output="".join(partial_chunks),
                     output_tokens=reported_tokens,
                 )
+                self._settle_interrupted_work(tracker, record, model)
                 return
             except (ProtocolError, TimeoutError, URLError, OSError, HTTPException) as error:
                 if isinstance(error, ProtocolError):
@@ -1585,6 +1974,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     system,
                     max_tokens,
                     body,
+                    len(partial_output),
                 )
             return True
         return False
@@ -1602,12 +1992,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         system: str | None,
         max_tokens: Any,
         body: Any,
+        seam_at: int,
     ) -> None:
         """Stream a continuation into the client's still-open response.
 
         Only text deltas are forwarded (the original content block is still
         open); envelope events from the continuation are swallowed and the
-        bridge emits its own closing message_delta/message_stop.
+        bridge emits its own closing message_delta/message_stop. ``seam_at`` is
+        where the first model's text ends, so the join can be audited after.
         """
         healed_tokens: int | None = None
         events = iter(stream_events(upstream, upstream_model))
@@ -1651,13 +2043,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                         body,
                     )
                     return
-                self._clear_interrupted_on_match(tracker, prompt)
+                self._audit_seam(record, partial_chunks, seam_at, model, upstream_model)
                 self._finalize_generation(
                     record,
                     "completed",
                     output="".join(partial_chunks),
                     output_tokens=usage.get("output_tokens"),
                 )
+                self._settle_interrupted_work(tracker, record, model)
                 return
             except (ProtocolError, TimeoutError, URLError, OSError, HTTPException) as error:
                 if isinstance(error, ProtocolError):
@@ -1668,6 +2061,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     message = "Upstream stream failed"
                 self.log_error("Healed stream failed: %s", message)
                 partial_output = "".join(partial_chunks)
+                self._audit_seam(record, partial_chunks, seam_at, model, upstream_model)
                 progress = _stream_progress(
                     partial_output, healed_tokens or reported_tokens, max_tokens
                 )
@@ -1738,6 +2132,40 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             # message_start / ping / block start/stop events are swallowed: the
             # client's original message is still open and must not be restarted.
 
+    def _audit_seam(
+        self,
+        record: GenerationRecord | None,
+        partial_chunks: list[str],
+        seam_at: int,
+        from_model: str,
+        to_model: str,
+    ) -> None:
+        """Flag a healed boundary the client cannot see. Never alters the response.
+
+        Clean seams are recorded too: without them the suspect count has no
+        denominator, and a heal rate cannot be read off the ledger.
+        """
+        ledger = self.server.ledger
+        if ledger is None or record is None:
+            return
+        output = "".join(partial_chunks)
+        if len(output) <= seam_at:
+            # The fallback contributed no text, so there is no joint to compare.
+            # Scoring it would record a clean seam for a heal that never joined
+            # anything, inflating the denominator with unearned passes.
+            return
+        audit = score_seam(output[:seam_at], output[seam_at:])
+        try:
+            ledger.heal_seam(
+                record,
+                from_model=from_model,
+                to_model=to_model,
+                seam_at=seam_at,
+                audit=audit,
+            )
+        except Exception as error:  # pragma: no cover - defensive
+            self.log_error("Could not record heal seam: %s", error)
+
     def _interrupt_after_client_loss(
         self,
         partial_chunks: list[str],
@@ -1791,13 +2219,16 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
     def _send_json(
         self, status: int, value: dict[str, Any], headers: dict[str, str] | None = None
     ) -> None:
+        generation_id = getattr(self, "_generation_id", None)
+        # Capture before writing: a duplicate request waiting on this one should
+        # still receive the answer even if this client has already gone away.
+        self._last_response = (status, value, dict(headers or {}), generation_id)
         data = json.dumps(value).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         for key, header_value in (headers or {}).items():
             self.send_header(key, header_value)
-        generation_id = getattr(self, "_generation_id", None)
         if generation_id:
             self.send_header("X-LLMBridge-Generation", generation_id)
         self.end_headers()
@@ -1879,4 +2310,7 @@ def main() -> None:  # pragma: no cover - process entrypoint, blocks in serve_fo
     except KeyboardInterrupt:
         print("\nShutting down LLMBridge")
     finally:
+        # Flush seam audits before the records that hold them go out of reach;
+        # nothing else is guaranteed to run once the process exits.
+        server.stop()
         server.server_close()

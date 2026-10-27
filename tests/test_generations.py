@@ -4,20 +4,24 @@ import os
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from llmbridge.ledger import GenerationLedger
+from llmbridge.protocol import ProtocolError
 from llmbridge.routing import ModelRoute
 from llmbridge.server import (
     LLMBridgeHandler,
     LLMBridgeServer,
     _anthropic_text,
     _upstream_output_tokens,
+    score_seam,
 )
+from llmbridge.work_tracker import WorkTracker
 
 
 def _decode(payload):
@@ -288,6 +292,47 @@ class GenerationServerTests(unittest.TestCase):
         self.assertEqual(child["output"], "Forked continuation")
         self.assertEqual(child["events"][0]["type"], "fork")
 
+    def test_fork_of_an_interrupted_generation_settles_it(self):
+        upstream_error = HTTPError("https://upstream.test", 429, "Too Many Requests", {}, None)
+        with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+            self._call("POST", "/v1/messages", self._message(prompt="Dead run"))
+        dead = self.ledger.list()[0]
+        self.assertEqual(dead.status, "interrupted")
+
+        with patch(
+            "llmbridge.server.urlopen",
+            return_value=_json_response(_completion(content="Recovered")),
+        ):
+            status, child_headers, _ = self._call(
+                "POST",
+                f"/v1/generations/{dead.id}/fork",
+                {"model": "nemotron", "max_tokens": 50},
+            )
+
+        self.assertEqual(status, 200)
+        settled = self.ledger.load(dead.id)
+        self.assertEqual(settled.status, "resumed")
+        self.assertEqual(
+            settled.events[-1].data["resumed_by"], self._generation_id(child_headers)
+        )
+
+    def test_fork_that_fails_leaves_the_source_recoverable(self):
+        upstream_error = HTTPError("https://upstream.test", 429, "Too Many Requests", {}, None)
+        with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+            self._call("POST", "/v1/messages", self._message(prompt="Dead run"))
+        dead = self.ledger.list()[0]
+
+        with patch("llmbridge.server.urlopen", side_effect=upstream_error):
+            status, _, _ = self._call(
+                "POST",
+                f"/v1/generations/{dead.id}/fork",
+                {"model": "nemotron", "max_tokens": 50},
+            )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(self.ledger.load(dead.id).status, "interrupted")
+        self.assertEqual(len(self.ledger.interrupted()), 2)
+
     def test_fork_defaults_to_source_model_when_unspecified(self):
         with patch("llmbridge.server.urlopen", return_value=_json_response(_completion())):
             _, headers, _ = self._call("POST", "/v1/messages", self._message(prompt="Base"))
@@ -328,6 +373,32 @@ class GenerationServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["type"], "invalid_request_error")
+
+    def test_fork_rejects_an_at_event_that_does_not_exist(self):
+        with patch("llmbridge.server.urlopen", return_value=_json_response(_completion())):
+            _, headers, _ = self._call("POST", "/v1/messages", self._message())
+        parent_id = self._generation_id(headers)
+
+        status, _, body = self._call(
+            "POST", f"/v1/generations/{parent_id}/fork", {"at_event": 99}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("at_event", body["error"]["message"])
+        # Lineage was not recorded for a step that never happened.
+        self.assertEqual(len(self.ledger.children(parent_id)), 0)
+
+    def test_fork_rejects_a_non_integer_at_event(self):
+        with patch("llmbridge.server.urlopen", return_value=_json_response(_completion())):
+            _, headers, _ = self._call("POST", "/v1/messages", self._message())
+        parent_id = self._generation_id(headers)
+
+        for value in ("1", True):
+            status, _, body = self._call(
+                "POST", f"/v1/generations/{parent_id}/fork", {"at_event": value}
+            )
+            self.assertEqual(status, 400, value)
+            self.assertIn("at_event", body["error"]["message"])
+        self.assertEqual(len(self.ledger.children(parent_id)), 0)
 
     def test_delete_removes_generation(self):
         with patch("llmbridge.server.urlopen", return_value=_json_response(_completion())):
@@ -375,6 +446,7 @@ class QueueServerTests(unittest.TestCase):
         env_patcher = patch.dict(os.environ, {"LLMBRIDGE_TEST_API_KEY": "test-key"})
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
+        self.tracker = WorkTracker(self.ledger)
         # Built with the queue disabled so no dispatcher thread races the
         # tests; each test enables the queue explicitly and dispatches by hand.
         self.server = LLMBridgeServer(
@@ -387,6 +459,7 @@ class QueueServerTests(unittest.TestCase):
                     api_key_env="LLMBRIDGE_TEST_API_KEY",
                 )
             },
+            work_tracker=self.tracker,
             ledger=self.ledger,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -570,6 +643,150 @@ class QueueServerTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["type"], "not_found")
 
+    def _queue_due(self):
+        _, _, body = self._post_with_quota_error()
+        generation_id = body["generation_id"]
+        record = self.ledger.load(generation_id)
+        self.ledger.queue(record, "quota", retry_at=time.time() - 1, attempt=1)
+        return generation_id
+
+    def test_queued_retry_follows_the_configured_fallbacks(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        # Configured after the request was parked, so the retry is the only run
+        # that sees the secondary route.
+        self.server.model_routes["backup"] = ModelRoute(
+            "http://backup.test/v1", model="backup-model"
+        )
+        self.server.model_routes["nemotron"] = replace(
+            self.server.model_routes["nemotron"], fallbacks=("backup",)
+        )
+        quota = HTTPError(
+            "http://upstream.test/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(b""),
+        )
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[quota, _json_response(_completion())],
+        ) as call:
+            self.server._dispatch_due_queue()
+
+        self.assertEqual(call.call_count, 2)
+        self.assertIn("backup.test", call.call_args.args[0].full_url)
+        self.assertEqual(self.ledger.load(generation_id).status, "completed")
+
+    def test_untranslatable_queued_request_fails_instead_of_looping(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        with patch(
+            "llmbridge.server.anthropic_to_openai",
+            side_effect=ProtocolError("unsupported content"),
+        ) as translate:
+            self.server._dispatch_due_queue()
+
+        translate.assert_called_once()
+        reloaded = self.ledger.load(generation_id)
+        self.assertEqual(reloaded.status, "failed")
+        self.assertIn("can no longer be sent", reloaded.events[-1].data["message"])
+
+    def test_queued_retry_requeues_an_untranslatable_reply(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        malformed = {
+            "choices": [
+                {"message": {"content": "hi"}, "finish_reason": "made_up_reason"}
+            ]
+        }
+        with patch(
+            "llmbridge.server.urlopen", return_value=_json_response(malformed)
+        ):
+            self.server._dispatch_due_queue()
+
+        requeued = self.ledger.load(generation_id)
+        self.assertEqual(requeued.status, "queued")
+        self.assertEqual(GenerationLedger.queue_attempt(requeued), 2)
+
+    def test_queued_retry_requeues_a_connect_failure(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        with patch("llmbridge.server.urlopen", side_effect=URLError("refused")):
+            self.server._dispatch_due_queue()
+
+        requeued = self.ledger.load(generation_id)
+        self.assertEqual(requeued.status, "queued")
+        self.assertEqual(GenerationLedger.queue_attempt(requeued), 2)
+
+    def test_queued_retry_requeues_a_server_error(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        error = HTTPError(
+            "http://upstream.test/v1/chat/completions",
+            503,
+            "Service Unavailable",
+            {},
+            io.BytesIO(b""),
+        )
+        with patch("llmbridge.server.urlopen", side_effect=error):
+            self.server._dispatch_due_queue()
+
+        self.assertEqual(self.ledger.load(generation_id).status, "queued")
+
+    def test_queued_retry_fails_fast_on_a_client_error(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        error = HTTPError(
+            "http://upstream.test/v1/chat/completions",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b""),
+        )
+        with patch("llmbridge.server.urlopen", side_effect=error):
+            self.server._dispatch_due_queue()
+
+        # Retrying a malformed request only burns the budget.
+        self.assertEqual(self.ledger.load(generation_id).status, "failed")
+
+    def test_queued_retry_marks_the_earlier_interruption_resumed(self):
+        self.enable_queue()
+        _, _, body = self._post_with_quota_error()
+        retry = self.ledger.load(body["generation_id"])
+        earlier = self.ledger.create(
+            retry.request, retry.model, fingerprint=retry.fingerprint
+        )
+        self.ledger.interrupt(earlier, "quota", output="half", progress=5.0)
+        self.ledger.queue(retry, "quota", retry_at=time.time() - 1, attempt=1)
+
+        with patch(
+            "llmbridge.server.urlopen", return_value=_json_response(_completion())
+        ):
+            self.server._dispatch_due_queue()
+
+        self.assertEqual(self.ledger.load(earlier.id).status, "resumed")
+        self.assertEqual(self.ledger.load(retry.id).status, "completed")
+
+    def test_queued_retry_settles_only_after_it_is_completed(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        seen = {}
+
+        def observe(fingerprint, *, by, model):
+            seen["status"] = self.ledger.load(by).status
+            return None
+
+        with patch.object(self.tracker, "resolve_matching", side_effect=observe):
+            with patch(
+                "llmbridge.server.urlopen", return_value=_json_response(_completion())
+            ):
+                self.server._dispatch_due_queue()
+
+        # Settling first would mark work done that a crash could still lose.
+        self.assertEqual(seen["status"], "completed")
+        self.assertEqual(self.ledger.load(generation_id).status, "completed")
+
 
 def _heal_routes():
     return {
@@ -631,6 +848,7 @@ class HealServerTests(QueueServerTests):
             ("127.0.0.1", 0),
             LLMBridgeHandler,
             _heal_routes(),
+            work_tracker=self.tracker,
             ledger=self.ledger,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -688,6 +906,63 @@ class HealServerTests(QueueServerTests):
         second_request = upstream_calls.call_args_list[1][0][0]
         body = json.loads(second_request.data)
         self.assertEqual(body["messages"][-1], {"role": "assistant", "content": "Hel"})
+
+    def test_heal_records_a_seam_audit(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_after_text(), _continuation()],
+        ):
+            status, headers, payload = self._call(
+                "POST", "/v1/messages", self._message()
+            )
+
+        self.assertEqual(status, 200)
+        record = self.ledger.load(self._generation_id(headers))
+        audits = [event for event in record.events if event.type == "heal_seam"]
+        self.assertEqual(len(audits), 1)
+        data = audits[0].data
+        self.assertEqual(data["seam_at"], 3)
+        self.assertEqual(data["continuation_chars"], len("lo world"))
+        self.assertFalse(data["suspect"])
+
+        heal = next(event for event in record.events if event.type == "heal")
+        self.assertEqual(data["from_model"], heal.data["from_model"])
+        self.assertEqual(data["to_model"], heal.data["to_model"])
+
+    def test_a_heal_with_no_continuation_text_is_not_audited(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_after_text(), _continuation("")],
+        ):
+            status, headers, payload = self._call(
+                "POST", "/v1/messages", self._message()
+            )
+
+        self.assertEqual(status, 200)
+        record = self.ledger.load(self._generation_id(headers))
+        # The heal is still recorded; only the seam score is skipped. Scoring an
+        # empty continuation would count a join that never happened as a pass.
+        self.assertEqual([event for event in record.events if event.type == "heal_seam"], [])
+        self.assertEqual(len([event for event in record.events if event.type == "heal"]), 1)
+        self.assertEqual(record.output, "Hel")
+
+    def test_a_continuation_that_restarts_is_flagged(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_after_text(), _continuation("Sure here is the whole answer")],
+        ):
+            status, headers, payload = self._call(
+                "POST", "/v1/messages", self._message()
+            )
+
+        self.assertEqual(status, 200)
+        record = self.ledger.load(self._generation_id(headers))
+        audit = next(event for event in record.events if event.type == "heal_seam").data
+        self.assertTrue(audit["restarted"])
+        self.assertTrue(audit["suspect"])
+        # Flagging is an audit only: the stitched answer still reaches the client.
+        self.assertEqual(record.status, "completed")
+        self.assertTrue(record.output.endswith("Sure here is the whole answer"))
 
     def test_heal_can_be_disabled(self):
         env = patch.dict(os.environ, {"LLMBRIDGE_SELF_HEAL": "0"})
@@ -779,6 +1054,55 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIsNone(_upstream_output_tokens({"usage": "nope"}))
         self.assertIsNone(_upstream_output_tokens({"usage": {"completion_tokens": True}}))
         self.assertIsNone(_upstream_output_tokens({"usage": {"completion_tokens": -1}}))
+
+
+class SeamScoringTests(unittest.TestCase):
+    def test_a_plain_join_is_not_suspect(self):
+        audit = score_seam(
+            "The capital of France is",
+            " Paris, and its metro carries about 10 million riders a week.",
+        )
+        self.assertFalse(audit["duplicated"])
+        self.assertFalse(audit["restarted"])
+        self.assertFalse(audit["suspect"])
+
+    def test_a_repeated_tail_is_flagged_as_duplicated(self):
+        partial = "Below are the quarterly figures for fiscal 2024"
+        audit = score_seam(partial, "figures for fiscal 2024. Revenue rose 12 percent.")
+        self.assertTrue(audit["duplicated"])
+        self.assertTrue(audit["suspect"])
+        self.assertGreaterEqual(audit["overlap_chars"], 12)
+
+    def test_a_fresh_preamble_is_flagged_as_a_restart(self):
+        for continuation in (
+            "Sure! The capital of France is Paris.",
+            "Certainly, here is a summary of the ledger:",
+            "Here's the answer you asked for.",
+            "I can help with that. The total is 42.",
+        ):
+            with self.subTest(continuation=continuation):
+                self.assertTrue(score_seam("totally different prefix text", continuation)["restarted"])
+
+    def test_a_normal_word_continuation_is_not_a_restart(self):
+        self.assertFalse(score_seam("The total rev", "enue for the quarter was 12 percent.")["restarted"])
+
+    def test_a_short_boundary_cannot_trip_the_overlap_floor(self):
+        # Ratio alone would be misleading on tiny windows; the char floor guards it.
+        audit = score_seam("Hel", "lo world")
+        self.assertGreaterEqual(audit["overlap_ratio"], 0.25)
+        self.assertLess(audit["overlap_chars"], 12)
+        self.assertFalse(audit["suspect"])
+
+    def test_only_the_boundary_window_is_compared(self):
+        repeated = "the quarterly figures for fiscal 2024 were reviewed"
+        partial = "Chapter one opens with " + repeated + " and then the narrative moves on"
+        audit = score_seam(partial, " The next paragraph introduces the accounts.")
+        self.assertFalse(audit["duplicated"])
+
+    def test_empty_inputs_are_scored_without_error(self):
+        self.assertEqual(score_seam("", "")["continuation_chars"], 0)
+        self.assertFalse(score_seam("some text", "")["suspect"])
+        self.assertFalse(score_seam("", "Paris is the capital")["duplicated"])
 
 
 if __name__ == "__main__":

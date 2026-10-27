@@ -51,8 +51,10 @@ class WorkTracker:
     - The interrupted prompt, the partial output generated so far, and minimal
       metadata are stored in the ledger record
     - Saved state persists until resumed, cleared, or pruned with older
-      records
-    - Clear automatically after a matching prompt completes, or on demand
+      records; recoverable records are exempt from the retention window up to
+      their own budget
+    - Marked ``resumed`` automatically when the same request completes, or
+      deleted on demand
     - In-memory session state is guarded by a lock, so a single instance may
       be shared across threads
     """
@@ -182,6 +184,7 @@ class WorkTracker:
         partial_output: str = "",
         max_tokens: Optional[int] = None,
         request: Optional[dict[str, Any]] = None,
+        fingerprint: Optional[str] = None,
     ) -> dict[str, Any]:
         """Save an interrupted generation directly, without a session.
 
@@ -199,6 +202,10 @@ class WorkTracker:
             request: The original request's replayable parts — ``messages``,
                 ``tools``, ``tool_choice`` — so a resume can rebuild the full
                 conversation (optional).
+            fingerprint: Identity of the original client request, used instead
+                of hashing the rebuilt body (optional). Without it, a record
+                saved from a replayed body could never be matched to the
+                request that interrupted.
 
         Returns:
             The saved state dictionary (same format as ``load_state()``).
@@ -213,6 +220,7 @@ class WorkTracker:
                 request=request,
             ),
             model_name,
+            fingerprint=fingerprint,
         )
         self.ledger.interrupt(
             record,
@@ -358,28 +366,37 @@ class WorkTracker:
         self._reset_session()
         return cleared
 
-    def clear_if_matches(self, prompt: str) -> bool:
-        """Clear the newest interrupted record whose prompt matches ``prompt``.
+    def resolve_matching(
+        self, fingerprint: str, *, by: Optional[str], model: str
+    ) -> Optional[str]:
+        """Mark the newest interrupted record for this request as resumed.
 
-        Called once the same prompt completes successfully, so finished work
-        is no longer offered for resumption. Only the matched record is
-        removed; older interrupted records are left untouched.
+        Matched on the request's content fingerprint rather than its prompt text.
+        Prompt is not an identity: two concurrent conversations can both ask for
+        "continue", and finishing one would then erase the other's recoverable
+        work. The record is transitioned to ``resumed`` instead of deleted, so
+        the interruption stays measurable.
 
         Returns:
-            True if a record with a matching prompt was cleared, else False.
+            The id of the resolved record, or None if nothing matched.
         """
-        cleared = False
+        resolved: Optional[str] = None
         for record in self.ledger.interrupted():
-            if record.prompt == prompt:
-                cleared = self.ledger.delete(record.id)
+            if record.fingerprint == fingerprint and record.id != by:
+                self.ledger.resume(record, by=by, model=model)
+                resolved = record.id
                 break
-        if cleared:
+        if resolved is not None:
             logger.info(
-                "Cleared interrupted work from %s (prompt match)",
+                "Marked interrupted work %s resumed in %s (by %s)",
+                resolved,
                 self.ledger.root,
+                by,
             )
-        self._reset_session()
-        return cleared
+            # Only a resolution touches the in-memory session. An unrelated
+            # request completing must not clear someone else's tracking run.
+            self._reset_session()
+        return resolved
 
     def _reset_session(self) -> None:
         """Forget any in-memory generation session."""
