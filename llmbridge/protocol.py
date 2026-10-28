@@ -870,13 +870,19 @@ def anthropic_to_openai(
         raise ProtocolError("max_tokens must be a positive integer")
     thinking = request.get("thinking")
     if thinking is not None:
-        if not isinstance(thinking, dict) or thinking.get("type") not in (
-            "enabled",
-            "disabled",
-        ):
-            raise ProtocolError("thinking must specify type enabled or disabled")
-        if thinking["type"] == "enabled" and reasoning_effort is None:
+        if not isinstance(thinking, dict):
+            raise ProtocolError("thinking must be an object")
+        # Clients are already moving to thinking types this bridge does not know
+        # (Claude Code sends one). An unknown type is treated as enabled: it maps
+        # onto the route's reasoning_effort when configured and is dropped
+        # otherwise, which is the same outcome as an explicit "enabled".
+        kind = thinking.get("type")
+        if kind not in ("enabled", "disabled"):
+            kind = "enabled"
+        if kind == "enabled" and reasoning_effort is None:
             thinking = {"type": "disabled"}
+        else:
+            thinking = {"type": kind}
 
     openai_messages: list[dict[str, Any]] = []
     system = request.get("system")
@@ -1137,7 +1143,16 @@ def openai_to_anthropic(
 
     finish_reason = choice.get("finish_reason")
     stop_reason = _stop_reason(finish_reason)
-    usage = response.get("usage", {})
+    if not content:
+        # A model that spent its whole budget on reasoning ends here with nothing
+        # an Anthropic client can display. An empty content list is not a valid
+        # answer, so report it as an upstream fault the route can retry past.
+        raise ProtocolError(
+            "Upstream returned an empty answer (reasoning alone is not text output)"
+        )
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
     return {
         "id": response.get("id", f"msg_{uuid4().hex}"),
         "type": "message",
@@ -1318,13 +1333,18 @@ def stream_events(response_lines: Any, requested_model: str):
         raise ProtocolError("Upstream stream ended with incomplete tool-call metadata")
     if finish_reason is None:
         raise ProtocolError("Upstream stream ended before a completion reason was received")
+    stop_reason = _stop_reason(finish_reason)
+    if not open_blocks:
+        # Reasoning-only deltas are dropped above, and a stream that never opened
+        # a block has nothing to show. Fail rather than close an empty answer, so
+        # the fault reaches the heal path and the client gets a typed error.
+        raise ProtocolError("Upstream stream produced no content")
 
     for block_index in sorted(open_blocks):
         yield _sse(
             "content_block_stop",
             {"type": "content_block_stop", "index": block_index},
         )
-    stop_reason = _stop_reason(finish_reason)
     delta_usage: dict[str, Any] = {}
     prompt_tokens = usage.get("prompt_tokens")
     if (

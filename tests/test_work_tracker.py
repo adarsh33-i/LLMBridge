@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from llmbridge.ledger import EVENT_INTERRUPT, EVENT_START, GenerationLedger
+from llmbridge.ledger import EVENT_INTERRUPT, EVENT_RESUME, EVENT_START, GenerationLedger
 from llmbridge.work_tracker import WorkTracker, track_generation
 
 
@@ -268,34 +268,95 @@ class WorkTrackerTests(unittest.TestCase):
         self.assertEqual([record.id for record in remaining], [completed.id])
         self.assertEqual(remaining[0].status, "completed")
 
-    def test_clear_if_matches_clears_matching_prompt(self):
-        tracker = self._tracker()
-        tracker.save(prompt="Hello", model_name="m")
-        self.assertTrue(tracker.clear_if_matches("Hello"))
-        self.assertEqual(self._record_files(), [])
+    def _fingerprint_of(self, generation_id):
+        record = self.ledger.load(generation_id)
+        self.assertIsNotNone(record)
+        return record.fingerprint
 
-    def test_clear_if_matches_keeps_other_prompt(self):
+    def test_resolve_matching_marks_the_record_resumed_and_keeps_it(self):
         tracker = self._tracker()
-        tracker.save(prompt="Hello", model_name="m")
-        self.assertFalse(tracker.clear_if_matches("Other"))
+        state = tracker.save(prompt="Hello", model_name="m")
+        resolved = tracker.resolve_matching(
+            self._fingerprint_of(state["generation_id"]), by="gen_newer000000", model="m"
+        )
+        self.assertEqual(resolved, state["generation_id"])
+        record = self.ledger.load(state["generation_id"])
+        self.assertEqual(record.status, "resumed")
+        self.assertEqual(record.events[-1].type, EVENT_RESUME)
+        self.assertEqual(record.events[-1].data["resumed_by"], "gen_newer000000")
+        # No longer offered, but still on disk as evidence of the interruption.
+        self.assertIsNone(tracker.load_state())
+        self.assertTrue(self.ledger._path(state["generation_id"]).exists())
+
+    def test_resolve_matching_ignores_other_requests(self):
+        tracker = self._tracker()
+        state = tracker.save(prompt="Hello", model_name="m")
+        self.assertIsNone(tracker.resolve_matching("some-other-fingerprint", by=None, model="m"))
         self.assertEqual(len(self._record_files()), 1)
         self.assertEqual(self._tracker().load_state()["prompt"], "Hello")
 
-    def test_clear_if_matches_without_records_returns_false(self):
-        self.assertFalse(self._tracker().clear_if_matches("Hello"))
+    def test_resolve_matching_without_records_returns_none(self):
+        self.assertIsNone(self._tracker().resolve_matching("abc", by=None, model="m"))
 
-    def test_clear_if_matches_tolerates_corrupt_state(self):
+    def test_resolve_matching_tolerates_corrupt_state(self):
         (self.ledger.root / "gen_broken.json").write_text("{ not json", encoding="utf-8")
-        self.assertFalse(self._tracker().clear_if_matches("Hello"))
+        self.assertIsNone(self._tracker().resolve_matching("abc", by=None, model="m"))
 
-    def test_clear_if_matches_clears_only_the_matching_record(self):
+    def test_resolve_matching_only_resolves_the_request_that_ran(self):
         tracker = self._tracker()
-        tracker.save(prompt="Stale", model_name="m")
-        tracker.save(prompt="Hello", model_name="m")
+        # Two concurrent jobs that share the prompt text "continue" but are
+        # different conversations: prompt text is not an identity.
+        first = tracker.save(
+            prompt="continue",
+            model_name="m",
+            messages=[{"role": "user", "content": "first job: continue"}],
+        )
+        second = tracker.save(
+            prompt="continue",
+            model_name="m",
+            messages=[{"role": "user", "content": "second job: continue"}],
+        )
+        resolved = tracker.resolve_matching(
+            self._fingerprint_of(first["generation_id"]), by="gen_newer000001", model="m"
+        )
+        self.assertEqual(resolved, first["generation_id"])
+        pending = self.ledger.interrupted()
+        self.assertEqual(
+            [record.id for record in pending], [second["generation_id"]]
+        )
+        self.assertEqual(pending[0].status, "interrupted")
+        self.assertEqual(
+            self.ledger.load(first["generation_id"]).status, "resumed"
+        )
 
-        self.assertTrue(tracker.clear_if_matches("Hello"))
-        prompts = [record.prompt for record in self.ledger.list(limit=None)]
-        self.assertEqual(prompts, ["Stale"])
+    def test_resolve_matching_never_resolves_itself(self):
+        tracker = self._tracker()
+        state = tracker.save(prompt="Hello", model_name="m")
+        mine = self._fingerprint_of(state["generation_id"])
+        self.assertIsNone(
+            tracker.resolve_matching(mine, by=state["generation_id"], model="m")
+        )
+        self.assertEqual(self.ledger.load(state["generation_id"]).status, "interrupted")
+
+    def test_resolver_leaves_an_unrelated_session_alone(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="my own work", model_name="m")
+        # A different request completing says nothing about this session.
+        self.assertIsNone(
+            tracker.resolve_matching("no-such-fingerprint", by=None, model="m")
+        )
+        self.assertEqual(tracker.save_interrupted()["prompt"], "my own work")
+
+    def test_resolver_clears_the_session_it_resolved(self):
+        tracker = self._tracker()
+        tracker.start_tracking(prompt="my own work", model_name="m")
+        state = tracker.save_interrupted()
+        resolved = tracker.resolve_matching(
+            self._fingerprint_of(state["generation_id"]), by="gen_newer000002", model="m"
+        )
+        self.assertEqual(resolved, state["generation_id"])
+        with self.assertRaises(RuntimeError):
+            tracker.save_interrupted()
 
     def test_save_persists_replayable_request(self):
         tracker = self._tracker()

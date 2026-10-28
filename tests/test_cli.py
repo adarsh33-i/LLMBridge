@@ -483,7 +483,34 @@ class ClaudeCommandTests(unittest.TestCase):
         with redirect_stdout(out):
             code = cli.main(["claude", "--print-env", "--", "--model", "local"])
         self.assertEqual(code, 0)
-        self.assertIn("claude --model local", out.getvalue())
+        rendered = out.getvalue()
+        self.assertIn("--model local", rendered)
+        self.assertIn("claude --settings", rendered)
+
+    def test_launch_passes_a_settings_layer_that_pins_the_bridge(self):
+        calls = {}
+
+        def fake_exec(program, argv, env):
+            calls["program"] = program
+            calls["argv"] = argv
+            calls["env"] = env
+            raise FileNotFoundError()
+
+        with patch("llmbridge.cli.os.execvpe", side_effect=fake_exec):
+            with redirect_stderr(io.StringIO()):
+                code = cli.main(["claude", "--port", "9100", "--", "--model", "local"])
+
+        self.assertEqual(code, 1)
+        argv = calls["argv"]
+        self.assertEqual(argv[:2], ["claude", "--settings"])
+        settings = json.loads(argv[2])
+        self.assertEqual(
+            settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9100"
+        )
+        self.assertEqual(argv[3:], ["--model", "local"])
+        self.assertEqual(
+            calls["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9100"
+        )
 
     def test_reports_missing_claude_cli(self):
         err = io.StringIO()
@@ -514,6 +541,65 @@ class LedgerBackedCommandTests(unittest.TestCase):
         record = self.ledger.create(_replay_request(prompt=prompt), model)
         self.ledger.complete(record, output, 3)
         return record
+
+    def _heal(self, record, seam_at, suspect):
+        self.ledger.heal(
+            record, from_model="primary", to_model="backup", resumed_chars=seam_at
+        )
+        self.ledger.heal_seam(
+            record,
+            from_model="primary",
+            to_model="backup",
+            seam_at=seam_at,
+            audit={
+                "continuation_chars": 30,
+                "overlap_chars": 31 if suspect else 2,
+                "overlap_ratio": 0.4 if suspect else 0.05,
+                "duplicated": suspect,
+                "restarted": False,
+                "suspect": suspect,
+            },
+        )
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        errors = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(errors):
+            code = cli.main([*argv, "--ledger", str(self.ledger.root)])
+        return code, out.getvalue() + errors.getvalue()
+
+
+class RecoverableStatusTests(LedgerBackedCommandTests):
+    """Status must account for every piece of work the bridge still holds."""
+
+    def _dead_run(self, prompt):
+        record = self.ledger.create(_replay_request(prompt=prompt), "primary")
+        self.ledger.interrupt(record, "quota", output="half", progress=5.0)
+        return record
+
+    def test_status_lists_the_other_recoverable_jobs(self):
+        oldest = self._dead_run("oldest")
+        middle = self._dead_run("middle")
+        newest = self._dead_run("newest")
+        code, rendered = self._run("status")
+        self.assertEqual(code, 0)
+        self.assertIn("Recoverable: 3", rendered)
+        self.assertIn(f"llmbridge fork {newest.id}", rendered)
+        self.assertIn(f"also waiting: {middle.id}, {oldest.id}", rendered)
+
+    def test_status_hides_the_waiting_line_for_a_single_job(self):
+        self._dead_run("only")
+        code, rendered = self._run("status")
+        self.assertEqual(code, 0)
+        self.assertIn("Recoverable: 1", rendered)
+        self.assertNotIn("also waiting", rendered)
+
+    def test_status_counts_work_parked_on_quota(self):
+        record = self.ledger.create(_replay_request(prompt="waiting"), "primary")
+        self.ledger.queue(record, "over quota", 1_800_000_000.0, 2)
+        code, rendered = self._run("status")
+        self.assertEqual(code, 0)
+        self.assertIn("Parked on quota: 1 (see GET /v1/queue)", rendered)
 
 
 class TreeCommandTests(LedgerBackedCommandTests):
@@ -617,12 +703,6 @@ model = "backup-model"
         self._env.start()
         self.addCleanup(self._env.stop)
 
-    def _run(self, *argv):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            code = cli.main([*argv, "--ledger", str(self.ledger.root)])
-        return code, out.getvalue()
-
     def test_passes_when_replayed_output_matches(self):
         record = self._completed(output="the answer")
         with patch.object(cli, "_replay_output", return_value=("the answer", None)):
@@ -657,6 +737,24 @@ model = "backup-model"
         self.assertEqual(code, 1)
         self.assertIn("upstream down", rendered)
 
+    def test_a_saved_empty_answer_is_skipped_not_passed(self):
+        record = self._completed(output="")
+        with patch.object(cli, "_replay_output", return_value=("", None)) as replay:
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 0)
+        self.assertIn("SKIP", rendered)
+        self.assertIn("no saved output", rendered)
+        self.assertNotIn("PASS", rendered)
+        replay.assert_not_called()
+
+    def test_an_empty_replay_fails(self):
+        record = self._completed(output="the answer")
+        with patch.object(cli, "_replay_output", return_value=("", None)):
+            code, rendered = self._run("replay", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL", rendered)
+        self.assertIn("returned no text", rendered)
+
     def test_requires_a_target(self):
         err = io.StringIO()
         with redirect_stderr(err):
@@ -684,6 +782,386 @@ model = "backup-model"
         code, rendered = self._run("replay", record.id)
         self.assertEqual(code, 1)
         self.assertIn("ghost", rendered)
+
+    def test_untranslatable_upstream_reply_is_reported_not_raised(self):
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": "x"},
+                                "finish_reason": "made_up_reason",
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        routes = cli._load_routes(None)
+        with patch("llmbridge.cli.urlopen", return_value=_Response()):
+            text, error = cli._replay_output(routes, "primary", _replay_request())
+
+        self.assertIsNone(text)
+        self.assertIn("Unsupported upstream completion reason", error)
+
+
+class HealSeamStatusTests(LedgerBackedCommandTests):
+    def _status(self):
+        return self._run("status")
+
+    def test_status_counts_heals_and_lists_suspect_seams(self):
+        clean = self._completed(prompt="clean prompt")
+        self._heal(clean, 20, suspect=False)
+        suspect = self._completed(prompt="bad prompt")
+        self._heal(suspect, 40, suspect=True)
+
+        code, rendered = self._status()
+        self.assertEqual(code, 0)
+        self.assertIn("Healed streams audited: 2 (1 suspect)", rendered)
+        self.assertIn(suspect.id, rendered)
+        self.assertIn("primary -> backup at char 40", rendered)
+        self.assertIn("31 chars repeated (duplicated)", rendered)
+        self.assertIn("llmbridge replay", rendered)
+        self.assertNotIn(f"{clean.id}:", rendered)
+
+    def test_status_stays_quiet_without_heals(self):
+        self._completed()
+        code, rendered = self._status()
+        self.assertEqual(code, 0)
+        self.assertNotIn("Healed streams", rendered)
+
+    def test_status_tells_an_unconsolidated_audit_to_consolidate(self):
+        record = self._completed()
+        self._heal(record, 20, suspect=False)
+        code, rendered = self._status()
+        self.assertEqual(code, 0)
+        self.assertIn("not yet consolidated: run `llmbridge audit`", rendered)
+
+    def test_stats_reports_counts_and_machine_readable_json(self):
+        self._completed(output="the answer")
+        code, rendered = self._run("stats")
+        self.assertEqual(code, 0)
+        self.assertIn("completed=1", rendered)
+        self.assertIn("Output tokens: 3", rendered)
+        self.assertIn("Wall time", rendered)
+
+        code, rendered = self._run("stats", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["object"], "stats")
+        self.assertEqual(payload["generations"]["total"], 1)
+        self.assertEqual(payload["tokens"]["output"], 3)
+
+
+class AuditCommandTests(LedgerBackedCommandTests):
+    def test_audit_writes_a_digest_and_reports_the_full_history_rate(self):
+        clean = self._completed(prompt="clean prompt")
+        self._heal(clean, 20, suspect=False)
+        suspect = self._completed(prompt="bad prompt")
+        self._heal(suspect, 40, suspect=True)
+
+        code, rendered = self._run("audit")
+        self.assertEqual(code, 0)
+        self.assertIn("Seam audits on disk: 2 (2 newly consolidated)", rendered)
+        self.assertIn("Full history: 2 audit(s), 1 suspect (50%)", rendered)
+        self.assertIn(f"{suspect.id}: primary -> backup at char 40 (duplicated)", rendered)
+        self.assertNotIn(f"{clean.id}:", rendered)
+        lines = self.ledger.audit_digest_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["generation_id"], clean.id)
+
+        code, rendered = self._run("status")
+        self.assertEqual(code, 0)
+        self.assertIn("Digest: 2 seam(s) (1 suspect, 50%)", rendered)
+
+    def test_audit_repeats_without_duplicating_a_seam(self):
+        record = self._completed()
+        self._heal(record, 20, suspect=True)
+        self._run("audit")
+        code, rendered = self._run("audit")
+        self.assertEqual(code, 0)
+        self.assertIn("(0 newly consolidated)", rendered)
+        self.assertIn("Full history: 1 audit(s), 1 suspect (100%)", rendered)
+        self.assertEqual(
+            len(self.ledger.audit_digest_path.read_text(encoding="utf-8").splitlines()),
+            1,
+        )
+
+    def test_audit_json_reports_the_digest_path(self):
+        record = self._completed()
+        self._heal(record, 12, suspect=False)
+        code, rendered = self._run("audit", "--json")
+        self.assertEqual(code, 0)
+        stats = json.loads(rendered)
+        self.assertEqual(stats["total_entries"], 1)
+        self.assertEqual(stats["suspect_rate"], 0.0)
+        self.assertEqual(Path(stats["digest_path"]).name, "heal_audit.jsonl")
+
+    def test_audit_says_nothing_was_healed(self):
+        self._completed()
+        code, rendered = self._run("audit")
+        self.assertEqual(code, 0)
+        self.assertIn("No heal seam audits recorded yet.", rendered)
+        self.assertFalse(self.ledger.audit_digest_path.exists())
+
+
+class DreamCommandTests(ReplayCommandTests):
+    OUTPUT = "Once upon a time there was a bridge, and it healed quietly."
+
+    def test_dream_continues_from_the_cut_point(self):
+        record = self._completed(output=self.OUTPUT)
+        continuation = "Sure, here is the answer"
+        cut = len("Once upon a time ")
+        with patch.object(
+            cli, "_replay_output", return_value=(continuation, None)
+        ) as send:
+            code, rendered = self._run("dream", record.id, "--at", str(cut))
+        self.assertEqual(code, 0)
+        self.assertEqual(send.call_args.args[1], "primary")
+        body = send.call_args.args[2]
+        self.assertEqual(
+            body["messages"][-1], {"role": "assistant", "content": self.OUTPUT[:cut]}
+        )
+        self.assertIn(
+            f"Dreaming {record.id} on primary: cut at char {cut} of {len(self.OUTPUT)}",
+            rendered,
+        )
+        self.assertIn(
+            f"continuation {len(continuation)} chars vs recorded remainder", rendered
+        )
+        self.assertIn("a heal at this seam would have been flagged by the audit", rendered)
+
+    def test_dream_defaults_to_the_midpoint(self):
+        record = self._completed(output=self.OUTPUT)
+        mid = len(self.OUTPUT) // 2
+        with patch.object(
+            cli, "_replay_output", return_value=(self.OUTPUT[mid:], None)
+        ):
+            code, rendered = self._run("dream", record.id)
+        self.assertEqual(code, 0)
+        self.assertIn(f"cut at char {mid} of", rendered)
+        self.assertIn("similarity 1.00", rendered)
+        self.assertIn("clean join, and the continuation tracks the recorded answer", rendered)
+
+    def test_dream_json_carries_the_seam_and_similarity(self):
+        record = self._completed(output=self.OUTPUT)
+        cut = len("Once upon a time there was a ")
+        with patch.object(
+            cli, "_replay_output", return_value=("there was a bridge", None)
+        ):
+            code, rendered = self._run("dream", record.id, "--at", str(cut), "--json")
+        self.assertEqual(code, 0)
+        result = json.loads(rendered)
+        self.assertEqual(result["generation_id"], record.id)
+        self.assertEqual(result["at"], cut)
+        self.assertEqual(result["truth_chars"], len(self.OUTPUT) - cut)
+        self.assertEqual(result["continuation_chars"], len("there was a bridge"))
+        self.assertTrue(result["seam"]["duplicated"])
+        self.assertTrue(result["seam"]["suspect"])
+
+    def test_dream_needs_a_record_with_output(self):
+        running = self.ledger.create(_replay_request(prompt="unfinished"), "primary")
+        code, rendered = self._run("dream", running.id)
+        self.assertEqual(code, 1)
+        self.assertIn("no stored output", rendered)
+
+    def test_dream_reports_an_upstream_failure(self):
+        record = self._completed(output=self.OUTPUT)
+        with patch.object(
+            cli, "_replay_output", return_value=(None, "upstream returned HTTP 502")
+        ):
+            code, rendered = self._run("dream", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("dream replay failed: upstream returned HTTP 502", rendered)
+
+    def test_dream_reports_an_empty_continuation(self):
+        record = self._completed(output=self.OUTPUT)
+        with patch.object(cli, "_replay_output", return_value=("", None)):
+            code, rendered = self._run("dream", record.id)
+        self.assertEqual(code, 1)
+        self.assertIn("returned no text", rendered)
+
+
+class FailoverCommandTests(LedgerBackedCommandTests):
+    _CONFIG = """
+[models.primary]
+base_url = "http://primary.test/v1"
+model = "primary-model"
+fallbacks = ["steady", "erratic"]
+
+[models.steady]
+base_url = "http://steady.test/v1"
+model = "steady-model"
+
+[models.erratic]
+base_url = "http://erratic.test/v1"
+model = "erratic-model"
+
+[models.solo]
+base_url = "http://solo.test/v1"
+model = "solo-model"
+"""
+
+    OUTPUT = "Once upon a time there was a bridge that healed quietly in the dark."
+    SEAM_AT = 28
+
+    def setUp(self):
+        super().setUp()
+        config = Path(self._tmp.name) / "llmbridge.toml"
+        config.write_text(self._CONFIG, encoding="utf-8")
+        self._env = patch.dict(
+            os.environ, {"LLMBRIDGE_CONFIG": str(config)}, clear=False
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _suspect(self, prompt="healed prompt", output=None, model="primary"):
+        record = self._completed(
+            prompt=prompt, output=output or self.OUTPUT, model=model
+        )
+        self._heal(record, self.SEAM_AT, suspect=True)
+        return record
+
+    def _answers(self, **by_model):
+        """Fake _replay_output that answers per alias; absent aliases fail."""
+
+        def replay(routes, alias, body):
+            if alias in by_model:
+                return by_model[alias], None
+            return None, f"no answer for {alias}"
+
+        return replay
+
+    @property
+    def ANSWERS(self):
+        return {
+            "steady": self.OUTPUT[self.SEAM_AT :],
+            "erratic": "time there was a bridge that healed loudly",
+            "solo": self.OUTPUT[self.SEAM_AT :],
+        }
+
+    def test_ranks_the_faithful_fallback_first(self):
+        self._suspect()
+        with patch.object(
+            cli,
+            "_replay_output",
+            side_effect=self._answers(
+                steady=self.ANSWERS["steady"], erratic=self.ANSWERS["erratic"]
+            ),
+        ):
+            code, rendered = self._run("failover")
+        self.assertEqual(code, 0)
+        self.assertLess(rendered.index("steady"), rendered.index("erratic"))
+        self.assertIn("Best fallback on these seams: steady", rendered)
+        self.assertIn("mean similarity 1.00, no flagged joins", rendered)
+        self.assertIn("2 real upstream call(s)", rendered)
+
+    def test_defaults_the_cut_to_the_recorded_seam(self):
+        record = self._suspect()
+        seen = []
+
+        def replay(routes, alias, body):
+            seen.append(body)
+            return self.OUTPUT[self.SEAM_AT :], None
+
+        with patch.object(cli, "_replay_output", side_effect=replay):
+            code, _ = self._run("failover", record.id, "--models", "steady")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            seen[0]["messages"][-1]["content"], self.OUTPUT[: self.SEAM_AT]
+        )
+
+    def test_samples_only_suspect_heals_by_default(self):
+        clean = self._completed(prompt="clean prompt")
+        self._heal(clean, self.SEAM_AT, suspect=False)
+        older = self._suspect(prompt="older suspect")
+        newest = self._suspect(prompt="newest suspect")
+        with patch.object(
+            cli, "_replay_output", side_effect=self._answers(solo=self.ANSWERS["solo"])
+        ) as replay:
+            code, rendered = self._run("failover", "--limit", "1", "--models", "solo")
+        self.assertEqual(code, 0)
+        self.assertEqual(replay.call_count, 1)
+        self.assertIn("Sampling 1 suspect heal(s)", rendered)
+        self.assertIn(newest.id, rendered)
+        self.assertNotIn(older.id, rendered)
+
+    def test_dry_run_sends_nothing(self):
+        self._suspect()
+        with patch.object(cli, "_replay_output") as replay:
+            code, rendered = self._run("failover", "--dry-run")
+        self.assertEqual(code, 0)
+        replay.assert_not_called()
+        self.assertIn("2 real upstream call(s)", rendered)
+        self.assertIn("dry run: nothing was sent", rendered)
+        self.assertIn("steady, erratic", rendered)
+
+    def test_a_failed_model_still_ranks_the_other(self):
+        self._suspect()
+        with patch.object(
+            cli,
+            "_replay_output",
+            side_effect=self._answers(steady=self.ANSWERS["steady"]),
+        ):
+            code, rendered = self._run("failover")
+        self.assertEqual(code, 0)
+        self.assertIn("no answer for erratic", rendered)
+        self.assertIn("Best fallback on these seams: steady", rendered)
+
+    def test_models_override_the_configured_fallbacks(self):
+        self._suspect()
+        with patch.object(
+            cli, "_replay_output", side_effect=self._answers(solo=self.ANSWERS["solo"])
+        ) as replay:
+            code, rendered = self._run("failover", "--models", "solo")
+        self.assertEqual(code, 0)
+        self.assertEqual(replay.call_count, 1)
+        self.assertIn("Best fallback on these seams: solo", rendered)
+
+    def test_a_repeated_model_is_scored_once(self):
+        self._suspect()
+        with patch.object(
+            cli, "_replay_output", side_effect=self._answers(solo=self.ANSWERS["solo"])
+        ) as replay:
+            code, rendered = self._run("failover", "--models", "solo, solo")
+        self.assertEqual(code, 0)
+        self.assertEqual(replay.call_count, 1)
+        self.assertIn("1 real upstream call(s)", rendered)
+
+    def test_a_model_without_fallbacks_asks_for_explicit_candidates(self):
+        self._suspect(model="solo")
+        code, rendered = self._run("failover")
+        self.assertEqual(code, 1)
+        self.assertIn("--models a,b", rendered)
+
+    def test_json_carries_the_ranking_and_call_count(self):
+        self._suspect()
+        with patch.object(
+            cli,
+            "_replay_output",
+            side_effect=self._answers(
+                steady=self.ANSWERS["steady"], erratic=self.ANSWERS["erratic"]
+            ),
+        ):
+            code, rendered = self._run("failover", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["calls"], 2)
+        self.assertEqual(payload["ranking"][0]["model"], "steady")
+        self.assertEqual(payload["ranking"][0]["faithful"], 1)
+        self.assertEqual(payload["ranking"][0]["flagged"], 0)
+
+    def test_unknown_id_fails_cleanly(self):
+        code, rendered = self._run("failover", "gen_deadbeef0000")
+        self.assertEqual(code, 1)
+        self.assertIn("gen_deadbeef0000 not found", rendered)
 
 
 if __name__ == "__main__":

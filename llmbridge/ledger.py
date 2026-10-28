@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -41,10 +41,23 @@ _DEFAULT_ROOT = ".llmbridge/generations"
 _DEFAULT_FORK_MAX_TOKENS = 4096
 
 # The ledger keeps only the newest records; older ones are pruned whenever a
-# new generation is created. Interrupted work is surfaced from these records,
-# so anything worth resuming must be among the retained few. Override with
-# LLMBRIDGE_LEDGER_MAX_RECORDS.
+# new generation is created. Override with LLMBRIDGE_LEDGER_MAX_RECORDS.
 MAX_TRACKED_INTERRUPTED: int = 10
+
+# Recoverable work -- interrupted generations and requests parked on quota --
+# outlives that window too, up to its own budget. Without this exemption the
+# retention cap deletes a half-written answer after ten unrelated requests, so
+# the resume endpoint reports no interrupted work for a job it could still
+# finish. Newest first; ``0`` restores the plain window. Override with
+# LLMBRIDGE_LEDGER_MAX_RECOVERABLE.
+MAX_KEPT_RECOVERABLE: int = 10
+
+# Suspect seam audits outlive the window above: a heal that joined badly is the
+# evidence a later review needs, and ordinary traffic would otherwise erase it
+# after ten unrelated requests. Forgetting therefore stays a stated policy with
+# its own bound instead of a storage side effect. Override with
+# LLMBRIDGE_AUDIT_MAX_SUSPECT.
+MAX_KEPT_SUSPECT_AUDITS: int = 25
 
 
 def _env_max_records() -> int:
@@ -57,6 +70,39 @@ def _env_max_records() -> int:
     except ValueError:
         return MAX_TRACKED_INTERRUPTED
     return value if value >= 1 else MAX_TRACKED_INTERRUPTED
+
+
+def _env_max_suspect_audits() -> int:
+    """Read the suspect-audit exemption budget, which may be zero to disable it."""
+    raw = os.environ.get("LLMBRIDGE_AUDIT_MAX_SUSPECT")
+    if raw is None:
+        return MAX_KEPT_SUSPECT_AUDITS
+    try:
+        value = int(raw)
+    except ValueError:
+        return MAX_KEPT_SUSPECT_AUDITS
+    return value if value >= 0 else MAX_KEPT_SUSPECT_AUDITS
+
+
+def _env_max_recoverable() -> int:
+    """Read the recoverable-work exemption budget, which may be zero to disable it."""
+    raw = os.environ.get("LLMBRIDGE_LEDGER_MAX_RECOVERABLE")
+    if raw is None:
+        return MAX_KEPT_RECOVERABLE
+    try:
+        value = int(raw)
+    except ValueError:
+        return MAX_KEPT_RECOVERABLE
+    return value if value >= 0 else MAX_KEPT_RECOVERABLE
+
+
+def _percentile(values: list[float], fraction: float) -> Optional[float]:
+    """Nearest-rank percentile, or None for an empty sample."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[index]
 
 
 def _lock_path_for(storage_path: Path) -> Path:
@@ -98,27 +144,49 @@ def _exclusive_lock(lock_path: Path) -> Iterator[None]:
 
 # Event kinds. ``start`` opens a generation; ``complete`` / ``interrupt`` /
 # ``fail`` close it; ``fork`` records that this generation descends from another;
-# ``heal`` records a mid-stream failover onto a fallback model; ``queue``
-# records that quota exhaustion parked the request for an automatic retry.
+# ``heal`` records a mid-stream failover onto a fallback model; ``heal_seam``
+# audits how well that continuation joined on; ``queue`` records that quota
+# exhaustion parked the request for an automatic retry; ``resume`` records that
+# interrupted work was finished by a later generation.
 EVENT_START = "start"
 EVENT_COMPLETE = "complete"
 EVENT_INTERRUPT = "interrupt"
 EVENT_FAIL = "fail"
 EVENT_FORK = "fork"
 EVENT_HEAL = "heal"
+EVENT_HEAL_SEAM = "heal_seam"
 EVENT_QUEUED = "queue"
+EVENT_RESUME = "resume"
 
 _STATUS_RUNNING = "running"
 _STATUS_COMPLETED = "completed"
 _STATUS_INTERRUPTED = "interrupted"
 _STATUS_FAILED = "failed"
 _STATUS_QUEUED = "queued"
+# Set on an interrupted record once a later generation has finished that work.
+# It leaves the recoverable set without erasing the interruption itself.
+_STATUS_RESUMED = "resumed"
 
 _ID_RE = re.compile(r"^gen_[A-Za-z0-9]+$")
 
 # Scalar request parameters worth remembering for a fork. The message list and
 # system prompt are stored separately so they can be rebuilt exactly.
 _PARAM_KEYS = ("max_tokens", "temperature", "top_p", "top_k", "stop_sequences", "stream")
+
+# What a consolidated heal audit keeps. These are the seam numbers the server
+# scores; the digest line is the durable form of a record's ``heal_seam`` event.
+_AUDIT_NAME = "heal_audit.jsonl"
+_AUDIT_FIELDS = (
+    "from_model",
+    "to_model",
+    "seam_at",
+    "continuation_chars",
+    "overlap_chars",
+    "overlap_ratio",
+    "duplicated",
+    "restarted",
+    "suspect",
+)
 
 
 def _validate_generation_id(generation_id: str) -> str:
@@ -203,6 +271,31 @@ def request_replay(body: Any) -> dict[str, Any]:
     if body.get("system") is not None:
         replay["system"] = body["system"]
     return replay
+
+
+def append_assistant_turn(
+    messages: list[dict[str, Any]], text: str
+) -> list[dict[str, Any]]:
+    """Append assistant text, merging into a trailing assistant turn.
+
+    A conversation may already end with an assistant turn when the client used a
+    prefill (the model is asked to continue that text). Appending another
+    assistant message would put two in a row, which Anthropic-shaped upstreams
+    reject, so the prefill and the new text are joined into one turn instead.
+    """
+    appended = [dict(message) for message in messages]
+    if appended and appended[-1].get("role") == "assistant":
+        last = appended[-1]
+        content = last.get("content")
+        if isinstance(content, str):
+            last["content"] = content + text
+        elif isinstance(content, list):
+            last["content"] = [*content, {"type": "text", "text": text}]
+        else:
+            last["content"] = text
+        return appended
+    appended.append({"role": "assistant", "content": text})
+    return appended
 
 
 @dataclass
@@ -329,6 +422,8 @@ class GenerationLedger:
         self.root = Path(base)
         self.root.mkdir(parents=True, exist_ok=True)
         self.max_records = _env_max_records()
+        self.max_suspect_audits = _env_max_suspect_audits()
+        self.max_recoverable = _env_max_recoverable()
         self._lock = threading.RLock()
 
     def _path(self, generation_id: str) -> Path:
@@ -377,13 +472,24 @@ class GenerationLedger:
         *,
         parent: Optional[str] = None,
         fork_event_seq: Optional[int] = None,
+        fingerprint: Optional[str] = None,
     ) -> GenerationRecord:
-        """Open a new generation. Forked children get a ``fork`` event instead of ``start``."""
+        """Open a new generation. Forked children get a ``fork`` event instead of ``start``.
+
+        ``fingerprint`` overrides the identity of the request being captured.
+        A caller that records an interruption from a rebuilt body (the resume
+        path keeps only the replayable parts) passes the original request's
+        fingerprint, so re-sending that request still resolves this record.
+        """
         prompt, system = _prompt_and_system(body)
         now = time.time()
         record = GenerationRecord(
             id="gen_" + uuid.uuid4().hex[:12],
-            fingerprint=_fingerprint(body),
+            fingerprint=(
+                fingerprint
+                if isinstance(fingerprint, str) and fingerprint
+                else _fingerprint(body)
+            ),
             model=model,
             prompt=prompt,
             system=system,
@@ -460,6 +566,26 @@ class GenerationLedger:
             self._save(record)
         return record
 
+    def resume(
+        self,
+        record: GenerationRecord,
+        *,
+        by: Optional[str],
+        model: str,
+    ) -> GenerationRecord:
+        """Mark interrupted work as finished by a later generation.
+
+        The record is kept rather than deleted: erasing it would remove the only
+        evidence that this answer was interrupted and had to be re-run, which is
+        exactly what makes resume rates measurable. It leaves the ``interrupted``
+        status, so it is no longer offered for resumption.
+        """
+        record.status = _STATUS_RESUMED
+        self._append(record, EVENT_RESUME, {"resumed_by": by, "model": model})
+        with self._lock:
+            self._save(record)
+        return record
+
     def fail(self, record: GenerationRecord, message: str) -> GenerationRecord:
         record.status = _STATUS_FAILED
         self._append(record, EVENT_FAIL, {"message": message})
@@ -527,6 +653,39 @@ class GenerationLedger:
             for record in self.list(limit=None)
             if record.status == _STATUS_INTERRUPTED
         ]
+
+    def settle_running(
+        self,
+        message: str,
+        *,
+        older_than: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> list[GenerationRecord]:
+        """Interrupt ``running`` records that no live request can still finish.
+
+        A record is only ``running`` while its request is in flight, and only the
+        serving process ever finalizes it. If that process exits mid-stream the
+        record keeps claiming the work is happening and never shows up as
+        recoverable, so a restart has to settle it here.
+
+        ``older_than`` skips records touched more recently than that many
+        seconds, which keeps a startup sweep from claiming a request another
+        process is still serving from the same ledger.
+        """
+        timestamp = time.time() if now is None else now
+        settled: list[GenerationRecord] = []
+        for record in self.list(limit=None):
+            if record.status != _STATUS_RUNNING:
+                continue
+            if older_than is not None and timestamp - record.updated_at < older_than:
+                continue
+            settled.append(self.interrupt(record, message))
+        return settled
+
+    @staticmethod
+    def is_recoverable(record: GenerationRecord) -> bool:
+        """Whether this record holds work that can still be finished or retried."""
+        return record.status in (_STATUS_INTERRUPTED, _STATUS_QUEUED)
 
     def children(self, generation_id: str) -> list[GenerationRecord]:
         """Return forks whose parent is ``generation_id``, newest first."""
@@ -605,6 +764,219 @@ class GenerationLedger:
             self._save(record)
         return record
 
+    def heal_seam(
+        self,
+        record: GenerationRecord,
+        *,
+        from_model: str,
+        to_model: str,
+        seam_at: int,
+        audit: dict[str, Any],
+    ) -> GenerationRecord:
+        """Record how well a healed continuation joined onto the truncated text.
+
+        The audit flags the boundary; it does not gate it. Absence of this event
+        means the continuation never finished, so there was no seam to score.
+        """
+        self._append(
+            record,
+            EVENT_HEAL_SEAM,
+            {**audit, "from_model": from_model, "to_model": to_model, "seam_at": seam_at},
+        )
+        with self._lock:
+            self._save(record)
+        return record
+
+    @staticmethod
+    def _heal_seam_event(record: GenerationRecord) -> Optional[GenerationEvent]:
+        for event in reversed(record.events):
+            if event.type == EVENT_HEAL_SEAM:
+                return event
+        return None
+
+    @staticmethod
+    def heal_seam_audit(record: GenerationRecord) -> Optional[dict[str, Any]]:
+        """The newest seam audit for this record, or None if it was never healed."""
+        event = GenerationLedger._heal_seam_event(record)
+        return None if event is None else dict(event.data)
+
+    @staticmethod
+    def heal_seam_suspect(record: GenerationRecord) -> bool:
+        """Whether the last recorded heal joined badly enough to be worth reviewing."""
+        audit = GenerationLedger.heal_seam_audit(record)
+        return bool(audit and audit.get("suspect"))
+
+    @property
+    def audit_digest_path(self) -> Path:
+        """Append-only file holding one consolidated line per seam audit."""
+        return self.root / _AUDIT_NAME
+
+    @staticmethod
+    def read_audit_digest(path: Path) -> list[dict[str, Any]]:
+        """Parse a heal digest, oldest line first, ignoring unreadable lines."""
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        entries: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+        return entries
+
+    def _consolidate_records(self, records: list[GenerationRecord]) -> tuple[int, int]:
+        """Copy these records' seam audits into the digest.
+
+        Append-only and idempotent: a seam already keyed by
+        ``(generation_id, seq)`` is not written twice. Returns
+        ``(audits_found, entries_written)``.
+        """
+        path = self.audit_digest_path
+        lock_path = _lock_path_for(path)
+        found = 0
+        fresh: list[dict[str, Any]] = []
+        # Read, compare, and append under the digest lock so two processes
+        # consolidating at once cannot both write the same seam.
+        with self._lock, _exclusive_lock(lock_path):
+            existing = self.read_audit_digest(path)
+            seen = {
+                (entry.get("generation_id"), entry.get("seq")) for entry in existing
+            }
+            for record in records:
+                for event in record.events:
+                    if event.type != EVENT_HEAL_SEAM:
+                        continue
+                    found += 1
+                    if (record.id, event.seq) in seen:
+                        continue
+                    entry: dict[str, Any] = {
+                        "generation_id": record.id,
+                        "seq": event.seq,
+                        "at": event.at,
+                    }
+                    entry.update({key: event.data.get(key) for key in _AUDIT_FIELDS})
+                    fresh.append(entry)
+            if fresh:
+                with open(path, "a", encoding="utf-8") as handle:
+                    for entry in sorted(
+                        fresh, key=lambda entry: (entry["at"], entry["seq"])
+                    ):
+                        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        return found, len(fresh)
+
+    def consolidate(self) -> dict[str, Any]:
+        """Copy seam audits out of records into the append-only digest.
+
+        Records are episodic: the retention window holds only the newest ones, so
+        a clean seam is erased by ordinary traffic and a suspect rate loses its
+        denominator. The digest is the durable form - one line per audit, keyed by
+        ``(generation_id, event seq)`` so re-running it never duplicates a seam,
+        and it survives the record it came from. Pruning consolidates the
+        records it is about to delete, and a graceful shutdown consolidates
+        everything, so this method is the on-demand pass.
+
+        Returns:
+            Counts over the digest after this pass, including the suspect rate
+            (``None`` when nothing has been audited, rather than a false zero).
+        """
+        path = self.audit_digest_path
+        found, fresh = self._consolidate_records(self.list(limit=None))
+        entries = self.read_audit_digest(path)
+        total = len(entries)
+        suspect = sum(1 for entry in entries if entry.get("suspect"))
+        return {
+            "digest_path": str(path),
+            "audits_on_disk": found,
+            "new_entries": fresh,
+            "total_entries": total,
+            "suspect_entries": suspect,
+            "suspect_rate": round(suspect / total, 3) if total else None,
+        }
+
+    def stats(self) -> dict[str, Any]:
+        """Summarise the ledger in the numbers an operator asks for.
+
+        Rates are reported next to their denominators because the working set is
+        small by design (records are pruned), and a suspect rate over three heals
+        is not the same claim as one over three hundred. ``digest_entries`` is the
+        durable count that outlives pruning; ``unconsolidated`` says how many
+        seam audits are still only in records.
+        """
+        records = self.list(limit=None)
+        by_status: dict[str, int] = {}
+        tokens = 0
+        token_counts = 0
+        wall_times: list[float] = []
+        healed = 0
+        audit_events = 0
+        audited = 0
+        suspect = 0
+        duplicated = 0
+        restarted = 0
+        for record in records:
+            by_status[record.status] = by_status.get(record.status, 0) + 1
+            if isinstance(record.output_tokens, int):
+                tokens += record.output_tokens
+                token_counts += 1
+            if any(event.type == EVENT_HEAL for event in record.events):
+                healed += 1
+            audit_events += sum(1 for event in record.events if event.type == EVENT_HEAL_SEAM)
+            audit = self.heal_seam_audit(record)
+            if audit is not None:
+                audited += 1
+                if audit.get("suspect"):
+                    suspect += 1
+                duplicated += 1 if audit.get("duplicated") else 0
+                restarted += 1 if audit.get("restarted") else 0
+            complete = next(
+                (event for event in record.events if event.type == EVENT_COMPLETE), None
+            )
+            if complete is not None and complete.at >= record.created_at:
+                wall_times.append(round((complete.at - record.created_at) * 1000, 1))
+
+        digest = self.read_audit_digest(self.audit_digest_path)
+        digest_suspect = sum(1 for entry in digest if entry.get("suspect"))
+        return {
+            "object": "stats",
+            "ledger": {"path": str(self.root), "records": len(records)},
+            "generations": {
+                "total": len(records),
+                "by_status": by_status,
+                "recoverable": sum(1 for record in records if self.is_recoverable(record)),
+            },
+            "tokens": {"output": tokens, "records_with_tokens": token_counts},
+            "wall_time_ms": {
+                "n": len(wall_times),
+                "p50": _percentile(wall_times, 0.50),
+                "p95": _percentile(wall_times, 0.95),
+                "max": max(wall_times) if wall_times else None,
+            },
+            "heals": {
+                "healed": healed,
+                "audited": audited,
+                "suspect": suspect,
+                "clean": audited - suspect,
+                "suspect_rate": round(suspect / audited, 3) if audited else None,
+                "duplicated": duplicated,
+                "restarted": restarted,
+                "digest_entries": len(digest),
+                "digest_suspect": digest_suspect,
+                "digest_suspect_rate": (
+                    round(digest_suspect / len(digest), 3) if digest else None
+                ),
+                "unconsolidated": max(0, audit_events - len(digest)),
+            },
+        }
+
     def queued(self) -> list[GenerationRecord]:
         """Return queued generations, earliest retry first."""
         return sorted(
@@ -658,7 +1030,10 @@ class GenerationLedger:
         Args:
             keep: How many records to retain; defaults to the ledger's
                 configured cap (``LLMBRIDGE_LEDGER_MAX_RECORDS``, else
-                ``MAX_TRACKED_INTERRUPTED``).
+                ``MAX_TRACKED_INTERRUPTED``). With no argument the retention
+                policy also exempts recent suspect seam audits and recoverable
+                work. Passing an explicit number is a manual hard window:
+                nothing is exempted.
 
         Returns:
             The ids of the removed records, oldest first.
@@ -667,18 +1042,67 @@ class GenerationLedger:
             return self._prune_locked(keep)
 
     def _prune_locked(self, keep: Optional[int] = None) -> list[str]:
+        policy_window = keep is None
         if keep is None:
             keep = self.max_records
         if not isinstance(keep, int) or isinstance(keep, bool) or keep < 0:
             keep = 0
+        # self.list() is newest-first, so the stale tail is walked oldest-first
+        # for deletion and newest-first when spending the exemption budgets:
+        # both should go to the freshest evidence and the freshest unfinished work.
+        records = self.list(limit=None)[keep:]
+        exempt: set[str] = set()
+        suspects = 0
+        recoverable = 0
+        if policy_window:
+            for record in records:
+                if (
+                    suspects < self.max_suspect_audits
+                    and GenerationLedger.heal_seam_suspect(record)
+                ):
+                    suspects += 1
+                    exempt.add(record.id)
+                elif (
+                    recoverable < self.max_recoverable
+                    and GenerationLedger.is_recoverable(record)
+                ):
+                    recoverable += 1
+                    exempt.add(record.id)
         removed: list[str] = []
-        # self.list() is newest-first, so the stale tail is walked oldest-first.
-        for record in reversed(self.list(limit=None)[keep:]):
+        victims = [record for record in reversed(records) if record.id not in exempt]
+        # Only records that actually carry a seam audit need the digest read and
+        # write; the common victim has never healed anything.
+        audited_victims = [
+            record
+            for record in victims
+            if any(event.type == EVENT_HEAL_SEAM for event in record.events)
+        ]
+        if audited_victims:
+            # Records are about to disappear; copy their seam audits into the
+            # digest first so a clean seam is not lost with its record. This is
+            # best-effort: never let a digest problem block retention.
+            try:
+                _, consolidated = self._consolidate_records(audited_victims)
+            except Exception as error:  # pragma: no cover - defensive
+                logger.error(
+                    "Could not consolidate seam audits before pruning: %s", error
+                )
+            else:
+                if consolidated:
+                    logger.info(
+                        "Consolidated %d seam audit(s) before pruning", consolidated
+                    )
+        for record in victims:
             if self.delete(record.id):
                 removed.append(record.id)
         if removed:
             logger.info(
-                "Pruned %d generation record(s) beyond the newest %d", len(removed), keep
+                "Pruned %d generation record(s) beyond the newest %d (%d suspect "
+                "seam audit(s) and %d recoverable record(s) kept beyond the window)",
+                len(removed),
+                keep,
+                suspects,
+                recoverable,
             )
         return removed
 
@@ -709,7 +1133,7 @@ class GenerationLedger:
         else:
             messages = [{"role": "user", "content": record.prompt}]
         if include_output and record.output:
-            messages.append({"role": "assistant", "content": record.output})
+            messages = append_assistant_turn(messages, record.output)
         resolved_max = max_tokens
         if not isinstance(resolved_max, int) or isinstance(resolved_max, bool) or resolved_max < 1:
             recorded = record.params.get("max_tokens")
@@ -729,3 +1153,28 @@ class GenerationLedger:
         if replay.get("tool_choice") is not None:
             request["tool_choice"] = replay["tool_choice"]
         return request
+
+    @classmethod
+    def dream_request(
+        cls,
+        record: GenerationRecord,
+        *,
+        at: int,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Build the request a fallback would have seen if this answer had died at ``at``.
+
+        The recorded output is complete, so no stream has to actually break for a
+        heal to be tested: the answer is cut at ``at``, the cut text is replayed as
+        an assistant turn, and the model is asked to continue. Everything after
+        ``at`` is the ground truth the continuation can be scored against.
+        """
+        if not isinstance(record.output, str) or not record.output:
+            raise ValueError("generation has no stored output to cut and replay")
+        cut = max(0, min(int(at), len(record.output)))
+        return cls.fork_request(
+            replace(record, output=record.output[:cut]),
+            model=model,
+            max_tokens=max_tokens,
+        )

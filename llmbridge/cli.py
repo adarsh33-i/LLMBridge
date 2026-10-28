@@ -113,6 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.add_argument("--ledger", help="Path to the generation ledger directory")
 
+    stats = subparsers.add_parser(
+        "stats",
+        help="Show status counts, wall time, and heal verdicts from the ledger",
+    )
+    stats.add_argument("--ledger", help="Path to the generation ledger directory")
+    stats.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
     fork = subparsers.add_parser(
         "fork", help="Continue a recorded generation (requires a running server)"
     )
@@ -163,6 +170,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--config", help="Path to llmbridge.toml")
     replay.add_argument("--ledger", help="Path to the generation ledger directory")
+
+    audit = subparsers.add_parser(
+        "audit",
+        help="Consolidate heal seam audits into a digest that outlives the records",
+    )
+    audit.add_argument("--ledger", help="Path to the generation ledger directory")
+    audit.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    dream = subparsers.add_parser(
+        "dream", help="Replay a saved answer as if its stream had died mid-way"
+    )
+    dream.add_argument("id", help="Generation id, e.g. gen_1a2b3c4d5e6f")
+    dream.add_argument(
+        "--at",
+        type=int,
+        help="Character to truncate the saved answer at (default: midway)",
+    )
+    dream.add_argument(
+        "--model", help="Route alias to continue from (defaults to the record's model)"
+    )
+    dream.add_argument("--max-tokens", type=int, help="Token limit for the continuation")
+    dream.add_argument("--config", help="Path to llmbridge.toml")
+    dream.add_argument("--ledger", help="Path to the generation ledger directory")
+    dream.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    failover = subparsers.add_parser(
+        "failover",
+        help="Rank fallback models by replaying recorded suspect heals",
+    )
+    failover.add_argument(
+        "ids",
+        nargs="*",
+        help="Generation ids to test (default: the newest suspect heals)",
+    )
+    failover.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="How many suspect heals to sample when no ids are given (default 5)",
+    )
+    failover.add_argument(
+        "--models",
+        help="Comma-separated aliases to compare (default: each record's configured fallbacks)",
+    )
+    failover.add_argument(
+        "--at",
+        type=int,
+        help="Cut every sampled answer at this character (default: its recorded seam)",
+    )
+    failover.add_argument(
+        "--threshold",
+        type=float,
+        default=0.8,
+        help="Similarity that counts as a faithful continuation (default 0.8)",
+    )
+    failover.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the sampling plan without calling any model",
+    )
+    failover.add_argument("--config", help="Path to llmbridge.toml")
+    failover.add_argument("--ledger", help="Path to the generation ledger directory")
+    failover.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     setup = subparsers.add_parser(
         "setup", help="Write a model routing config interactively"
@@ -267,6 +337,66 @@ def _generations(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_ms(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value / 1000:.1f}s" if value >= 1000 else f"{value:.0f}ms"
+
+
+def _stats(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    stats = ledger.stats()
+    if getattr(args, "json", False):
+        print(json.dumps(stats, indent=2))
+        return 0
+    generations = stats["generations"]
+    print(f"Ledger: {stats['ledger']['path']} ({generations['total']} records)")
+    if not generations["total"]:
+        print("No generations recorded yet — make a request to /v1/messages.")
+        return 0
+    statuses = ", ".join(
+        f"{name}={count}" for name, count in sorted(generations["by_status"].items())
+    )
+    print(f"Statuses: {statuses}")
+    print(f"Recoverable: {generations['recoverable']}")
+    tokens = stats["tokens"]
+    print(f"Output tokens: {tokens['output']} over {tokens['records_with_tokens']} record(s)")
+    wall = stats["wall_time_ms"]
+    if wall["n"]:
+        print(
+            f"Wall time: p50 {_format_ms(wall['p50'])}, p95 {_format_ms(wall['p95'])}, "
+            f"max {_format_ms(wall['max'])} (n={wall['n']})"
+        )
+    heals = stats["heals"]
+    if heals["audited"] or heals["healed"]:
+        rate = (
+            f", {heals['suspect_rate']:.0%} suspect"
+            if heals["suspect_rate"] is not None
+            else ""
+        )
+        print(
+            f"Heals: {heals['healed']} healed, {heals['audited']} audited"
+            f" ({heals['suspect']} suspect{rate}); duplicated {heals['duplicated']}, "
+            f"restarted {heals['restarted']}"
+        )
+    if heals["digest_entries"]:
+        digest_rate = (
+            f", {heals['digest_suspect_rate']:.0%}"
+            if heals["digest_suspect_rate"] is not None
+            else ""
+        )
+        print(
+            f"Digest: {heals['digest_entries']} seam(s)"
+            f" ({heals['digest_suspect']} suspect{digest_rate})"
+        )
+    if heals["unconsolidated"]:
+        print(
+            f"  {heals['unconsolidated']} audit(s) not yet consolidated: "
+            "run `llmbridge audit`"
+        )
+    return 0
+
+
 def _status(args: argparse.Namespace) -> int:
     ledger = GenerationLedger(getattr(args, "ledger", None))
     records = ledger.list(limit=100000)
@@ -290,6 +420,48 @@ def _status(args: argparse.Namespace) -> int:
     if recoverable:
         print(f"Recoverable: {len(recoverable)}")
         print(f"  continue one with: llmbridge fork {recoverable[0].id} --model <alias>")
+        others = [record.id for record in recoverable[1:6]]
+        if others:
+            print(f"  also waiting: {', '.join(others)}")
+    parked = [record for record in records if record.status == "queued"]
+    if parked:
+        print(f"Parked on quota: {len(parked)} (see GET /v1/queue)")
+    audited = [r for r in records if GenerationLedger.heal_seam_audit(r)]
+    if audited:
+        suspect = [r for r in audited if GenerationLedger.heal_seam_suspect(r)]
+        print(f"Healed streams audited: {len(audited)} ({len(suspect)} suspect)")
+        for record in suspect[:5]:
+            audit = GenerationLedger.heal_seam_audit(record)
+            reasons = ", ".join(
+                name for name in ("duplicated", "restarted") if audit.get(name)
+            )
+            print(
+                f"  {record.id}: {audit['from_model']} -> {audit['to_model']} at char "
+                f"{audit['seam_at']}, {audit['overlap_chars']} chars repeated ({reasons})"
+            )
+        if suspect:
+            print("  flag only: review with `llmbridge replay <id>`")
+    # The digest outlives records, so its count can exceed the audits still on
+    # disk. Say which is which instead of printing two numbers that disagree.
+    heals = ledger.stats()["heals"]
+    if heals["digest_entries"]:
+        digest_rate = (
+            f", {heals['digest_suspect_rate']:.0%}"
+            if heals["digest_suspect_rate"] is not None
+            else ""
+        )
+        print(
+            f"Digest: {heals['digest_entries']} seam(s) "
+            f"({heals['digest_suspect']} suspect{digest_rate})"
+        )
+        pruned = heals["digest_entries"] - heals["audited"]
+        if pruned > 0:
+            print(f"  {pruned} digest entry(ies) came from generations already pruned")
+    if heals["unconsolidated"]:
+        print(
+            f"  {heals['unconsolidated']} audit(s) not yet consolidated: "
+            "run `llmbridge audit` before these records age out"
+        )
     return 0
 
 
@@ -441,14 +613,16 @@ def _replay_output(routes: dict, alias: str, body: dict) -> tuple[str | None, st
         )
         with urlopen(request, timeout=120) as response:
             upstream_reply = json.loads(response.read().decode("utf-8", "replace"))
-    except RoutingError as error:
-        return None, str(error)
+        anthropic_reply = openai_to_anthropic(upstream_reply, alias)
     except HTTPError as error:
         error.close()
         return None, f"upstream returned HTTP {error.code}"
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
         return None, f"upstream request failed: {error}"
-    anthropic_reply = openai_to_anthropic(upstream_reply, alias)
+    except ValueError as error:
+        # RoutingError and ProtocolError both subclass ValueError: a bad route
+        # config or an untranslatable reply is reported, never raised at the CLI.
+        return None, str(error)
     text = "".join(
         block.get("text", "")
         for block in anthropic_reply.get("content", [])
@@ -484,7 +658,14 @@ def _replay(args: argparse.Namespace) -> int:
         return 1
 
     failures = 0
+    skipped = 0
     for record in targets:
+        if not record.output:
+            # Two empty answers are trivially "identical"; comparing them would
+            # report a pass that verified nothing.
+            skipped += 1
+            print(f"SKIP {record.id}: the saved generation has no output to compare")
+            continue
         alias = getattr(args, "model", None) or record.model
         body = dict(record.request)
         body.setdefault("model", alias)
@@ -495,7 +676,11 @@ def _replay(args: argparse.Namespace) -> int:
             failures += 1
             print(f"FAIL {record.id}: {error}")
             continue
-        ratio = difflib.SequenceMatcher(None, record.output, text or "").ratio()
+        if not text:
+            failures += 1
+            print(f"FAIL {record.id}: the replay returned no text")
+            continue
+        ratio = difflib.SequenceMatcher(None, record.output, text).ratio()
         passed = ratio >= args.threshold
         if not passed:
             failures += 1
@@ -503,10 +688,355 @@ def _replay(args: argparse.Namespace) -> int:
         print(
             f"{label} {record.id}: similarity {ratio:.2f} "
             f"(threshold {args.threshold:.2f}, saved {len(record.output)} chars, "
-            f"replayed {len(text or '')} chars)"
+            f"replayed {len(text)} chars)"
         )
-    print(f"{len(targets) - failures}/{len(targets)} replay(s) matched")
+    compared = len(targets) - skipped
+    if compared == 0:
+        print(f"No replayable generations: {skipped} had no saved output")
+        return 0
+    summary = f"{compared - failures}/{compared} replay(s) matched"
+    if skipped:
+        summary += f", {skipped} skipped (nothing to compare)"
+    print(summary)
     return 0 if failures == 0 else 1
+
+
+def _audit(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    stats = ledger.consolidate()
+    if getattr(args, "json", False):
+        print(json.dumps(stats, indent=2))
+        return 0
+    print(f"Digest: {stats['digest_path']}")
+    print(
+        f"Seam audits on disk: {stats['audits_on_disk']} "
+        f"({stats['new_entries']} newly consolidated)"
+    )
+    if not stats["total_entries"]:
+        print("No heal seam audits recorded yet.")
+        return 0
+    print(
+        f"Full history: {stats['total_entries']} audit(s), "
+        f"{stats['suspect_entries']} suspect ({stats['suspect_rate']:.0%})"
+    )
+    entries = GenerationLedger.read_audit_digest(Path(stats["digest_path"]))
+    for entry in [e for e in entries if e.get("suspect")][-5:]:
+        reasons = ", ".join(
+            name for name in ("duplicated", "restarted") if entry.get(name)
+        )
+        print(
+            f"  {entry['generation_id']}: {entry['from_model']} -> "
+            f"{entry['to_model']} at char {entry['seam_at']} ({reasons})"
+        )
+    print("  audits consolidate only while their record survives: run after traffic")
+    return 0
+
+
+def _dream(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    record = _load_generation(ledger, args.id)
+    if record is None:
+        print(f"error: generation {args.id} not found", file=sys.stderr)
+        return 1
+    if not isinstance(record.output, str) or len(record.output) < 2:
+        print(
+            f"error: generation {args.id} has no stored output to cut and continue",
+            file=sys.stderr,
+        )
+        return 1
+    at = args.at if args.at is not None else len(record.output) // 2
+    try:
+        body = ledger.dream_request(
+            record, at=at, model=args.model, max_tokens=args.max_tokens
+        )
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    alias = args.model or record.model
+    try:
+        routes = _load_routes(getattr(args, "config", None))
+    except RoutingError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    continuation, error = _replay_output(routes, alias, body)
+    if error is not None:
+        print(f"error: dream replay failed: {error}", file=sys.stderr)
+        return 1
+    continuation = continuation or ""
+    if not continuation:
+        print(
+            f"error: {alias} returned no text for the continuation",
+            file=sys.stderr,
+        )
+        return 1
+    truth = record.output[at:]
+    seam = server.score_seam(record.output[:at], continuation)
+    similarity = difflib.SequenceMatcher(None, truth, continuation).ratio()
+    reasons = [name for name in ("duplicated", "restarted") if seam.get(name)]
+    flag = f", {', '.join(reasons)}" if reasons else ""
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "generation_id": record.id,
+                    "model": alias,
+                    "at": at,
+                    "output_chars": len(record.output),
+                    "truth_chars": len(truth),
+                    "continuation_chars": len(continuation),
+                    "similarity": round(similarity, 3),
+                    "seam": seam,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    print(f"Dreaming {record.id} on {alias}: cut at char {at} of {len(record.output)}")
+    print(
+        f"  continuation {len(continuation)} chars vs recorded remainder "
+        f"{len(truth)} chars, similarity {similarity:.2f}"
+    )
+    print(
+        f"  seam: {seam['overlap_chars']} chars repeated "
+        f"({seam['overlap_ratio']:.2f}{flag})"
+    )
+    if seam["suspect"]:
+        print("  a heal at this seam would have been flagged by the audit")
+    elif similarity < 0.5:
+        print("  clean join, but the continuation diverges from what the first model said next")
+    else:
+        print("  clean join, and the continuation tracks the recorded answer")
+    print("  read-only: nothing here is written to the ledger")
+    return 0
+
+
+def _failover_samples(
+    ledger: GenerationLedger, args: argparse.Namespace
+) -> tuple[list, list[str]]:
+    """The records to replay: explicit ids, else the newest suspect heals."""
+    if args.ids:
+        records = []
+        for generation_id in args.ids:
+            record = _load_generation(ledger, generation_id)
+            if record is None:
+                return [], [generation_id]
+            records.append(record)
+        return records, []
+    suspects = [
+        record
+        for record in ledger.list(limit=None)
+        if GenerationLedger.heal_seam_suspect(record)
+    ]
+    return suspects[: max(args.limit, 0)], []
+
+
+def _failover_models(samples: list, routes: dict, requested: str | None) -> list[str]:
+    """Explicit aliases, else every fallback configured for the sampled models."""
+    if requested:
+        # A repeated alias would otherwise be scored twice and double its weight.
+        models: list[str] = []
+        for candidate in requested.split(","):
+            alias = candidate.strip()
+            if alias and alias not in models:
+                models.append(alias)
+        return models
+    models: list[str] = []
+    for record in samples:
+        route = routes.get(record.model)
+        for alias in route.fallbacks if route is not None else ():
+            if alias not in models:
+                models.append(alias)
+    return models
+
+
+def _failover_cut(record, requested_at: int | None) -> int:
+    """Where to cut a stored answer: an explicit character or its recorded seam."""
+    cut = requested_at
+    if cut is None:
+        audit = GenerationLedger.heal_seam_audit(record) or {}
+        seam_at = audit.get("seam_at")
+        cut = seam_at if isinstance(seam_at, int) else len(record.output) // 2
+    # Leave at least one character of recorded remainder to compare against.
+    return max(1, min(int(cut), len(record.output) - 1))
+
+
+def _failover(args: argparse.Namespace) -> int:
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    samples, missing = _failover_samples(ledger, args)
+    if missing:
+        print(f"error: generation {missing[0]} not found", file=sys.stderr)
+        return 1
+    usable = [
+        record
+        for record in samples
+        if isinstance(record.output, str) and len(record.output) >= 2
+    ]
+    if not usable:
+        print(
+            "No recorded heals with stored output to test. Run `llmbridge status` "
+            "to see suspect seams, or name generation ids explicitly.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        routes = _load_routes(getattr(args, "config", None))
+    except RoutingError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    models = _failover_models(usable, routes, getattr(args, "models", None))
+    if not models:
+        print(
+            "error: none of the sampled models configures a fallback; "
+            "list candidates with --models a,b",
+            file=sys.stderr,
+        )
+        return 1
+    unknown = [alias for alias in models if alias not in routes]
+    if unknown:
+        print(f"error: no configured model alias {unknown[0]!r}", file=sys.stderr)
+        return 1
+
+    plan = [(record, _failover_cut(record, args.at)) for record in usable]
+    calls = len(plan) * len(models)
+    as_json = getattr(args, "json", False)
+    plan_payload = {
+        "plan": [
+            {
+                "generation_id": record.id,
+                "model": record.model,
+                "at": at,
+                "output_chars": len(record.output),
+            }
+            for record, at in plan
+        ],
+        "models": models,
+        "calls": calls,
+        "threshold": args.threshold,
+    }
+    if args.dry_run:
+        if as_json:
+            print(json.dumps({**plan_payload, "dry_run": True}, indent=2))
+        else:
+            print(
+                f"Sampling {len(plan)} suspect heal(s) x {len(models)} model(s): "
+                f"{calls} real upstream call(s)."
+            )
+            print("Each call spends real tokens, and the score only says whether a fallback")
+            print("continues the same way - not whether the answer was right.")
+            for record, at in plan:
+                print(f"  {record.id}: cut at char {at} of {len(record.output)}")
+            print("  models: " + ", ".join(models))
+            print("  dry run: nothing was sent")
+        return 0
+    if not as_json:
+        print(
+            f"Sampling {len(plan)} suspect heal(s) x {len(models)} model(s): "
+            f"{calls} real upstream call(s)."
+        )
+        print("Each call spends real tokens, and the score only says whether a fallback")
+        print("continues the same way - not whether the answer was right.")
+
+    results: dict[str, list[dict[str, Any]]] = {alias: [] for alias in models}
+    for record, at in plan:
+        for alias in models:
+            body = ledger.dream_request(record, at=at, model=alias)
+            continuation, error = _replay_output(routes, alias, body)
+            if error is not None:
+                results[alias].append(
+                    {"generation_id": record.id, "at": at, "error": error}
+                )
+                continue
+            continuation = continuation or ""
+            truth = record.output[at:]
+            seam = server.score_seam(record.output[:at], continuation)
+            results[alias].append(
+                {
+                    "generation_id": record.id,
+                    "at": at,
+                    "continuation_chars": len(continuation),
+                    "similarity": round(
+                        difflib.SequenceMatcher(None, truth, continuation).ratio(), 3
+                    ),
+                    "seam": seam,
+                }
+            )
+
+    ranking: list[dict[str, Any]] = []
+    for alias in models:
+        runs = [entry for entry in results[alias] if "error" not in entry]
+        flagged = sum(1 for entry in runs if entry["seam"]["suspect"])
+        faithful = sum(
+            1 for entry in runs if entry["similarity"] >= args.threshold
+        )
+        mean = sum(entry["similarity"] for entry in runs) / len(runs) if runs else 0.0
+        worst = min(runs, key=lambda entry: entry["similarity"]) if runs else None
+        ranking.append(
+            {
+                "model": alias,
+                "runs": len(runs),
+                "failed": len(results[alias]) - len(runs),
+                "flagged": flagged,
+                "faithful": faithful,
+                "mean_similarity": round(mean, 3),
+                "worst": worst,
+            }
+        )
+    # Fewest suspicious joins first; similarity breaks ties.
+    ranking.sort(key=lambda row: (row["flagged"], -row["mean_similarity"]))
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "plan": [
+                        {
+                            "generation_id": record.id,
+                            "model": record.model,
+                            "at": at,
+                            "output_chars": len(record.output),
+                        }
+                        for record, at in plan
+                    ],
+                    "calls": calls,
+                    "threshold": args.threshold,
+                    "ranking": ranking,
+                    "results": results,
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return 0 if any(row["runs"] for row in ranking) else 1
+
+    print()
+    print(f"{'MODEL':<16}{'RUNS':<6}{'FLAGGED':<9}{'FAITHFUL':<10}{'MEAN SIM':<10}WORST")
+    for row in ranking:
+        worst = row["worst"]
+        worst_text = (
+            f"{worst['generation_id']} ({worst['similarity']:.2f})" if worst else "-"
+        )
+        print(
+            f"{row['model']:<16}{row['runs']:<6}{row['flagged']:<9}"
+            f"{row['faithful']:<10}{row['mean_similarity']:<10.2f}{worst_text}"
+        )
+        for entry in results[row["model"]]:
+            if "error" in entry:
+                print(f"  {entry['generation_id']}: {entry['error']}")
+    ranked = [row for row in ranking if row["runs"]]
+    if ranked:
+        best = ranked[0]
+        verdict = (
+            "no flagged joins" if best["flagged"] == 0 else f"{best['flagged']} flagged join(s)"
+        )
+        print()
+        print(
+            f"Best fallback on these seams: {best['model']} "
+            f"(mean similarity {best['mean_similarity']:.2f}, {verdict})"
+        )
+        print("Smallest sample that can rank anything: one heal per model.")
+    else:
+        print("Every sampled call failed; no fallback could be ranked.")
+    return 0 if ranked else 1
 
 
 def _prompt(label: str, default: str | None = None) -> str:
@@ -706,19 +1236,27 @@ def _claude(args: argparse.Namespace) -> int:
     forwarded = list(args.claude_args)
     if forwarded and forwarded[0] == "--":
         forwarded = forwarded[1:]
+    # Claude Code lets a settings-pinned env override inherited variables, which
+    # is why exporting ANTHROPIC_BASE_URL alone can still send traffic elsewhere.
+    # A CLI settings layer outranks every file, so the bridge URL wins.
+    settings = json.dumps(
+        {"env": {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_AUTH_TOKEN": api_key}}
+    )
+    launch: list[str] = []
+    if "--settings" not in forwarded:
+        launch += ["--settings", settings]
 
     if args.print_env:
         print(f"ANTHROPIC_BASE_URL={base_url}")
         print(f"ANTHROPIC_AUTH_TOKEN={api_key}")
-        if forwarded:
-            print("claude " + " ".join(forwarded))
+        print(f"claude --settings '{settings}'" + (" " + " ".join(forwarded) if forwarded else ""))
         return 0
 
     env = dict(os.environ)
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = api_key
     try:
-        os.execvpe("claude", ["claude", *forwarded], env)
+        os.execvpe("claude", ["claude", *launch, *forwarded], env)
     except FileNotFoundError:
         print(
             "error: the `claude` CLI was not found on PATH. Install Claude Code, "
@@ -762,10 +1300,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "init": _init,
         "generations": _generations,
         "status": _status,
+        "stats": _stats,
         "fork": _fork,
         "tree": _tree,
         "diff": _diff,
         "replay": _replay,
+        "audit": _audit,
+        "dream": _dream,
+        "failover": _failover,
         "setup": _setup,
         "doctor": _doctor,
         "claude": _claude,
