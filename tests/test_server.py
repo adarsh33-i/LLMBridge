@@ -28,6 +28,8 @@ from llmbridge.server import (
     _extract_prompt_and_system,
     _is_loopback_host,
     _is_retryable_status,
+    _parse_retry_after,
+    _retry_sleep,
     _route_attempts,
     _route_retry_backoff_seconds,
     _upstream_timeout_seconds,
@@ -1208,6 +1210,30 @@ class RouteRetrySettingTests(unittest.TestCase):
         with patch.dict(os.environ, {"LLMBRIDGE_ROUTE_RETRY_BACKOFF": "soon"}):
             self.assertEqual(_route_retry_backoff_seconds(), 0.5)
 
+    def test_parse_retry_after_accepts_seconds_and_http_dates(self):
+        self.assertEqual(_parse_retry_after("7"), 7.0)
+        self.assertEqual(_parse_retry_after(" 12 "), 12.0)
+        self.assertIsNone(_parse_retry_after(None))
+        self.assertIsNone(_parse_retry_after(""))
+        self.assertIsNone(_parse_retry_after("soon"))
+        self.assertIsNone(_parse_retry_after("-3"))
+        with patch("llmbridge.server.time.time", return_value=784111767.0):
+            # RFC 9110 example date is 784111777 in epoch seconds.
+            self.assertEqual(
+                _parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), 10.0
+            )
+        self.assertEqual(_parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), 0.0)
+
+    def test_retry_sleep_waits_at_least_retry_after(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_ROUTE_RETRY_BACKOFF": "0.5"}):
+            with patch("llmbridge.server.time.sleep") as sleep:
+                _retry_sleep(1, retry_after=4.0)
+                _retry_sleep(1, retry_after=0.1)
+                _retry_sleep(2)
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list], [4.0, 0.5, 1.0]
+        )
+
     def test_retryable_statuses(self):
         self.assertTrue(_is_retryable_status(429))
         self.assertTrue(_is_retryable_status(503))
@@ -1461,6 +1487,79 @@ class FallbackRouteTests(unittest.TestCase):
                 "http://primary.test/v1/chat/completions",
             ],
         )
+
+
+    def _rate_limited(self, retry_after: str):
+        return HTTPError(
+            "http://primary.test", 429, "Too Many", {"Retry-After": retry_after}, None
+        )
+
+    def test_same_route_retry_honours_retry_after(self):
+        env = {
+            "LLMBRIDGE_TEST_API_KEY": "k",
+            "LLMBRIDGE_ROUTE_ATTEMPTS": "2",
+            "LLMBRIDGE_ROUTE_RETRY_BACKOFF": "0",
+        }
+        body = {"model": "primary", "max_tokens": 10, "messages": [{"role": "user", "content": "Hi"}]}
+        with patch.dict(os.environ, env):
+            with patch("llmbridge.server.time.sleep") as sleep, patch(
+                "llmbridge.server.urlopen",
+                side_effect=[self._rate_limited("3"), self._ok_response()],
+            ) as call:
+                with urlopen(self._post(body)) as response:
+                    self.assertEqual(response.status, 200)
+
+        sleep.assert_called_once_with(3.0)
+        urls = [c.args[0].full_url for c in call.call_args_list]
+        self.assertEqual(urls, ["http://primary.test/v1/chat/completions"] * 2)
+
+    def test_long_retry_after_skips_to_fallback_without_waiting(self):
+        env = {
+            "LLMBRIDGE_TEST_API_KEY": "k",
+            "LLMBRIDGE_ROUTE_ATTEMPTS": "3",
+            "LLMBRIDGE_ROUTE_RETRY_BACKOFF": "0",
+        }
+        body = {"model": "primary", "max_tokens": 10, "messages": [{"role": "user", "content": "Hi"}]}
+        with patch.dict(os.environ, env):
+            with patch("llmbridge.server.time.sleep") as sleep, patch(
+                "llmbridge.server.urlopen",
+                side_effect=[self._rate_limited("600"), self._ok_response()],
+            ) as call:
+                with urlopen(self._post(body)) as response:
+                    self.assertEqual(response.status, 200)
+
+        sleep.assert_not_called()
+        urls = [c.args[0].full_url for c in call.call_args_list]
+        self.assertEqual(
+            urls,
+            [
+                "http://primary.test/v1/chat/completions",
+                "http://backup.test/v1/chat/completions",
+            ],
+        )
+
+    def test_streaming_retry_honours_retry_after(self):
+        env = {
+            "LLMBRIDGE_TEST_API_KEY": "k",
+            "LLMBRIDGE_ROUTE_ATTEMPTS": "2",
+            "LLMBRIDGE_ROUTE_RETRY_BACKOFF": "0",
+        }
+        body = {
+            "model": "primary",
+            "max_tokens": 10,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        with patch.dict(os.environ, env):
+            with patch("llmbridge.server.time.sleep") as sleep, patch(
+                "llmbridge.server.urlopen",
+                side_effect=[self._rate_limited("2")] + [URLError("down")] * 3,
+            ):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post(body))
+                error.exception.close()
+
+        self.assertIn(2.0, [c.args[0] for c in sleep.call_args_list])
 
 
 class ResumeInterruptedTests(unittest.TestCase):

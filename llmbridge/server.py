@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -43,6 +44,11 @@ _RESUMABLE_HTTP_STATUS = frozenset({402, 403, 408, 429, 500, 502, 503, 504, 529}
 # environment so a deployment can trade latency for resilience.
 _DEFAULT_ROUTE_ATTEMPTS = 1
 _DEFAULT_ROUTE_RETRY_BACKOFF_SECONDS = 0.5
+
+# The longest an upstream ``Retry-After`` may hold a request open before a
+# same-route retry. Anything longer is not worth blocking the client for, so
+# the route is abandoned in favour of the next fallback (or the queue).
+_MAX_RETRY_AFTER_WAIT_SECONDS = 30.0
 
 # A failed upstream attempt: (kind, message, http_status). ``kind`` decides how
 # the failure is reported to the client and whether it is worth saving.
@@ -240,10 +246,36 @@ def _route_retry_backoff_seconds() -> float:
     return max(0.0, value)
 
 
-def _retry_sleep(attempt: int) -> None:
-    backoff = _route_retry_backoff_seconds()
-    if backoff > 0:
-        time.sleep(backoff * (2 ** (attempt - 1)))
+def _retry_sleep(attempt: int, retry_after: float | None = None) -> None:
+    """Wait before re-trying a route: exponential backoff, but never less
+    than the delay the upstream asked for with ``Retry-After``."""
+    delay = _route_retry_backoff_seconds() * (2 ** (attempt - 1))
+    if retry_after is not None:
+        delay = max(delay, retry_after)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _parse_retry_after(raw: Any) -> float | None:
+    """Seconds to wait from a ``Retry-After`` header, or None if unusable.
+
+    RFC 9110 allows either delay-seconds or an HTTP-date; both are accepted.
+    A date in the past means "retry now" (0 seconds).
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:
+        return None
+    return max(0.0, when.timestamp() - time.time())
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -1465,12 +1497,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     upstream = urlopen(request, timeout=_upstream_timeout_seconds())
                 except HTTPError as error:
                     failure = self._record_http_failure(error)
-                    if (
-                        failure[2] is not None
-                        and _is_retryable_status(failure[2])
-                        and attempt < _route_attempts()
-                    ):
-                        _retry_sleep(attempt)
+                    if self._wait_to_retry_http(failure, attempt):
                         continue
                     break
                 except URLError as error:
@@ -1553,12 +1580,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     upstream = urlopen(request, timeout=_upstream_timeout_seconds())
                 except HTTPError as error:
                     failure = self._record_http_failure(error)
-                    if (
-                        failure[2] is not None
-                        and _is_retryable_status(failure[2])
-                        and attempt < _route_attempts()
-                    ):
-                        _retry_sleep(attempt)
+                    if self._wait_to_retry_http(failure, attempt):
                         continue
                     break
                 except URLError as error:
@@ -1608,13 +1630,35 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             body=body,
         )
 
+    def _wait_to_retry_http(self, failure: _Failure, attempt: int) -> bool:
+        """Sleep and return True when an HTTP failure should retry this route.
+
+        A ``Retry-After`` longer than ``_MAX_RETRY_AFTER_WAIT_SECONDS`` means
+        another attempt here is pointless for now, so the route is skipped and
+        the next candidate gets the request instead.
+        """
+        status = failure[2]
+        if (
+            status is None
+            or not _is_retryable_status(status)
+            or attempt >= _route_attempts()
+        ):
+            return False
+        retry_after = self._upstream_retry_after
+        if retry_after is not None and retry_after > _MAX_RETRY_AFTER_WAIT_SECONDS:
+            self.log_message(
+                "upstream asked to wait %.0fs; moving on instead of retrying",
+                retry_after,
+            )
+            return False
+        _retry_sleep(attempt, retry_after)
+        return True
+
     def _record_http_failure(self, error: HTTPError) -> _Failure:
         status = error.code
         retry_after = None
         if error.headers is not None:
-            raw = error.headers.get("Retry-After")
-            if raw is not None and raw.strip().isdigit():
-                retry_after = float(raw.strip())
+            retry_after = _parse_retry_after(error.headers.get("Retry-After"))
         self._upstream_retry_after = retry_after
         error.close()
         self.log_error("Upstream returned HTTP %s", status)
