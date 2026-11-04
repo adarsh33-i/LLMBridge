@@ -1222,3 +1222,78 @@ class DreamRequestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FallbackQualityTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+
+    def _seam(self, to_model, suspect, from_model="primary", consolidate=True):
+        record = self.ledger.create(
+            {"model": from_model, "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            from_model,
+        )
+        self.ledger.heal_seam(
+            record,
+            from_model=from_model,
+            to_model=to_model,
+            seam_at=3,
+            audit={"continuation_chars": 5, "overlap_chars": 0, "overlap_ratio": 0.0,
+                   "duplicated": suspect, "restarted": False, "suspect": suspect},
+        )
+        self.ledger.complete(record, "x", 1)
+        if consolidate:
+            self.ledger.consolidate()
+        return record
+
+    def test_counts_per_fallback_from_digest_and_unconsolidated_records(self):
+        self._seam("a", True)
+        self._seam("a", False)
+        self._seam("b", False, consolidate=False)  # only in the record
+        self._seam("c", True, from_model="other")   # different primary, ignored
+        quality = self.ledger.fallback_quality("primary", min_samples=2)
+        self.assertEqual(quality["a"]["samples"], 2)
+        self.assertEqual(quality["a"]["suspect"], 1)
+        self.assertEqual(quality["a"]["suspect_rate"], 0.5)
+        self.assertTrue(quality["a"]["trusted"])
+        self.assertEqual(quality["b"]["samples"], 1)
+        self.assertFalse(quality["b"]["trusted"])
+        self.assertNotIn("c", quality)
+
+    def test_digest_survives_pruning_of_the_records(self):
+        for _ in range(4):
+            self._seam("a", False)
+        self.ledger.prune(keep=0)
+        self.assertEqual(self.ledger.list(limit=None), [])
+        quality = self.ledger.fallback_quality("primary")
+        self.assertEqual(quality["a"]["samples"], 4)
+        self.assertTrue(quality["a"]["trusted"])
+
+    def test_rank_sorts_trusted_by_suspect_rate_then_config_order(self):
+        from llmbridge.routing import ModelRoute
+        from llmbridge.server import rank_heal_candidates
+
+        r = ModelRoute("http://x/v1")
+        remaining = [(r, "a"), (r, "b"), (r, "c"), (r, "d")]
+        quality = {
+            "a": {"samples": 5, "suspect": 4, "suspect_rate": 0.8, "trusted": True},
+            "b": {"samples": 1, "suspect": 0, "suspect_rate": 0.0, "trusted": False},
+            "c": {"samples": 5, "suspect": 0, "suspect_rate": 0.0, "trusted": True},
+        }
+        ranked, note = rank_heal_candidates(remaining, quality)
+        self.assertEqual([m for _, m in ranked], ["c", "a", "b", "d"])
+        self.assertEqual([n["model"] for n in note], ["c", "a", "b", "d"])
+        self.assertEqual(note[0]["config_position"], 2)
+        self.assertFalse(note[3]["trusted"])
+        self.assertIsNone(note[3]["suspect_rate"])
+
+    def test_quality_cache_is_invalidated_by_a_new_seam(self):
+        self._seam("a", False)
+        first = self.ledger.fallback_quality("primary", min_samples=1)
+        self.assertEqual(first["a"]["samples"], 1)
+        self._seam("a", True)
+        second = self.ledger.fallback_quality("primary", min_samples=1)
+        self.assertEqual(second["a"]["samples"], 2)
+        self.assertEqual(second["a"]["suspect"], 1)
