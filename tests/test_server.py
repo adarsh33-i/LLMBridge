@@ -1007,6 +1007,22 @@ class StreamResponseUnitTests(unittest.TestCase):
                 LLMBridgeHandler.handle_one_request(handler)
 
 
+class ShutdownSignalTests(unittest.TestCase):
+    def test_sigterm_is_routed_through_keyboard_interrupt(self):
+        import signal
+
+        from llmbridge.server import install_shutdown_signals
+
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        install_shutdown_signals()
+        handler = signal.getsignal(signal.SIGTERM)
+        self.assertTrue(callable(handler))
+        # The same path SIGINT takes, so main()'s finally still runs stop().
+        with self.assertRaises(KeyboardInterrupt):
+            handler(signal.SIGTERM, None)
+
+
 class ServerSettingsTests(unittest.TestCase):
     def setUp(self):
         self._routes = {
@@ -1516,6 +1532,144 @@ class ResumeInterruptedTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 404)
         error.exception.close()
 
+    def _use_ledger_backed_server(self):
+        """Rebuild the server with the ledger attached (lineage + GET /v1/generations)."""
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = LLMBridgeServer(
+            ("127.0.0.1", 0),
+            LLMBridgeHandler,
+            {
+                "nemotron": ModelRoute(
+                    "http://upstream.test/v1",
+                    model="nvidia/nemotron",
+                    api_key_env="LLMBRIDGE_TEST_API_KEY",
+                ),
+                "other": ModelRoute("http://other.test/v1", model="other-model"),
+            },
+            work_tracker=self.tracker,
+            ledger=self.ledger,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def _interrupted_record(self, text="half", prompt="Continue this"):
+        body = {
+            "model": "nemotron", "max_tokens": 256, "system": "be terse",
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        record = self.ledger.create(body, "nemotron")
+        self.ledger.interrupt(record, "Upstream stream timed out", output=text, output_tokens=2)
+        return record
+
+    def test_handoff_token_round_trips_and_is_tamper_evident(self):
+        from llmbridge.server import mint_handoff_token, verify_handoff_token
+        record = self._interrupted_record()
+        token = mint_handoff_token(record, secret=b"s" * 16, now=1000.0)
+        self.assertNotIn("=", token)
+        payload = verify_handoff_token(token, secret=b"s" * 16, now=1001.0)
+        self.assertEqual(payload["generation_id"], record.id)
+        self.assertEqual(payload["partial_output"], "half")
+        self.assertEqual(payload["request"]["messages"][0]["content"], "Continue this")
+        self.assertEqual(payload["fingerprint"], record.fingerprint)
+        with self.assertRaises(ValueError):
+            verify_handoff_token(token, secret=b"t" * 16, now=1001.0)
+        head, _, sig = token.partition(".")
+        with self.assertRaises(ValueError):
+            verify_handoff_token(head + "x." + sig, secret=b"s" * 16, now=1001.0)
+        with self.assertRaises(ValueError):
+            verify_handoff_token("not-a-token", secret=b"s" * 16)
+        with self.assertRaises(ValueError) as expired:
+            verify_handoff_token(token, secret=b"s" * 16, now=1000.0 + 25 * 3600)
+        self.assertIn("expired", str(expired.exception))
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_TTL_SECONDS": "10"}):
+            with self.assertRaises(ValueError):
+                verify_handoff_token(token, secret=b"s" * 16, now=1020.0)
+        with self.assertRaises(ValueError):
+            verify_handoff_token(token, secret=b"s" * 16, now=100.0)  # issued in the future
+
+    def test_get_interrupted_carries_a_token_only_when_a_secret_is_set(self):
+        self._use_ledger_backed_server()
+        self._interrupted_record()
+        with urlopen(self._url("/v1/interrupted")) as response:
+            state = json.loads(response.read())
+        self.assertNotIn("handoff_token", state)
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value"}):
+            with urlopen(self._url("/v1/interrupted")) as response:
+                state = json.loads(response.read())
+            self.assertIn("handoff_token", state)
+            with urlopen(self._url(f"/v1/generations/{state['generation_id']}")) as response:
+                full = json.loads(response.read())
+            # Each mint carries its own issue time, so compare what the tokens say.
+            from llmbridge.server import verify_handoff_token
+            a = verify_handoff_token(state["handoff_token"], secret=b"shared-secret-value")
+            b = verify_handoff_token(full["handoff_token"], secret=b"shared-secret-value")
+            self.assertEqual(a["generation_id"], b["generation_id"])
+            self.assertEqual(a["partial_output"], b["partial_output"])
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "short"}):
+            with urlopen(self._url("/v1/interrupted")) as response:
+                self.assertNotIn("handoff_token", json.loads(response.read()))
+
+    def test_resume_accepts_a_handoff_token_from_another_bridge(self):
+        # Bridge A minted the token; this bridge (B) has never seen gen_remote.
+        self._use_ledger_backed_server()
+        from llmbridge.ledger import GenerationRecord
+        from llmbridge.server import mint_handoff_token
+        import time as _time
+        remote = GenerationRecord(
+            id="gen_remote000001", fingerprint="fp-remote", model="claude-sonnet-4-5",
+            prompt="Continue this", system="be terse", params={"max_tokens": 256},
+            status="interrupted", created_at=_time.time(), updated_at=_time.time(),
+            request={"messages": [{"role": "user", "content": "Continue this"}], "system": "be terse"},
+            output="half", output_tokens=2,
+        )
+        token = mint_handoff_token(remote, secret=b"shared-secret-value")
+        env = {"LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value", "LLMBRIDGE_TEST_API_KEY": "k"}
+        with patch.dict(os.environ, env):
+            with patch("llmbridge.server.urlopen", return_value=self._ok_response()) as call:
+                with urlopen(self._resume({"handoff_token": token, "model": "other"})) as response:
+                    self.assertEqual(response.status, 200)
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+        forwarded = json.loads(call.call_args.args[0].data)
+        self.assertEqual(forwarded["model"], "other-model")
+        self.assertEqual(forwarded["max_tokens"], 256)
+        self.assertEqual(
+            forwarded["messages"],
+            [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "Continue this"},
+                {"role": "assistant", "content": "half"},
+            ],
+        )
+        child = self.ledger.load(child_id)
+        self.assertEqual(child.status, "completed")
+        self.assertIsNone(child.parent)
+        self.assertEqual(child.fingerprint, "fp-remote")
+        handoff = next(e for e in child.events if e.type == "handoff")
+        self.assertEqual(handoff.data["source_generation"], "gen_remote000001")
+        self.assertEqual(handoff.data["source_model"], "claude-sonnet-4-5")
+        self.assertEqual(handoff.data["resumed_chars"], 4)
+        self.assertEqual(self.ledger.interrupted(), [])  # nothing local was touched
+
+    def test_resume_with_token_but_no_secret_is_a_clear_400(self):
+        from llmbridge.server import mint_handoff_token
+        token = mint_handoff_token(self._interrupted_record(), secret=b"shared-secret-value")
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("LLMBRIDGE_HANDOFF_SECRET", "LLMBRIDGE_API_KEY")}
+        with patch.dict(os.environ, clean, clear=True):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(self._resume({"handoff_token": token}))
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("LLMBRIDGE_HANDOFF_SECRET", error.exception.read().decode())
+        error.exception.close()
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "a-different-secret!"}):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(self._resume({"handoff_token": token}))
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("signature", error.exception.read().decode())
+        error.exception.close()
+
     def test_resume_reissues_partial_output_as_assistant_turn(self):
         self.tracker.save(
             prompt="Continue this",
@@ -1642,6 +1796,298 @@ class ResumeInterruptedTests(unittest.TestCase):
             error.exception.close()
         finally:
             self.server.client_api_key = None
+
+
+class _ContinuationStream:
+    """Streams a continuation the way a model does when given a prefill."""
+
+    def __init__(self, text: str = " world"):
+        self.text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def __iter__(self):
+        yield b"data: " + json.dumps(
+            {"choices": [{"delta": {"content": self.text}, "finish_reason": None}]}
+        ).encode() + b"\n"
+        yield (
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+            b'"usage":{"completion_tokens":3}}\n'
+        )
+
+    def close(self):
+        pass
+
+
+class AutoResumeTests(unittest.TestCase):
+    """LLMBRIDGE_AUTO_RESUME: a re-sent request continues its interrupted run."""
+
+    BODY = {
+        "model": "nemotron",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Say hello world"}],
+    }
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ledger = GenerationLedger(str(Path(self._tmp.name) / "generations"))
+        self.tracker = WorkTracker(self.ledger)
+        self.server = LLMBridgeServer(
+            ("127.0.0.1", 0),
+            LLMBridgeHandler,
+            {
+                "nemotron": ModelRoute(
+                    "http://upstream.test/v1",
+                    model="nvidia/nemotron",
+                    fallbacks=["other"],
+                ),
+                "other": ModelRoute("http://other.test/v1", model="other-model"),
+            },
+            work_tracker=self.tracker,
+            ledger=self.ledger,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def _post(self, body: dict) -> Request:
+        return Request(
+            self._url("/v1/messages"),
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def _interrupt(self, body: dict, partial: str = "Hello") -> GenerationRecord:
+        """Record an interrupted run of ``body`` that saved ``partial``."""
+        record = self.ledger.create(body, body["model"])
+        self.ledger.interrupt(record, "Upstream stream timed out", output=partial, output_tokens=2)
+        return record
+
+    def _ok(self, text: str = " world"):
+        return _UpstreamResponse(
+            {
+                "id": "x",
+                "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            }
+        )
+
+    def test_off_by_default_reruns_from_scratch(self):
+        source = self._interrupt(self.BODY)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LLMBRIDGE_AUTO_RESUME", None)
+            with patch("llmbridge.server.urlopen", return_value=self._ok("fresh")) as call:
+                with urlopen(self._post(self.BODY)) as response:
+                    result = json.loads(response.read())
+                    resumed_header = response.headers.get("X-LLMBridge-Resumed")
+        self.assertEqual(result["content"][0]["text"], "fresh")
+        self.assertIsNone(resumed_header)
+        sent = json.loads(call.call_args.args[0].data)
+        self.assertEqual(sent["messages"][-1]["role"], "user")
+        # The identical re-send still settles the old record, as before.
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
+
+    def test_non_stream_resume_prepends_saved_text(self):
+        source = self._interrupt(self.BODY)
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok(" world")) as call:
+                with urlopen(self._post(self.BODY)) as response:
+                    result = json.loads(response.read())
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+                    resumed = response.headers.get("X-LLMBridge-Resumed")
+        # The client receives one whole answer, saved prefix first.
+        self.assertEqual(result["content"], [{"type": "text", "text": "Hello world"}])
+        self.assertEqual(result["usage"]["output_tokens"], 5)
+        self.assertEqual(resumed, source.id)
+        # The upstream was asked to continue, not to start over.
+        sent = json.loads(call.call_args.args[0].data)
+        self.assertEqual(sent["messages"][-1], {"role": "assistant", "content": "Hello"})
+        # Lineage: the child points at the source, both are settled.
+        child = self.ledger.load(child_id)
+        self.assertEqual(child.parent, source.id)
+        self.assertEqual(child.status, "completed")
+        self.assertEqual(child.output, "Hello world")
+        self.assertEqual(child.fingerprint, source.fingerprint)
+        types = [event.type for event in child.events]
+        self.assertEqual(types, ["fork", "heal", "heal_seam", "complete"])
+        heal = next(e for e in child.events if e.type == "heal")
+        self.assertEqual(heal.data["reason"], "auto_resume")
+        self.assertEqual(heal.data["resumed_chars"], 5)
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
+        self.assertEqual(self.ledger.interrupted(), [])
+
+    def test_stream_resume_replays_prefix_then_continuation(self):
+        body = {**self.BODY, "stream": True}
+        source = self._interrupt(body)
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=_ContinuationStream(" world")):
+                with urlopen(self._post(body)) as response:
+                    raw = response.read().decode()
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+                    resumed = response.headers.get("X-LLMBridge-Resumed")
+        self.assertEqual(resumed, source.id)
+        self.assertEqual(raw.count("event: message_start"), 1)
+        self.assertEqual(raw.count("event: content_block_start"), 1)
+        self.assertEqual(raw.count("event: message_stop"), 1)
+        self.assertNotIn("event: error", raw)
+        texts = [
+            json.loads(line[6:])["delta"]["text"]
+            for line in raw.splitlines()
+            if line.startswith("data: ") and '"content_block_delta"' in line
+        ]
+        self.assertEqual(texts, ["Hello", " world"])
+        child = self.ledger.load(child_id)
+        self.assertEqual(child.status, "completed")
+        self.assertEqual(child.output, "Hello world")
+        self.assertIn("heal_seam", [event.type for event in child.events])
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
+
+    def test_different_request_is_not_resumed(self):
+        self._interrupt(self.BODY)
+        other = {**self.BODY, "messages": [{"role": "user", "content": "Something else"}]}
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok("fresh")) as call:
+                with urlopen(self._post(other)) as response:
+                    result = json.loads(response.read())
+                    resumed = response.headers.get("X-LLMBridge-Resumed")
+        self.assertEqual(result["content"][0]["text"], "fresh")
+        self.assertIsNone(resumed)
+        self.assertEqual(json.loads(call.call_args.args[0].data)["messages"][-1]["role"], "user")
+        self.assertEqual(len(self.ledger.interrupted()), 1)
+
+    def test_interrupted_record_without_text_runs_fresh(self):
+        source = self.ledger.create(self.BODY, "nemotron")
+        self.ledger.interrupt(source, "Upstream returned HTTP 429")  # no output saved
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok("fresh")) as call:
+                with urlopen(self._post(self.BODY)) as response:
+                    result = json.loads(response.read())
+        self.assertEqual(result["content"][0]["text"], "fresh")
+        self.assertEqual(json.loads(call.call_args.args[0].data)["messages"][-1]["role"], "user")
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
+
+    def test_unreachable_upstream_falls_back_to_the_normal_path(self):
+        source = self._interrupt(self.BODY)
+        failure = URLError("refused")
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", side_effect=failure) as call:
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self._post(self.BODY))
+        self.assertEqual(error.exception.code, 502)
+        error.exception.close()
+        # Both routes tried for the resume, then both again for the fresh run.
+        self.assertEqual(call.call_count, 4)
+        # The original interruption is still offered; a failed resume must not
+        # settle work it did not finish.
+        self.assertEqual(self.ledger.load(source.id).status, "interrupted")
+
+    def test_uses_fallback_route_when_primary_is_down(self):
+        source = self._interrupt(self.BODY)
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request.full_url)
+            if "upstream.test" in request.full_url:
+                raise URLError("down")
+            return self._ok(" world")
+
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", side_effect=fake_urlopen):
+                with urlopen(self._post(self.BODY)) as response:
+                    result = json.loads(response.read())
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+        self.assertEqual(result["content"][0]["text"], "Hello world")
+        self.assertEqual(calls, [
+            "http://upstream.test/v1/chat/completions",
+            "http://other.test/v1/chat/completions",
+        ])
+        heal = next(e for e in self.ledger.load(child_id).events if e.type == "heal")
+        self.assertEqual(heal.data["to_model"], "other-model")
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
+
+    def test_simultaneous_resends_share_one_resume(self):
+        # Audit finding: two identical re-sends arriving together must not
+        # both resume the same source and both pay for an upstream call.
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
+        source = self._interrupt(self.BODY)
+        calls = []
+
+        class _SlowOk(_UpstreamResponse):
+            def read(self, size=-1):
+                _time.sleep(0.3)
+                return super().read(size)
+
+        def fake(request, timeout=None):
+            calls.append(request.full_url)
+            return _SlowOk({
+                "id": "x",
+                "choices": [{"message": {"content": " world"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            })
+
+        def send():
+            with urlopen(self._post(self.BODY)) as response:
+                return json.loads(response.read()), dict(response.headers)
+
+        env = {"LLMBRIDGE_AUTO_RESUME": "1", "LLMBRIDGE_COALESCE_REQUESTS": "always"}
+        with patch.dict(os.environ, env):
+            with patch("llmbridge.server.urlopen", side_effect=fake):
+                with ThreadPoolExecutor(2) as pool:
+                    a, b = pool.map(lambda _: send(), range(2))
+        self.assertEqual(len(calls), 1, "the duplicate must ride on the leader's resume")
+        self.assertEqual(a[0]["content"][0]["text"], "Hello world")
+        self.assertEqual(b[0]["content"][0]["text"], "Hello world")
+        coalesced = [h for h in (a[1], b[1]) if h.get("X-LLMBridge-Coalesced") == "1"]
+        self.assertEqual(len(coalesced), 1)
+        self.assertEqual(a[1]["X-LLMBridge-Generation"], b[1]["X-LLMBridge-Generation"])
+        children = [r for r in self.ledger.list(limit=None) if r.parent == source.id]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
+
+    def test_non_stream_resume_record_carries_the_summed_token_count(self):
+        source = self._interrupt(self.BODY)  # output_tokens=2
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok(" world")):
+                with urlopen(self._post(self.BODY)) as response:
+                    result = json.loads(response.read())
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+        self.assertEqual(result["usage"]["output_tokens"], 5)
+        self.assertEqual(self.ledger.load(child_id).output_tokens, 5)
+
+    def test_non_stream_resume_reports_seam_verdict_in_a_header_when_enabled(self):
+        self._interrupt(self.BODY)
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1", "LLMBRIDGE_SEAM_EVENTS": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok(" world")):
+                with urlopen(self._post(self.BODY)) as response:
+                    self.assertEqual(response.headers.get("X-LLMBridge-Seam"), "clean")
+        self._interrupt(self.BODY)
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok(" world")):
+                with urlopen(self._post(self.BODY)) as response:
+                    self.assertIsNone(response.headers.get("X-LLMBridge-Seam"))
+
+    def test_resumable_lookup_prefers_newest_with_text(self):
+        older = self._interrupt(self.BODY, partial="old half")
+        self.ledger.interrupt(self.ledger.create(self.BODY, "nemotron"), "quota")  # newest, no text
+        found = self.ledger.resumable(_fingerprint(self.BODY))
+        self.assertEqual(found.id, older.id)
+        self.assertIsNone(self.ledger.resumable(""))
+        self.assertIsNone(self.ledger.resumable("nope"))
 
 
 class ResumeLineageTests(unittest.TestCase):
@@ -1990,3 +2436,171 @@ class CoalesceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HealHelperUnitTests(unittest.TestCase):
+    """Pure-function coverage for the tool-heal, shadow, and ranking helpers."""
+
+    def _sse(self, event_type, payload):
+        from llmbridge.server import _sse_bytes
+        return _sse_bytes(event_type, {"type": event_type, **payload})
+
+    def test_line_has_token_recognises_text_tool_and_finish(self):
+        from llmbridge.server import _line_has_token
+        self.assertTrue(_line_has_token(b'data: {"choices":[{"delta":{"content":"x"}}]}\n'))
+        self.assertTrue(_line_has_token(b'data: {"choices":[{"delta":{"tool_calls":[{}]}}]}\n'))
+        self.assertTrue(_line_has_token(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n'))
+        self.assertFalse(_line_has_token(b'data: {"choices":[{"delta":{"content":""}}]}\n'))
+        self.assertFalse(_line_has_token(b'data: [DONE]\n'))
+        self.assertFalse(_line_has_token(b': keepalive\n'))
+        self.assertFalse(_line_has_token(b'data: not json\n'))
+        self.assertFalse(_line_has_token(b'data: [1,2]\n'))
+        self.assertFalse(_line_has_token(b'data: {"choices":["bad"]}\n'))
+
+    def test_primed_stream_replays_buffer_then_live_lines(self):
+        from llmbridge.server import _PrimedStream
+
+        class _Live:
+            def __init__(self):
+                self.closed = False
+                self._lines = iter([b"c\n", b"d\n"])
+            def readline(self, limit=-1):
+                return next(self._lines, b"")
+            def close(self):
+                self.closed = True
+
+        live = _Live()
+        with _PrimedStream(live, [b"a\n", b"b\n"]) as primed:
+            self.assertEqual([primed.readline() for _ in range(5)], [b"a\n", b"b\n", b"c\n", b"d\n", b""])
+        self.assertTrue(live.closed)
+
+    def test_primed_stream_close_swallows_errors(self):
+        from llmbridge.server import _PrimedStream
+
+        class _Bad:
+            def readline(self, limit=-1):
+                return b""
+            def close(self):
+                raise OSError("already closed")
+
+        _PrimedStream(_Bad(), []).close()  # must not raise
+
+    def test_racer_reports_connect_errors_and_cancellation(self):
+        from llmbridge.server import _Racer
+        route = ModelRoute("http://x.test/v1")
+        with patch("llmbridge.server.urlopen", side_effect=URLError("down")):
+            racer = _Racer(route, "m", Request("http://x.test/v1/chat/completions")).start()
+            racer.ready.wait(2)
+        self.assertIsInstance(racer.error, URLError)
+        self.assertFalse(racer.has_token)
+        racer.close()  # upstream is None: nothing to close, must not raise
+
+        class _Lines:
+            closed = False
+            def __init__(self):
+                self._it = iter([b": ping\n", b'data: {"choices":[{"delta":{"content":"t"}}]}\n', b"more\n"])
+            def readline(self, limit=-1):
+                return next(self._it, b"")
+            def close(self):
+                self.closed = True
+
+        upstream = _Lines()
+        with patch("llmbridge.server.urlopen", return_value=upstream):
+            racer = _Racer(route, "m", Request("http://x.test/v1/chat/completions")).start()
+            racer.ready.wait(2)
+        self.assertTrue(racer.has_token)
+        self.assertEqual(len(racer.buffered), 2)  # stopped at the first token line
+        racer.close()
+        self.assertTrue(upstream.closed)
+
+    def test_hold_and_release_tool_events(self):
+        from llmbridge.server import (
+            _hold_tool_event, _new_tool_state, _release_tool_block, _split_held_tools,
+            _tool_block_complete,
+        )
+        state = _new_tool_state()
+        start = self._sse("content_block_start", {"index": 1, "content_block": {"type": "tool_use", "id": "c1", "name": "bash", "input": {}}})
+        text_start = self._sse("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}})
+        d1 = self._sse("content_block_delta", {"index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"cmd":'}})
+        d2 = self._sse("content_block_delta", {"index": 1, "delta": {"type": "input_json_delta", "partial_json": ' "ls"}'}})
+        other = self._sse("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "hi"}})
+        self.assertFalse(_hold_tool_event(text_start, state))
+        self.assertTrue(_hold_tool_event(start, state))
+        self.assertTrue(_hold_tool_event(d1, state))
+        self.assertFalse(_hold_tool_event(other, state))
+        self.assertFalse(_hold_tool_event(b"garbage", state))
+        done, cut = _split_held_tools(state)
+        self.assertEqual([i for i, _ in cut], [1])
+        self.assertEqual(done, [])
+        self.assertTrue(_hold_tool_event(d2, state))
+        done, cut = _split_held_tools(state)
+        self.assertEqual([i for i, _ in done], [1])
+        self.assertTrue(_tool_block_complete(state["held"][1]))
+        released = _release_tool_block(state, 1)
+        self.assertEqual(released, [start, d1, d2])
+        self.assertEqual(_release_tool_block(state, 1), [])
+        self.assertEqual(state["order"], [])
+
+    def test_tool_block_complete_rejects_empty_and_non_object_json(self):
+        from llmbridge.server import _tool_block_complete
+        self.assertFalse(_tool_block_complete({"json": ""}))
+        self.assertFalse(_tool_block_complete({"json": "   "}))
+        self.assertFalse(_tool_block_complete({"json": "[1]"}))
+        self.assertFalse(_tool_block_complete({"json": '{"a":'}))
+        self.assertTrue(_tool_block_complete({"json": '{"a": 1}'}))
+
+    def test_tool_heal_hint_and_system_addendum_shapes(self):
+        from llmbridge.server import _build_tool_heal_body, _tool_heal_hint, _with_system_addendum
+        hint = _tool_heal_hint("", [{"id": "c1", "name": "read", "input": "{}"}],
+                               [{"name": "bash", "json": '{"cmd":'}, {"name": None, "json": ""}])
+        self.assertIn("read id=c1", hint)
+        self.assertIn("calling tool `bash`", hint)
+        self.assertIn("beginning a call to tool `<unknown>`", hint)
+        self.assertEqual(_with_system_addendum({"system": "A"}, "B")["system"], "A\n\nB")
+        self.assertEqual(_with_system_addendum({"system": [{"type": "text", "text": "A"}]}, "B")["system"][-1]["text"], "B")
+        self.assertEqual(_with_system_addendum({}, "B")["system"], "B")
+        self.assertIsNone(_build_tool_heal_body("nope", "", [], []))
+        self.assertIsNone(_build_tool_heal_body({"messages": "nope"}, "", [], []))
+        body = _build_tool_heal_body({"messages": [{"role": "user", "content": "q"}]}, "partial", [], [{"name": "bash", "json": ""}])
+        self.assertEqual(body["messages"][-1], {"role": "assistant", "content": "partial"})
+        self.assertIn("bash", body["system"])
+
+    def test_heal_text_index_and_block_tracking(self):
+        from llmbridge.server import _heal_text_index, _track_open_blocks
+        state = {"open": {}, "finished": False, "seen": set()}
+        _track_open_blocks(b"garbage", state)
+        _track_open_blocks(self._sse("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}), state)
+        self.assertEqual(_heal_text_index(state), 0)
+        _track_open_blocks(self._sse("content_block_start", {"index": 1, "content_block": "weird"}), state)
+        self.assertIsNone(_heal_text_index(state))  # unknown block type blocks a text heal
+        _track_open_blocks(self._sse("content_block_stop", {"index": 1}), state)
+        self.assertEqual(_heal_text_index(state), 0)
+        _track_open_blocks(self._sse("message_stop", {}), state)
+        self.assertIsNone(_heal_text_index(state))
+        self.assertEqual(state["seen"], {0, 1})
+        self.assertIsNone(_heal_text_index({"open": {}, "finished": False}))
+
+    def test_env_parsers_fall_back_on_bad_input(self):
+        from llmbridge.server import (
+            _adaptive_fallbacks_enabled, _adaptive_min_samples, _heal_tool_calls_enabled,
+            _shadow_after_seconds,
+        )
+        with patch.dict(os.environ, {"LLMBRIDGE_ADAPTIVE_MIN_SAMPLES": "x", "LLMBRIDGE_SHADOW_AFTER_SECONDS": "nope"}):
+            self.assertEqual(_adaptive_min_samples(), 3)
+            self.assertEqual(_shadow_after_seconds(), 0.0)
+        with patch.dict(os.environ, {"LLMBRIDGE_ADAPTIVE_MIN_SAMPLES": "0", "LLMBRIDGE_SHADOW_AFTER_SECONDS": "-2"}):
+            self.assertEqual(_adaptive_min_samples(), 3)
+            self.assertEqual(_shadow_after_seconds(), 0.0)
+        with patch.dict(os.environ, {"LLMBRIDGE_ADAPTIVE_MIN_SAMPLES": "7", "LLMBRIDGE_SHADOW_AFTER_SECONDS": "1.5",
+                                     "LLMBRIDGE_ADAPTIVE_FALLBACKS": "yes", "LLMBRIDGE_HEAL_TOOL_CALLS": "0"}):
+            self.assertEqual(_adaptive_min_samples(), 7)
+            self.assertEqual(_shadow_after_seconds(), 1.5)
+            self.assertTrue(_adaptive_fallbacks_enabled())
+            self.assertFalse(_heal_tool_calls_enabled())
+
+    def test_rank_handles_empty_quality(self):
+        from llmbridge.server import rank_heal_candidates
+        r = ModelRoute("http://x/v1")
+        ranked, note = rank_heal_candidates([(r, "a"), (r, "b")], {})
+        self.assertEqual([m for _, m in ranked], ["a", "b"])
+        self.assertEqual([n["samples"] for n in note], [0, 0])

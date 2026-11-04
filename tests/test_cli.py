@@ -469,6 +469,25 @@ class ClaudeCommandTests(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8787", rendered)
         self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-abc", rendered)
 
+    def test_ignores_a_stray_anthropic_base_url(self):
+        out = io.StringIO()
+        env = {"ANTHROPIC_BASE_URL": "https://some-other-gateway.example"}
+        with patch.dict(os.environ, env, clear=True):
+            with redirect_stdout(out):
+                code = cli.main(["claude", "--print-env"])
+        self.assertEqual(code, 0)
+        rendered = out.getvalue()
+        self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8787", rendered)
+        self.assertNotIn("some-other-gateway", rendered)
+
+    def test_honours_llmbridge_base_url(self):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"LLMBRIDGE_BASE_URL": "http://127.0.0.1:9900/"}, clear=True):
+            with redirect_stdout(out):
+                code = cli.main(["claude", "--print-env"])
+        self.assertEqual(code, 0)
+        self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:9900", out.getvalue())
+
     def test_builds_url_from_host_and_port(self):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -814,6 +833,84 @@ model = "backup-model"
 class HealSeamStatusTests(LedgerBackedCommandTests):
     def _status(self):
         return self._run("status")
+
+    def test_handoff_prints_a_token_for_interrupted_work(self):
+        record = self.ledger.create(
+            {"model": "primary", "max_tokens": 10, "messages": [{"role": "user", "content": "q"}]},
+            "primary",
+        )
+        self.ledger.interrupt(record, "timed out", output="partial text")
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value"}):
+            code, rendered = self._run("handoff", record.id)
+        self.assertEqual(code, 0)
+        token = rendered.strip().splitlines()[0]
+        self.assertEqual(token.count("."), 1)
+        from llmbridge.server import verify_handoff_token
+        payload = verify_handoff_token(token, secret=b"shared-secret-value")
+        self.assertEqual(payload["partial_output"], "partial text")
+
+    def test_handoff_refuses_without_a_secret_or_for_completed_work(self):
+        record = self._completed()
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value"}):
+            code, _ = self._run("handoff", record.id)
+        self.assertEqual(code, 1)
+        interrupted = self.ledger.create(
+            {"model": "primary", "max_tokens": 10, "messages": [{"role": "user", "content": "q"}]},
+            "primary",
+        )
+        self.ledger.interrupt(interrupted, "timed out", output="x")
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("LLMBRIDGE_HANDOFF_SECRET", "LLMBRIDGE_API_KEY")}
+        with patch.dict(os.environ, clean, clear=True):
+            code, _ = self._run("handoff", interrupted.id)
+        self.assertEqual(code, 1)
+        code, _ = self._run("handoff", "gen_missing")
+        self.assertEqual(code, 1)
+
+    def test_handoff_to_posts_the_token_to_another_bridge(self):
+        record = self.ledger.create(
+            {"model": "primary", "max_tokens": 10, "messages": [{"role": "user", "content": "q"}]},
+            "primary",
+        )
+        self.ledger.interrupt(record, "timed out", output="partial text")
+
+        class _Resp:
+            headers = {"X-LLMBridge-Generation": "gen_onb"}
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return b'{"content":[{"type":"text","text":"done"}]}'
+
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value"}):
+            with patch("llmbridge.cli.urlopen", return_value=_Resp()) as call:
+                code, rendered = self._run(
+                    "handoff", record.id,
+                    "--to", "http://bridge-b:8787/", "--model", "backup", "--max-tokens", "50",
+                )
+        self.assertEqual(code, 0)
+        sent = call.call_args.args[0]
+        self.assertEqual(sent.full_url, "http://bridge-b:8787/v1/interrupted/resume")
+        body = json.loads(sent.data)
+        self.assertIn("handoff_token", body)
+        self.assertEqual(body["model"], "backup")
+        self.assertEqual(body["max_tokens"], 50)
+        self.assertIn("done", rendered)
+
+    def test_stats_prints_hint_effect_when_both_sides_have_data(self):
+        def seam(hinted, restarted):
+            record = self._completed()
+            self.ledger.heal_seam(
+                record, from_model="primary", to_model="backup", seam_at=3,
+                audit={"continuation_chars": 9, "overlap_chars": 0, "overlap_ratio": 0.0,
+                       "duplicated": False, "restarted": restarted, "suspect": restarted,
+                       "hinted": hinted},
+            )
+        seam(False, True)
+        seam(False, False)
+        seam(True, False)
+        code, rendered = self._run("stats")
+        self.assertEqual(code, 0)
+        self.assertIn("Heal hint (restart rate, hinted vs not):", rendered)
+        self.assertIn("backup: 0% over 1 vs 50% over 2 (delta -50%)", rendered)
 
     def test_status_counts_heals_and_lists_suspect_seams(self):
         clean = self._completed(prompt="clean prompt")

@@ -130,6 +130,20 @@ def build_parser() -> argparse.ArgumentParser:
     fork.add_argument("--base-url", help="Bridge base URL (default http://127.0.0.1:8787)")
     fork.add_argument("--api-key", help="Bridge API key (or LLMBRIDGE_API_KEY)")
 
+    handoff = subparsers.add_parser(
+        "handoff",
+        help="Print a signed token that lets another bridge resume an interrupted generation",
+    )
+    handoff.add_argument("id", help="Interrupted generation id, e.g. gen_1a2b3c4d5e6f")
+    handoff.add_argument("--ledger", help="Path to the generation ledger directory")
+    handoff.add_argument(
+        "--to", metavar="URL",
+        help="Send the token straight to another bridge's /v1/interrupted/resume",
+    )
+    handoff.add_argument("--model", help="With --to: alias on the receiving bridge to continue on")
+    handoff.add_argument("--max-tokens", type=int, help="With --to: token limit for the continuation")
+    handoff.add_argument("--api-key", help="With --to: the receiving bridge's client API key")
+
     tree = subparsers.add_parser(
         "tree", help="Show a generation's fork lineage (ancestors and children)"
     )
@@ -394,6 +408,19 @@ def _stats(args: argparse.Namespace) -> int:
             f"  {heals['unconsolidated']} audit(s) not yet consolidated: "
             "run `llmbridge audit`"
         )
+    effect = heals.get("hint_effect") or {}
+    rows = [
+        (model, sides) for model, sides in sorted(effect.items())
+        if sides["hinted"]["samples"] and sides["unhinted"]["samples"]
+    ]
+    if rows:
+        print("Heal hint (restart rate, hinted vs not):")
+        for model, sides in rows:
+            h, u = sides["hinted"], sides["unhinted"]
+            print(
+                f"  {model}: {h['restart_rate']:.0%} over {h['samples']} vs "
+                f"{u['restart_rate']:.0%} over {u['samples']} (delta {sides['delta']:+.0%})"
+            )
     return 0
 
 
@@ -508,6 +535,72 @@ def _fork(args: argparse.Namespace) -> int:
 def _describe(record) -> str:
     preview = (record.prompt or "")[:48].replace("\n", " ")
     return f"{record.id} ({record.status}, {record.model}) {preview!r}"
+
+
+def _handoff(args: argparse.Namespace) -> int:
+    from .server import _handoff_secret, mint_handoff_token
+
+    ledger = GenerationLedger(getattr(args, "ledger", None))
+    record = ledger.load(args.id)
+    if record is None:
+        print(f"error: generation {args.id} not found", file=sys.stderr)
+        return 1
+    if record.status != "interrupted" or not record.output:
+        print(
+            f"error: {args.id} is {record.status} with {len(record.output or '')} chars of "
+            "output; only interrupted work with saved text can be handed off",
+            file=sys.stderr,
+        )
+        return 1
+    secret = _handoff_secret()
+    if secret is None:
+        print(
+            "error: set LLMBRIDGE_HANDOFF_SECRET (or LLMBRIDGE_API_KEY, 16+ chars) to sign "
+            "handoff tokens; the receiving bridge must use the same value",
+            file=sys.stderr,
+        )
+        return 1
+    token = mint_handoff_token(record, secret=secret)
+    if not args.to:
+        print(token)
+        print(
+            f"# {len(record.output)} chars of {record.model} output; resume on another bridge with:\n"
+            f"#   curl -X POST <bridge>/v1/interrupted/resume -d '{{\"handoff_token\": \"...\", "
+            f"\"model\": \"<alias>\"}}'\n#   or: llmbridge handoff {record.id} --to <bridge> --model <alias>",
+            file=sys.stderr,
+        )
+        return 0
+    payload: dict[str, Any] = {"handoff_token": token}
+    if args.model:
+        payload["model"] = args.model
+    if args.max_tokens is not None:
+        payload["max_tokens"] = args.max_tokens
+    headers = {"Content-Type": "application/json"}
+    api_key = args.api_key or os.environ.get("LLMBRIDGE_API_KEY")
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    request = Request(
+        f"{args.to.rstrip('/')}/v1/interrupted/resume",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request) as response:
+            generation_id = response.headers.get("X-LLMBridge-Generation")
+            body = response.read().decode("utf-8", "replace")
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")
+        print(f"error: handoff failed (HTTP {error.code}): {detail}", file=sys.stderr)
+        error.close()
+        return 1
+    except URLError as error:
+        print(f"error: could not reach {args.to}: {error.reason}", file=sys.stderr)
+        return 1
+    print(body)
+    if generation_id:
+        print(f"# continued on {args.to} as {generation_id}", file=sys.stderr)
+    return 0
 
 
 def _tree(args: argparse.Namespace) -> int:
@@ -1225,7 +1318,9 @@ def _claude(args: argparse.Namespace) -> int:
         port = args.port or 8787
         base_url = f"http://{host}:{port}"
     else:
-        base_url = os.environ.get("ANTHROPIC_BASE_URL") or _DEFAULT_BASE_URL
+        # Never inherit ANTHROPIC_BASE_URL here: a stray export pointing at
+        # another gateway is exactly what this launcher exists to override.
+        base_url = os.environ.get("LLMBRIDGE_BASE_URL") or _DEFAULT_BASE_URL
     base_url = base_url.rstrip("/")
 
     api_key = (
@@ -1302,6 +1397,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": _status,
         "stats": _stats,
         "fork": _fork,
+        "handoff": _handoff,
         "tree": _tree,
         "diff": _diff,
         "replay": _replay,

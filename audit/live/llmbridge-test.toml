@@ -1,0 +1,77 @@
+# Test-only routing config for the live audit. Ports: stub 8790, bridge 8791/8792.
+# The user's real llmbridge.toml is never touched; ledger paths are set per instance.
+
+[models.ok-stub]
+base_url = "http://127.0.0.1:8790/ok/v1"
+model = "stub-model"
+
+[models.stall-stub]
+base_url = "http://127.0.0.1:8790/stall/v1"
+model = "stub-model"
+fallbacks = ["ok-stub"]
+
+[models.repeat-stub]
+base_url = "http://127.0.0.1:8790/repeat/v1"
+model = "stub-model"
+
+[models.stall-to-repeat]
+base_url = "http://127.0.0.1:8790/stall/v1"
+model = "stub-model"
+fallbacks = ["repeat-stub"]
+
+[models.stall-to-local]
+base_url = "http://127.0.0.1:8790/stall/v1"
+model = "stub-model"
+fallbacks = ["qwen-local"]
+
+[models.fail-stub]
+base_url = "http://127.0.0.1:8790/fail/v1"
+model = "stub-model"
+fallbacks = ["ok-stub"]
+
+[models.noloop-stub]
+base_url = "http://127.0.0.1:8790/fail/v1"
+model = "stub-model"
+
+[models.tool-stub]
+base_url = "http://127.0.0.1:8790/tool/v1"
+model = "stub-model"
+
+[models.slow-stub]
+base_url = "http://127.0.0.1:8790/slow/v1"
+model = "stub-model"
+
+[models.echo-stub]
+base_url = "http://127.0.0.1:8790/echo/v1"
+model = "stub-model"
+
+[models.qwen-local]
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3:8b"
+
+[models.spark-local]
+base_url = "http://127.0.0.1:11434/v1"
+model = "claude-sonnet-4-5:latest"
+
+[models.toolok-stub]
+base_url = "http://127.0.0.1:8790/toolok/v1"
+model = "stub-model"
+
+[models.toolstall-stub]
+base_url = "http://127.0.0.1:8790/toolstall/v1"
+model = "stub-model"
+fallbacks = ["toolok-stub"]
+
+[models.slow-then-ok]
+base_url = "http://127.0.0.1:8790/slow/v1"
+model = "stub-model"
+fallbacks = ["ok-stub"]
+
+[models.restart-stub]
+base_url = "http://127.0.0.1:8790/restart/v1"
+model = "stub-model"
+
+[models.stall-to-restart]
+base_url = "http://127.0.0.1:8790/stall/v1"
+model = "stub-model"
+fallbacks = ["restart-stub"]

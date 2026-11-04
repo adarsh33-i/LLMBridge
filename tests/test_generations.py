@@ -85,6 +85,39 @@ class _StreamScript:
             raise self._fail
 
 
+class _DelayedStream:
+    """Opens at once but waits ``delay`` seconds before its first line.
+
+    Models a provider whose connection is accepted immediately while the
+    first token is slow. ``closed`` records whether the bridge cancelled it.
+    """
+
+    def __init__(self, delay: float, lines: list[bytes]):
+        self._delay = delay
+        self._lines = list(lines)
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        return False
+
+    def close(self):
+        self.closed = True
+
+    def __iter__(self):
+        waited = 0.0
+        while waited < self._delay and not self.closed:
+            time.sleep(0.02)
+            waited += 0.02
+        if self.closed:
+            return
+        for line in self._lines:
+            yield line
+
+
 class GenerationServerTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -843,6 +876,75 @@ def _continuation(text="lo world"):
     )
 
 
+def _tool_delta(index, *, call_id=None, name=None, arguments=None, finish=None):
+    call = {"index": index, "function": {}}
+    if call_id is not None:
+        call["id"] = call_id
+    if name is not None:
+        call["function"]["name"] = name
+    if arguments is not None:
+        call["function"]["arguments"] = arguments
+    choice = {"delta": {"tool_calls": [call]}, "finish_reason": finish}
+    return b"data: " + json.dumps({"choices": [choice]}).encode() + b"\n"
+
+
+def _broken_in_tool_call():
+    """Text, then a tool call whose arguments are cut off by a stream error."""
+    return _StreamScript(
+        [
+            b'data: {"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}\n',
+            _tool_delta(0, call_id="call_1", name="bash", arguments='{"cmd":'),
+            b'data: {"error": {"message": "connection reset"}}\n',
+        ]
+    )
+
+
+def _two_tool_calls_second_cut():
+    return _StreamScript(
+        [
+            _tool_delta(0, call_id="call_1", name="read_file", arguments='{"path": "a.txt"}'),
+            _tool_delta(1, call_id="call_2", name="bash", arguments='{"cm'),
+            b'data: {"error": {"message": "connection reset"}}\n',
+        ]
+    )
+
+
+def _tool_continuation(name="bash", call_id="call_fb"):
+    """A fallback that issues one complete tool call and stops with tool_calls."""
+    return _StreamScript(
+        [
+            _tool_delta(0, call_id=call_id, name=name, arguments='{"cmd": '),
+            _tool_delta(0, arguments='"ls -la"}'),
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":6}}\n',
+        ]
+    )
+
+
+def _broken_right_after_tool_open():
+    """Tool block opened (id + name) and the socket dies before any argument byte."""
+    return _StreamScript(
+        [
+            _tool_delta(0, call_id="call_1", name="bash", arguments=""),
+            b'data: {"error": {"message": "connection reset"}}\n',
+        ]
+    )
+
+
+def _failing_after_open_stream():
+    """Opens fine, then errors on the first read: a primary that dies late."""
+    return _StreamScript([], fail=TimeoutError())
+
+
+def _healthy_tool_stream():
+    return _StreamScript(
+        [
+            _tool_delta(0, call_id="call_ok", name="find", arguments='{"path":'),
+            _tool_delta(0, arguments=' "."}'),
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":4}}\n',
+        ]
+    )
+
+
 def _sse_events(payload) -> list[dict]:
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8", "replace")
@@ -905,6 +1007,13 @@ class HealServerTests(QueueServerTests):
         self.assertEqual(kinds.count("message_start"), 1)
         self.assertEqual(kinds[-1], "message_stop")
 
+        # The client must be told the text block ended before the message does,
+        # or a strict stream parser never commits the healed text.
+        self.assertIn("content_block_stop", kinds)
+        self.assertLess(
+            kinds.index("content_block_stop"), kinds.index("message_delta")
+        )
+
         text = "".join(
             event["delta"]["text"]
             for event in events
@@ -927,6 +1036,599 @@ class HealServerTests(QueueServerTests):
         second_request = upstream_calls.call_args_list[1][0][0]
         body = json.loads(second_request.data)
         self.assertEqual(body["messages"][-1], {"role": "assistant", "content": "Hel"})
+
+    def test_tool_block_interruption_is_not_healed_when_tool_heal_is_off(self):
+        # With tool-call healing disabled a stream that dies mid tool call must
+        # not be continued with text: fail, save, and let the client retry.
+        with patch.dict(os.environ, {"LLMBRIDGE_HEAL_TOOL_CALLS": "0"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_in_tool_call(), _continuation()],
+            ) as upstream_calls:
+                status, headers, payload = self._call(
+                    "POST", "/v1/messages", self._message()
+                )
+
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        kinds = [event.get("type") for event in events]
+        self.assertEqual(kinds[-1], "error")
+        self.assertNotIn("message_stop", kinds)
+        self.assertEqual(upstream_calls.call_count, 1)
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertEqual(record.status, "interrupted")
+        self.assertFalse([event for event in record.events if event.type == "heal"])
+
+    def test_tool_call_cut_mid_arguments_is_finished_by_the_fallback(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_in_tool_call(), _tool_continuation()],
+        ) as upstream_calls:
+            status, headers, payload = self._call(
+                "POST", "/v1/messages", self._message()
+            )
+
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        kinds = [event.get("type") for event in events]
+        self.assertNotIn("error", kinds)
+        self.assertEqual(kinds.count("message_start"), 1)
+        self.assertEqual(kinds[-1], "message_stop")
+
+        # Exactly one tool_use block reached the client, whole, with valid JSON,
+        # and it is the fallback's call, not the half-written one.
+        starts = [e for e in events if e.get("type") == "content_block_start"]
+        tool_starts = [e for e in starts if e["content_block"]["type"] == "tool_use"]
+        self.assertEqual(len(tool_starts), 1)
+        tool_index = tool_starts[0]["index"]
+        self.assertEqual(tool_starts[0]["content_block"]["id"], "call_fb")
+        self.assertEqual(tool_starts[0]["content_block"]["name"], "bash")
+        args = "".join(
+            e["delta"]["partial_json"]
+            for e in events
+            if e.get("type") == "content_block_delta"
+            and e.get("index") == tool_index
+            and e["delta"].get("type") == "input_json_delta"
+        )
+        self.assertEqual(json.loads(args), {"cmd": "ls -la"})
+        # The half-written '{"cmd":' never reached the client.
+        self.assertNotIn('"partial_json": "{\\"cmd\\":"', payload if isinstance(payload, str) else payload.decode())
+        # Text the first model wrote stays, and the block indices are coherent.
+        text = "".join(
+            e["delta"]["text"] for e in events
+            if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta"
+        )
+        self.assertEqual(text, "Hel")
+        stops = [e["index"] for e in events if e.get("type") == "content_block_stop"]
+        self.assertEqual(sorted(stops), sorted({e["index"] for e in starts}))
+        message_delta = next(e for e in events if e.get("type") == "message_delta")
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+
+        # The fallback was told what was cut and asked to finish it.
+        second = json.loads(upstream_calls.call_args_list[1][0][0].data)
+        system_text = next(m["content"] for m in second["messages"] if m["role"] == "system")
+        self.assertIn("`bash`", system_text)
+        self.assertIn('{"cmd":', system_text)
+        self.assertEqual(second["messages"][-1], {"role": "assistant", "content": "Hel"})
+
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertEqual(record.status, "completed")
+        heal = next(e for e in record.events if e.type == "heal")
+        self.assertEqual(heal.data["reason"], "tool_call")
+        self.assertEqual(heal.data["tool"]["cut"], [{"name": "bash", "json_chars": 7}])
+        seam = next(e for e in record.events if e.type == "heal_seam")
+        self.assertTrue(seam.data["tool_call"])
+        self.assertTrue(seam.data["tool_finished"])
+        self.assertEqual(seam.data["tool_issued"], ["bash"])
+        self.assertFalse(seam.data["suspect"])
+
+    def test_completed_tool_calls_are_released_before_the_cut_one_is_healed(self):
+        # First model finishes call_1 (read_file) then dies inside call_2.
+        # call_1 must reach the client under its own id; call_2 comes from the
+        # fallback; the fallback is told not to repeat call_1.
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_two_tool_calls_second_cut(), _tool_continuation()],
+        ) as upstream_calls:
+            status, headers, payload = self._call(
+                "POST", "/v1/messages", self._message()
+            )
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        self.assertNotIn("error", [e.get("type") for e in events])
+        tool_starts = [
+            e for e in events
+            if e.get("type") == "content_block_start" and e["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual([t["content_block"]["id"] for t in tool_starts], ["call_1", "call_fb"])
+        self.assertEqual([t["content_block"]["name"] for t in tool_starts], ["read_file", "bash"])
+        indices = [t["index"] for t in tool_starts]
+        self.assertEqual(len(set(indices)), 2)
+        for t in tool_starts:
+            args = "".join(
+                e["delta"]["partial_json"] for e in events
+                if e.get("type") == "content_block_delta" and e.get("index") == t["index"]
+            )
+            self.assertIsInstance(json.loads(args), dict)
+        system_text = next(
+            m["content"] for m in json.loads(upstream_calls.call_args_list[1][0][0].data)["messages"]
+            if m["role"] == "system"
+        )
+        self.assertIn("read_file id=call_1", system_text)
+        record = self.ledger.load(self._generation_id(headers))
+        heal = next(e for e in record.events if e.type == "heal")
+        self.assertEqual(heal.data["tool"]["issued"], [{"id": "call_1", "name": "read_file"}])
+        self.assertEqual(heal.data["tool"]["cut"][0]["name"], "bash")
+
+    def test_tool_heal_flags_a_fallback_that_called_the_wrong_tool(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_in_tool_call(), _tool_continuation(name="grep", call_id="call_x")],
+        ):
+            status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        self.assertNotIn("error", [e.get("type") for e in _sse_events(payload)])
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertEqual(record.status, "completed")
+        seam = next(e for e in record.events if e.type == "heal_seam")
+        self.assertFalse(seam.data["tool_finished"])
+        self.assertTrue(seam.data["suspect"])
+        self.assertEqual(seam.data["tool_expected"], ["bash"])
+        self.assertEqual(seam.data["tool_issued"], ["grep"])
+
+    def test_tool_call_cut_before_any_argument_is_reissued_not_released(self):
+        # Audit finding: an empty argument string must not count as a complete
+        # call. The client must never receive call_1 with input {}.
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_right_after_tool_open(), _tool_continuation()],
+        ) as upstream_calls:
+            status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        self.assertNotIn("error", [e.get("type") for e in events])
+        tool_starts = [
+            e for e in events
+            if e.get("type") == "content_block_start" and e["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual([t["content_block"]["id"] for t in tool_starts], ["call_fb"])
+        system_text = next(
+            m["content"] for m in json.loads(upstream_calls.call_args_list[1][0][0].data)["messages"]
+            if m["role"] == "system"
+        )
+        self.assertIn("stopped while beginning a call to tool `bash`", system_text)
+        self.assertNotIn("already issued", system_text)
+        record = self.ledger.load(self._generation_id(headers))
+        heal = next(e for e in record.events if e.type == "heal")
+        self.assertEqual(heal.data["tool"]["issued"], [])
+        self.assertEqual(heal.data["tool"]["cut"], [{"name": "bash", "json_chars": 0}])
+
+    def test_shadow_streams_the_fallback_as_soon_as_the_primary_dies(self):
+        # Audit finding: primary opens, delay elapses, shadow is started, then
+        # the primary errors. The shadow must carry the stream without waiting
+        # for the upstream timeout even though it is slow to its first token.
+        slow_primary = _DelayedStream(delay=0.3, lines=[])  # opens, says nothing, then EOF -> error
+        slow_shadow = _DelayedStream(
+            delay=0.6,
+            lines=[
+                b'data: {"choices":[{"delta":{"content":"eventually"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}\n',
+            ],
+        )
+
+        def pick(request, timeout=None):
+            return slow_primary if "primary.test" in request.full_url else slow_shadow
+
+        started = time.monotonic()
+        with patch.dict(os.environ, {
+            "LLMBRIDGE_SHADOW_AFTER_SECONDS": "0.1",
+            "LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS": "20",
+        }):
+            with patch("llmbridge.server.urlopen", side_effect=pick):
+                status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        elapsed = time.monotonic() - started
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        self.assertNotIn("error", [e.get("type") for e in events])
+        text = "".join(
+            e["delta"]["text"] for e in events if e.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "eventually")
+        self.assertLess(elapsed, 5.0, f"waited {elapsed:.1f}s: race did not hand off on primary death")
+        shadow = next(e for e in self.ledger.load(self._generation_id(headers)).events if e.type == "shadow")
+        self.assertEqual(shadow.data["reason"], "primary_failed")
+        self.assertTrue(shadow.data["loser_sent"])
+
+    def test_shadow_event_records_whether_the_loser_was_opened(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_SHADOW_AFTER_SECONDS": "1"}):
+            with patch("llmbridge.server.urlopen", return_value=_continuation("quick")):
+                status, headers, _ = self._call("POST", "/v1/messages", self._message())
+        shadow = next(e for e in self.ledger.load(self._generation_id(headers)).events if e.type == "shadow")
+        self.assertFalse(shadow.data["loser_sent"])
+
+    def test_tool_heal_whose_fallback_breaks_is_saved_and_reported(self):
+        # The fallback accepts the turn, then dies too. The client gets a typed
+        # error (not a silent half message), the record is interrupted with the
+        # text so far, and a heal event shows the attempt was made.
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_in_tool_call(), _broken_after_text()],
+        ):
+            status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        kinds = [e.get("type") for e in events]
+        self.assertEqual(kinds[-1], "error")
+        self.assertNotIn("message_stop", kinds)
+        self.assertIn("Interrupted work was saved", events[-1]["error"]["message"])
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertEqual(record.status, "interrupted")
+        self.assertEqual(record.output, "HelHel")  # first model's text + fallback's 'Hel' before it broke
+        self.assertEqual([e.type for e in record.events if e.type == "heal"], ["heal"])
+        self.assertEqual(self.ledger.interrupted()[0].id, record.id)
+
+    def test_tool_blocks_are_delivered_whole_on_a_healthy_stream(self):
+        # Holding tool events must not change a healthy stream's content: the
+        # client still gets start, full arguments, stop, in that order.
+        with patch("llmbridge.server.urlopen", return_value=_healthy_tool_stream()):
+            status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        kinds = [e.get("type") for e in events]
+        self.assertNotIn("error", kinds)
+        start = next(e for e in events if e.get("type") == "content_block_start" and e["content_block"]["type"] == "tool_use")
+        args = "".join(
+            e["delta"]["partial_json"] for e in events
+            if e.get("type") == "content_block_delta" and e.get("index") == start["index"]
+        )
+        self.assertEqual(json.loads(args), {"path": "."})
+        self.assertLess(kinds.index("content_block_start"), kinds.index("content_block_stop"))
+        self.assertEqual(self.ledger.load(self._generation_id(headers)).status, "completed")
+
+    def _seed_seam(self, to_model: str, suspect: bool, from_model: str = "nemotron"):
+        """Write one scored seam into the digest for from_model -> to_model."""
+        record = self.ledger.create(self._message(), from_model)
+        self.ledger.heal(record, from_model=from_model, to_model=to_model, resumed_chars=3)
+        self.ledger.heal_seam(
+            record,
+            from_model=from_model,
+            to_model=to_model,
+            seam_at=3,
+            audit={
+                "continuation_chars": 8,
+                "overlap_chars": 20 if suspect else 0,
+                "overlap_ratio": 0.5 if suspect else 0.0,
+                "duplicated": suspect,
+                "restarted": False,
+                "suspect": suspect,
+            },
+        )
+        self.ledger.complete(record, "x", 1)
+        self.ledger.consolidate()
+
+    def _three_route_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = LLMBridgeServer(
+            ("127.0.0.1", 0),
+            LLMBridgeHandler,
+            {
+                "nemotron": ModelRoute(
+                    "http://primary.test/v1",
+                    model="nvidia/nemotron",
+                    api_key_env="LLMBRIDGE_TEST_API_KEY",
+                    fallbacks=("backup", "second"),
+                ),
+                "backup": ModelRoute("http://backup.test/v1", model="backup-model"),
+                "second": ModelRoute("http://second.test/v1", model="second-model"),
+            },
+            work_tracker=self.tracker,
+            ledger=self.ledger,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.thread.join, 2)
+
+    def test_adaptive_fallbacks_prefer_the_better_scored_route(self):
+        self._three_route_server()
+        for _ in range(3):
+            self._seed_seam("backup-model", suspect=True)
+            self._seed_seam("second-model", suspect=False)
+        with patch.dict(os.environ, {"LLMBRIDGE_ADAPTIVE_FALLBACKS": "1"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_after_text(), _continuation()],
+            ) as upstream_calls:
+                status, headers, payload = self._call(
+                    "POST", "/v1/messages", self._message()
+                )
+        self.assertEqual(status, 200)
+        urls = [c.args[0].full_url for c in upstream_calls.call_args_list]
+        self.assertEqual(urls[1], "http://second.test/v1/chat/completions")
+        record = self.ledger.load(self._generation_id(headers))
+        heal = next(e for e in record.events if e.type == "heal")
+        self.assertEqual(heal.data["to_model"], "second-model")
+        order = heal.data["order"]
+        self.assertEqual([o["model"] for o in order], ["second-model", "backup-model"])
+        self.assertTrue(all(o["trusted"] for o in order))
+        self.assertEqual(order[0]["suspect_rate"], 0.0)
+        self.assertEqual(order[1]["suspect_rate"], 1.0)
+
+    def test_adaptive_fallbacks_keep_config_order_without_evidence(self):
+        self._three_route_server()
+        self._seed_seam("backup-model", suspect=True)
+        self._seed_seam("backup-model", suspect=True)
+        with patch.dict(os.environ, {"LLMBRIDGE_ADAPTIVE_FALLBACKS": "1"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_after_text(), _continuation()],
+            ) as upstream_calls:
+                status, headers, _ = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        urls = [c.args[0].full_url for c in upstream_calls.call_args_list]
+        self.assertEqual(urls[1], "http://backup.test/v1/chat/completions")
+        heal = next(
+            e for e in self.ledger.load(self._generation_id(headers)).events
+            if e.type == "heal"
+        )
+        self.assertEqual([o["model"] for o in heal.data["order"]], ["backup-model", "second-model"])
+        self.assertFalse(heal.data["order"][0]["trusted"])
+
+    def test_adaptive_fallbacks_off_by_default(self):
+        self._three_route_server()
+        for _ in range(3):
+            self._seed_seam("backup-model", suspect=True)
+            self._seed_seam("second-model", suspect=False)
+        clean = {k: v for k, v in os.environ.items() if k != "LLMBRIDGE_ADAPTIVE_FALLBACKS"}
+        with patch.dict(os.environ, clean, clear=True), patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_after_text(), _continuation()],
+        ) as upstream_calls:
+            status, headers, _ = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        urls = [c.args[0].full_url for c in upstream_calls.call_args_list]
+        self.assertEqual(urls[1], "http://backup.test/v1/chat/completions")
+        heal = next(
+            e for e in self.ledger.load(self._generation_id(headers)).events
+            if e.type == "heal"
+        )
+        self.assertNotIn("order", heal.data)
+
+    def test_shadow_race_lets_the_fallback_win_when_primary_stalls(self):
+        slow_primary = _DelayedStream(
+            delay=2.0,
+            lines=[
+                b'data: {"choices":[{"delta":{"content":"late"},"finish_reason":null}]}\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}\n',
+            ],
+        )
+        fast_shadow = _continuation("fast answer")
+
+        def pick(request, timeout=None):
+            return slow_primary if "primary.test" in request.full_url else fast_shadow
+
+        with patch.dict(os.environ, {"LLMBRIDGE_SHADOW_AFTER_SECONDS": "0.1"}):
+            with patch("llmbridge.server.urlopen", side_effect=pick) as upstream_calls:
+                status, headers, payload = self._call(
+                    "POST", "/v1/messages", self._message()
+                )
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        kinds = [event.get("type") for event in events]
+        self.assertNotIn("error", kinds)
+        self.assertEqual(kinds.count("message_start"), 1)
+        text = "".join(
+            e["delta"]["text"] for e in events if e.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "fast answer")
+        self.assertTrue(slow_primary.closed, "the losing primary must be closed")
+        urls = sorted(c.args[0].full_url for c in upstream_calls.call_args_list)
+        self.assertEqual(
+            urls,
+            ["http://backup.test/v1/chat/completions", "http://primary.test/v1/chat/completions"],
+        )
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertEqual(record.status, "completed")
+        self.assertEqual(record.output, "fast answer")
+        shadow = next(e for e in record.events if e.type == "shadow")
+        self.assertEqual(shadow.data["winner"], "backup-model")
+        self.assertEqual(shadow.data["loser"], "nvidia/nemotron")
+        self.assertEqual(shadow.data["reason"], "shadow_first_token")
+        self.assertTrue(shadow.data["raced"])
+        self.assertFalse([e for e in record.events if e.type == "heal"])
+
+    def test_shadow_race_never_opens_the_fallback_when_primary_is_fast(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_SHADOW_AFTER_SECONDS": "1"}):
+            with patch(
+                "llmbridge.server.urlopen", return_value=_continuation("quick")
+            ) as upstream_calls:
+                status, headers, payload = self._call(
+                    "POST", "/v1/messages", self._message()
+                )
+        self.assertEqual(status, 200)
+        self.assertEqual(upstream_calls.call_count, 1)
+        text = "".join(
+            e["delta"]["text"]
+            for e in _sse_events(payload)
+            if e.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "quick")
+        record = self.ledger.load(self._generation_id(headers))
+        shadow = next(e for e in record.events if e.type == "shadow")
+        self.assertEqual(shadow.data["reason"], "primary_first_token")
+        self.assertIsNone(shadow.data["loser"])
+        self.assertFalse(shadow.data["raced"])
+
+    def test_shadow_winner_can_still_heal_if_it_breaks_later(self):
+        self._three_route_server()
+        slow_primary = _DelayedStream(delay=2.0, lines=[])
+        broken_shadow = _broken_after_text()
+        third = _continuation("lo world")
+
+        def pick(request, timeout=None):
+            if "primary.test" in request.full_url:
+                return slow_primary
+            if "backup.test" in request.full_url:
+                return broken_shadow
+            return third
+
+        with patch.dict(os.environ, {"LLMBRIDGE_SHADOW_AFTER_SECONDS": "0.1"}):
+            with patch("llmbridge.server.urlopen", side_effect=pick):
+                status, headers, payload = self._call(
+                    "POST", "/v1/messages", self._message()
+                )
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        self.assertNotIn("error", [e.get("type") for e in events])
+        text = "".join(
+            e["delta"]["text"] for e in events if e.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "Hello world")
+        record = self.ledger.load(self._generation_id(headers))
+        kinds = [e.type for e in record.events]
+        self.assertIn("shadow", kinds)
+        self.assertIn("heal", kinds)
+        heal = next(e for e in record.events if e.type == "heal")
+        self.assertEqual(heal.data["to_model"], "second-model")
+
+    def test_shadow_is_off_by_default(self):
+        clean = {k: v for k, v in os.environ.items() if k != "LLMBRIDGE_SHADOW_AFTER_SECONDS"}
+        with patch.dict(os.environ, clean, clear=True), patch(
+            "llmbridge.server.urlopen", return_value=_continuation("plain")
+        ) as upstream_calls:
+            status, headers, _ = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        self.assertEqual(upstream_calls.call_count, 1)
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertNotIn("shadow", [e.type for e in record.events])
+
+    def test_heal_hint_is_off_by_default_and_recorded_when_on(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_after_text(), _continuation()],
+        ) as calls:
+            status, headers, _ = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        second = json.loads(calls.call_args_list[1][0][0].data)
+        self.assertFalse(any(m["role"] == "system" for m in second["messages"]))
+        record = self.ledger.load(self._generation_id(headers))
+        heal = next(e for e in record.events if e.type == "heal")
+        seam = next(e for e in record.events if e.type == "heal_seam")
+        self.assertFalse(heal.data["hinted"])
+        self.assertFalse(seam.data["hinted"])
+
+        with patch.dict(os.environ, {"LLMBRIDGE_HEAL_HINT": "1"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_after_text(), _continuation()],
+            ) as calls:
+                status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        second = json.loads(calls.call_args_list[1][0][0].data)
+        system_text = next(m["content"] for m in second["messages"] if m["role"] == "system")
+        self.assertIn("do not restate", system_text)
+        # The hint is sent upstream only; the client's text is unchanged.
+        text = "".join(
+            e["delta"]["text"] for e in _sse_events(payload) if e.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "Hello world")
+        record = self.ledger.load(self._generation_id(headers))
+        self.assertTrue(next(e for e in record.events if e.type == "heal").data["hinted"])
+        self.assertTrue(next(e for e in record.events if e.type == "heal_seam").data["hinted"])
+
+    def test_heal_hint_keeps_an_existing_system_prompt(self):
+        body = {**self._message(), "system": "Be terse."}
+        with patch.dict(os.environ, {"LLMBRIDGE_HEAL_HINT": "1"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_after_text(), _continuation()],
+            ) as calls:
+                status, _, _ = self._call("POST", "/v1/messages", body)
+        self.assertEqual(status, 200)
+        second = json.loads(calls.call_args_list[1][0][0].data)
+        system_text = next(m["content"] for m in second["messages"] if m["role"] == "system")
+        self.assertTrue(system_text.startswith("Be terse."))
+        self.assertIn("do not restate", system_text)
+
+    def test_hint_effect_splits_restart_rate_by_hinted(self):
+        def seam(hinted, restarted):
+            record = self.ledger.create(self._message(), "nemotron")
+            self.ledger.heal_seam(
+                record, from_model="nemotron", to_model="backup-model", seam_at=3,
+                audit={"continuation_chars": 9, "overlap_chars": 0, "overlap_ratio": 0.0,
+                       "duplicated": False, "restarted": restarted, "suspect": restarted,
+                       "hinted": hinted},
+            )
+            self.ledger.complete(record, "x", 1)
+        for _ in range(2):
+            seam(False, True)
+        seam(False, False)
+        seam(True, False)
+        seam(True, False)
+        legacy = self.ledger.create(self._message(), "nemotron")  # pre-hint seam: no field
+        self.ledger.heal_seam(
+            legacy, from_model="nemotron", to_model="backup-model", seam_at=3,
+            audit={"continuation_chars": 9, "overlap_chars": 0, "overlap_ratio": 0.0,
+                   "duplicated": False, "restarted": True, "suspect": True},
+        )
+        self.ledger.complete(legacy, "x", 1)
+        effect = self.ledger.hint_effect()["backup-model"]
+        self.assertEqual(effect["unhinted"]["samples"], 4)
+        self.assertEqual(effect["unhinted"]["restart_rate"], 0.75)
+        self.assertEqual(effect["hinted"]["samples"], 2)
+        self.assertEqual(effect["hinted"]["restart_rate"], 0.0)
+        self.assertEqual(effect["delta"], -0.75)
+        self.assertIn("hint_effect", self.ledger.stats()["heals"])
+
+    def test_seam_event_is_emitted_after_message_stop_when_enabled(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_SEAM_EVENTS": "1"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_after_text(), _continuation()],
+            ):
+                status, headers, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        raw = payload if isinstance(payload, str) else payload.decode()
+        self.assertIn("event: llmbridge_seam", raw)
+        events = _sse_events(payload)
+        kinds = [e.get("type") for e in events]
+        self.assertEqual(kinds[-2:], ["message_stop", "llmbridge_seam"])
+        seam = events[-1]
+        self.assertEqual(seam["generation_id"], self._generation_id(headers))
+        self.assertEqual(seam["from_model"], "nemotron")
+        self.assertEqual(seam["to_model"], "backup-model")
+        self.assertEqual(seam["seam_at"], 3)
+        self.assertTrue(seam["audited"])
+        self.assertFalse(seam["suspect"])
+        self.assertIn("overlap_chars", seam)
+
+    def test_seam_event_is_absent_by_default(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_broken_after_text(), _continuation()],
+        ):
+            status, _, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        raw = payload if isinstance(payload, str) else payload.decode()
+        self.assertNotIn("llmbridge_seam", raw)
+        self.assertEqual([e.get("type") for e in _sse_events(payload)][-1], "message_stop")
+
+    def test_seam_event_flags_a_suspect_tool_heal(self):
+        with patch.dict(os.environ, {"LLMBRIDGE_SEAM_EVENTS": "1"}):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=[_broken_in_tool_call(), _tool_continuation(name="grep", call_id="call_x")],
+            ):
+                status, _, payload = self._call("POST", "/v1/messages", self._message())
+        self.assertEqual(status, 200)
+        seam = _sse_events(payload)[-1]
+        self.assertEqual(seam["type"], "llmbridge_seam")
+        self.assertTrue(seam["tool_call"])
+        self.assertFalse(seam["tool_finished"])
+        self.assertTrue(seam["suspect"])
 
     def test_heal_records_a_seam_audit(self):
         with patch(

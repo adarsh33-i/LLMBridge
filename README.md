@@ -86,7 +86,7 @@ To persist on Windows across new terminals: `setx ANTHROPIC_BASE_URL "http://127
 
 For a per-project setup, put the same `"env"` block in that project's `.claude/settings.json`.
 
-Or skip the exports entirely: `llmbridge claude` launches Claude Code wired to the bridge (add `--print-env` to just see the values). It passes the URL and token as a CLI settings layer as well as environment variables: Claude Code lets a settings-pinned env outrank inherited exports, which is how a launch can look correct and still send traffic elsewhere. The CLI layer wins over every settings file.
+Or skip the exports entirely: `llmbridge claude` launches Claude Code wired to the bridge (add `--print-env` to just see the values). It ignores any `ANTHROPIC_BASE_URL` already in your shell — a stray export pointing at another gateway is exactly what it exists to override — and targets `LLMBRIDGE_BASE_URL`, `--base-url`, or `--host`/`--port` instead. It passes the URL and token as a CLI settings layer as well as environment variables: Claude Code lets a settings-pinned env outrank inherited exports, which is how a launch can look correct and still send traffic elsewhere. The CLI layer wins over every settings file.
 
 ---
 
@@ -134,6 +134,7 @@ Claude Code's Sonnet/Opus/Haiku picks land on the matching `claude-*` blocks abo
 | `api_key_env` | Env var holding the API key |
 | `reasoning_effort` | `low` \| `medium` \| `high` — enables thinking |
 | `supports_images` / `supports_tools` | Reject unsupported capabilities early |
+| `tokenizer_encoding` | tiktoken encoding for `count_tokens` (`cl100k_base`, `o200k_base`, `p50k_base`, `r50k_base`); needs the `token-count` extra |
 | `fallbacks` | Aliases to try on failure |
 | `cache_control` | `"strip"` (default) or `"passthrough"` |
 
@@ -163,7 +164,7 @@ A model alias with dots needs a quoted key, because TOML reads dots as nesting:
 | `LLMBRIDGE_HOST` | `127.0.0.1` | Bind address. Non-loopback requires `LLMBRIDGE_API_KEY` |
 | `LLMBRIDGE_PORT` | `8787` | Listen port (also settable with `--port`) |
 | `LLMBRIDGE_CONFIG` | unset | Config file path; overrides the search order above |
-| `LLMBRIDGE_BASE_URL` | `http://127.0.0.1:8787` | Which bridge URL the read-only CLI commands (`check`, `generations`, `status`, `fork`, …) talk to |
+| `LLMBRIDGE_BASE_URL` | `http://127.0.0.1:8787` | Which bridge URL the commands that talk to a running server (`fork`, `claude`) use. `status`, `stats`, `generations`, `tree`, `diff`, `audit`, `check` and `models` read the ledger and config directly and need no server |
 | `LLMBRIDGE_CLIENT_TIMEOUT_SECONDS` | `300` | How long one client request may stream |
 | `LLMBRIDGE_UPSTREAM_TIMEOUT_SECONDS` | `180` | Timeout for each upstream call |
 | `LLMBRIDGE_ROUTE_ATTEMPTS` | `1` | Tries on one route before falling through to the next fallback (max 10) |
@@ -171,7 +172,7 @@ A model alias with dots needs a quoted key, because TOML reads dots as nesting:
 | `LLMBRIDGE_DOCUMENT_ROOTS` | unset | Directories allowed as local `file:` document sources (`os.pathsep`-separated). Unset disables local file documents |
 | `LLMBRIDGE_ANTHROPIC_FILES_API_KEY` | unset | Enables document sources that reference the Anthropic Files API |
 
-Feature-specific vars (`LLMBRIDGE_SELF_HEAL`, `LLMBRIDGE_QUEUE_*`, `LLMBRIDGE_COALESCE_REQUESTS`, `LLMBRIDGE_TRACK_*`, `LLMBRIDGE_LEDGER_*`, `LLMBRIDGE_ENABLE_OCR`) are documented with their features below.
+Feature-specific vars (`LLMBRIDGE_SELF_HEAL`, `LLMBRIDGE_HEAL_TOOL_CALLS`, `LLMBRIDGE_HEAL_HINT`, `LLMBRIDGE_SEAM_EVENTS`, `LLMBRIDGE_ADAPTIVE_FALLBACKS`, `LLMBRIDGE_SHADOW_AFTER_SECONDS`, `LLMBRIDGE_AUTO_RESUME`, `LLMBRIDGE_HANDOFF_*`, `LLMBRIDGE_QUEUE_*`, `LLMBRIDGE_COALESCE_REQUESTS`, `LLMBRIDGE_TRACK_*`, `LLMBRIDGE_LEDGER_*`, `LLMBRIDGE_ENABLE_OCR`) are documented with their features below.
 
 ---
 
@@ -206,6 +207,7 @@ Real errors and what they mean:
 | `llmbridge status` | Summarize ledger, flag recoverable work |
 | `llmbridge stats` | Status counts, tokens, p50/p95 wall time, heal verdicts (`--json`) |
 | `llmbridge fork <id> --model <alias>` | Continue a generation on another model |
+| `llmbridge handoff <id> [--to <url> --model <alias>]` | Print a signed token another bridge can resume, or send it there directly |
 | `llmbridge tree <id>` | Render a fork lineage (ancestors + descendants) |
 | `llmbridge diff <idA> <idB>` | Compare two generations' outputs side by side |
 | `llmbridge replay <id>\|--all` | Re-send recorded requests; flag output drift |
@@ -225,7 +227,7 @@ Real errors and what they mean:
 | `POST` | `/v1/messages/count_tokens` | Approximate input-token estimate |
 | `GET` | `/v1/interrupted` | Newest interrupted record + `recoverable_count`, `other_recoverable` (404 if none) |
 | `GET` | `/v1/stats` | Ledger stats: statuses, tokens, wall time, heal verdicts and digest rate |
-| `POST` | `/v1/interrupted/resume` | Resume interrupted work on a model; marks the source `resumed` |
+| `POST` | `/v1/interrupted/resume` | Resume interrupted work on a model; marks the source `resumed`. Accepts `{"handoff_token": ...}` from another bridge |
 | `DELETE` | `/v1/interrupted` | Delete the newest record, returns `remaining_recoverable` |
 | `GET` | `/v1/generations` | List durable generations |
 | `GET` | `/v1/generations/{id}` | Full generation record |
@@ -298,7 +300,42 @@ The final generation record contains the full stitched output. Disable with:
 LLMBRIDGE_SELF_HEAL=0
 ```
 
-Tool-use blocks are not stitched — healing applies to text output only; without partial text or a fallback the normal interrupted-work flow applies.
+Without partial text or a fallback the normal interrupted-work flow applies. A stream that dies inside a tool call is healed too — see [Healing inside a tool call](#healing-inside-a-tool-call).
+
+### Healing inside a tool call
+
+A gateway that fails over at the request restarts the turn, so an agent mid tool call gets a different call or an error. LLMBridge finishes the same turn.
+
+While tool-call healing is on (the default, `LLMBRIDGE_HEAL_TOOL_CALLS=1`), a `tool_use` block is delivered to the client **whole, at the moment it completes**, instead of argument fragment by fragment. Clients act on a tool call only once its JSON is complete, so nothing observable changes on a healthy stream, and a model that dies mid-call has then shown the client nothing it must retract. When the stream breaks:
+
+1. Tool calls that completed before the break are released to the client under their original ids.
+2. The fallback receives the text so far as an assistant prefill plus a system addendum naming the completed calls (do not repeat), the tool that was cut off, and the argument prefix it had written. It is asked to finish that call with the same tool.
+3. The fallback's tool blocks are re-indexed above every index the client has seen and forwarded with the fallback's own ids. The bridge closes every open block and ends the message with the fallback's own stop reason, so a turn that ends in a tool call still says `tool_use`.
+4. The ledger gets a `heal` with `reason: tool_call` and which calls were cut and issued, and a `heal_seam` with `tool_call: true` and `tool_finished`. A fallback that called a different tool than the one cut off, or none, is `suspect`, and the digest carries `tool_finished` so `stats` can report it.
+
+Set `LLMBRIDGE_HEAL_TOOL_CALLS=0` to restore the previous behaviour: a break inside a tool call is interrupted and saved, never stitched.
+
+### Fallbacks ranked by evidence
+
+The config order of `fallbacks` is a guess made before any heal happened. The digest knows better: it has a scored seam for every join each fallback ever made onto this primary.
+
+```bash
+LLMBRIDGE_ADAPTIVE_FALLBACKS=1      # off by default
+LLMBRIDGE_ADAPTIVE_MIN_SAMPLES=3    # seams a fallback needs before its rate counts
+```
+
+When on, a heal orders the remaining candidates by their measured suspect rate for this primary model, lowest first. A fallback with fewer than the minimum samples keeps its config position relative to the others and sorts after every trusted one, so the chain only moves where the evidence can justify it. The order the heal chose from is written into the `heal` event (`order`: model, config position, samples, suspect rate, trusted), so every reordering is auditable. `llmbridge failover` is the offline version of the same ranking; this is the online one. The digest is the source, so pruned records still count.
+
+### Speculative shadow stream
+
+A provider that accepts the connection and then says nothing for ten seconds is a stall the normal timeout cannot tell from a slow answer. Opt in to race it:
+
+```bash
+LLMBRIDGE_SHADOW_AFTER_SECONDS=3    # 0 / unset = off
+```
+
+The primary is opened at once. If no visible token has arrived after the delay, the first fallback is opened too and whichever yields a token first carries the stream; the other is closed. The client sees one `message_start` and one model's answer. The loser's partial output is never shown, and a shadow winner that later breaks still heals onto the next candidate like any stream. Each race writes a `shadow` event (winner, loser, reason, how long the bridge waited, and `loser_sent`: whether the losing request was sent to its provider, and so billed) whether or not the fallback was actually opened, so the delay can be judged against how often it triggered and cost a second call. A primary that dies after the shadow was opened hands the stream to the shadow at once (`reason: primary_failed`) rather than waiting for the shadow's first token. Every race that opens the shadow spends a second upstream call on purpose; that is the trade the delay sets.
+
 
 ### Seam audit
 
@@ -528,6 +565,7 @@ The bridge automatically saves interrupted work when upstream fails (quota, rate
 - **Resumed**: `POST /v1/interrupted/resume` replays the work onto the model you name, with the partial output returned as an assistant turn. The interruption is kept and marked `resumed`, with a `resume` event naming the run that finished it. Deleting it would erase the only evidence that the answer needed a second try.
 - **Forked**: forking an `interrupted` generation settles it the same way — but only when the fork completes. A failed fork leaves both runs recoverable.
 - **Cleared**: `DELETE /v1/interrupted` deletes the newest record and answers with `remaining_recoverable`. This is the one place work is removed rather than marked.
+- **Picked up automatically** (opt-in, `LLMBRIDGE_AUTO_RESUME=1`): a byte-identical re-send of the request that died continues from the saved text instead of starting over. See [Automatic resume on re-send](#automatic-resume-on-re-send).
 - **Retention**: the newest 10 records, plus up to 10 recent `interrupted`/`queued` records and up to 25 suspect seam audits kept beyond that window.
 
 ```bash
@@ -543,6 +581,133 @@ Without the recoverable exemption the bridge silently stops offering work it cou
 
 One caveat on resuming: the stored partial output is **text only**. A stream that died inside a tool call keeps its text deltas and nothing else, so a resume rebuilds the conversation from the replayed request rather than from the interrupted call itself.
 
+### Telling the fallback how to continue
+
+```bash
+LLMBRIDGE_HEAL_HINT=1    # off by default
+```
+
+By default a heal hands the fallback the partial text as a bare assistant turn and lets the
+model work out that it should continue. With the hint on, the heal request also carries a
+short system addendum: continue from exactly where the text stops, do not restate or
+acknowledge the interruption. The hint goes upstream only; the client's stream is
+unchanged. Every `heal` and `heal_seam` event records `hinted`, and the digest keeps it, so
+`llmbridge stats` can answer the only question that matters about a prompt tweak: did it
+change the restart rate for this model?
+
+```bash
+llmbridge stats
+# ...
+# Heal hint (restart rate, hinted vs not):
+#   qwen3:8b: 0% over 12 vs 25% over 20 (delta -25%)
+```
+
+The line appears once a model has seams on both sides. Tool-call heals are excluded from
+the comparison, since they always carry an addendum. The default is off so the digest keeps
+accruing un-hinted samples; turn it on once you have a baseline, and leave it on if the
+delta is negative.
+
+### Telling the client how the join was scored
+
+```bash
+LLMBRIDGE_SEAM_EVENTS=1    # off by default
+```
+
+The seam audit is written for whoever reads the ledger later. An agent that just received
+a healed answer cannot see it, so it cannot decide to re-ask. With this on, every healed
+stream ends with one extra SSE event **after** `message_stop`:
+
+```
+event: llmbridge_seam
+data: {"type":"llmbridge_seam","generation_id":"gen_...","from_model":"nemotron",
+       "to_model":"qwen3:8b","seam_at":480,"audited":true,"suspect":false,
+       "duplicated":false,"restarted":false,"overlap_chars":9,"overlap_ratio":0.056,
+       "hinted":false}
+```
+
+A tool-call heal adds `tool_call`, `tool_finished` and marks the seam `suspect` when the
+fallback did not finish the call it was asked to. It is placed after `message_stop` so a
+strict Anthropic parser that stops reading there is unaffected; a client that opts in reads
+one more event. A non-streaming auto-resume reports the same verdict as a header,
+`X-LLMBridge-Seam: clean|suspect`. The event never changes the answer; it tells the client
+the answer was stitched and how well.
+
+### Moving interrupted work to another bridge
+
+Two bridges that share a secret can hand work to each other without sharing a ledger.
+
+```bash
+export LLMBRIDGE_HANDOFF_SECRET="<16+ chars, same on both bridges>"   # or LLMBRIDGE_API_KEY
+```
+
+With a secret set, `GET /v1/interrupted` and `GET /v1/generations/{id}` (for an
+`interrupted` record with saved text) include a `handoff_token`: the replayable request,
+the partial output, the source model and the fingerprint, packed and signed with
+HMAC-SHA256. Any bridge with the same secret accepts it:
+
+```bash
+# on bridge A
+llmbridge handoff gen_1a2b3c4d5e6f                      # prints the token
+# on bridge B (or from A, pointing at B)
+llmbridge handoff gen_1a2b3c4d5e6f --to http://bridge-b:8787 --model <alias-on-B>
+# the HTTP form
+curl -X POST http://bridge-b:8787/v1/interrupted/resume \
+     -d '{"handoff_token": "<token>", "model": "<alias-on-B>"}'
+```
+
+Bridge B rebuilds the conversation with the partial text as an assistant prefill, runs it
+on the named route, and records the child under the original request's fingerprint with a
+`handoff` event naming the source generation and model, so lineage is traceable across the
+two ledgers. Nothing on B is touched besides that child. The source record on A stays
+`interrupted` until something on A settles it: re-run `llmbridge status` there and
+`DELETE /v1/interrupted` or fork it once B has finished, or let auto-resume on A pick it
+up if the same request is ever re-sent there.
+
+Tokens expire after `LLMBRIDGE_HANDOFF_TTL_SECONDS` (default 24 h), are rejected if
+tampered with or over 2 MiB, and are only minted and accepted when a secret of at least 16
+characters is configured. A token is a bearer credential for one piece of work: it carries
+the prompt in clear, so send it over the same channel you would send the prompt.
+
+### Automatic resume on re-send
+
+By default a client that re-sends a request whose earlier run was interrupted pays for the
+whole answer again: the new run starts from scratch, and the old record is merely marked
+`resumed` once it completes. Opt in to have the bridge pick the work up instead:
+
+```bash
+LLMBRIDGE_AUTO_RESUME=1    # off by default
+```
+
+When a `POST /v1/messages` arrives whose **fingerprint** matches an `interrupted` record
+that saved partial text, the bridge (after joining any identical request already in flight,
+so two simultaneous re-sends share one resume when coalescing is on):
+
+1. Rebuilds the request with the saved text appended as an assistant turn, exactly as
+   `fork` does, and opens the route (primary, then its `fallbacks`) **before sending any
+   byte** to the client. If no route answers, the ordinary request path runs and reports
+   the failure the usual way; nothing is settled.
+2. Answers the client with one whole response. A streaming client gets one
+   `message_start`, the saved text as the first `content_block_delta`, then the
+   continuation in the same stream. A non-streaming client gets the saved text and the
+   continuation joined in the first text block, with `usage.output_tokens` summed.
+3. Records the continuation as a child of the interrupted record (`fork` event, parent
+   set), with a `heal` event whose `reason` is `auto_resume` and a scored `heal_seam`, so
+   `llmbridge status`, `stats`, `tree` and `audit` all see it. The source is marked
+   `resumed`. The reply carries `X-LLMBridge-Generation` (the child) and
+   `X-LLMBridge-Resumed` (the source).
+
+The match is the request's content fingerprint, the same identity coalescing and
+settlement use: a byte-identical re-send from a client timeout retry, an agent loop, or a
+second bridge sharing the ledger qualifies. A different request that shares the prompt
+never does, and an interrupted record with no saved text (a `429` before the first token)
+runs fresh. A Claude Code `continue` is a *different* request, with the partial text
+already in its history, so it is routed normally rather than resumed.
+
+The default is off on purpose. The bridge cannot tell a timeout retry from a client that
+cancelled on purpose and wants a fresh answer; turn this on where retries are the common
+case. The join is audited like any heal: a continuation that repeats or restarts the saved
+text shows up as `suspect`, and `llmbridge replay <id>` re-checks it.
+
 ---
 
 ## Compatibility & Limitations
@@ -552,11 +717,13 @@ One caveat on resuming: the stored partial output is **text only**. A stream tha
 | Messages | System, user/assistant text, images (URL/base64), documents |
 | Documents | Text, base64, public HTTP(S) URLs, local files, Anthropic Files API |
 | Tools | Definitions, choices, results, upstream tool calls → function calling |
+| Self-healing | Text and tool-call streams; fallbacks optionally ranked by measured seam quality; optional first-token race against the first fallback |
 | Streaming | OpenAI SSE → Anthropic events (`ping`, `input_tokens`, `content_filter`→`end_turn`) |
 | Token counting | Route-configured tiktoken or char-based fallback (estimate only) |
 | Thinking | Only on routes with `reasoning_effort`; `budget_tokens` not preserved |
 | Caching | Off by default (`cache_control="strip"`); `"passthrough"` forwards breakpoints |
 | Coalescing | Non-streaming only, opt-in; identity is the full request fingerprint |
+| Auto-resume | Opt-in; a re-sent interrupted request continues from its saved text, streaming or not |
 
 **Not supported**: Full Anthropic API parity, beta/newer features, preserved citations/layout/formatting in documents. OCR optional (PyMuPDF + Tesseract, 10 pages / 90s limit).
 
@@ -589,6 +756,13 @@ pip install -e ".[token-count]"
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+CI runs the same suite under pytest with coverage (the build fails below 85%):
+
+```bash
+pip install -e ".[test]"
+python -m pytest --cov=llmbridge --cov-report=term-missing
 ```
 
 ---

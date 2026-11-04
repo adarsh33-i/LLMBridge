@@ -157,6 +157,8 @@ EVENT_HEAL = "heal"
 EVENT_HEAL_SEAM = "heal_seam"
 EVENT_QUEUED = "queue"
 EVENT_RESUME = "resume"
+EVENT_SHADOW = "shadow"
+EVENT_HANDOFF = "handoff"
 
 _STATUS_RUNNING = "running"
 _STATUS_COMPLETED = "completed"
@@ -186,6 +188,9 @@ _AUDIT_FIELDS = (
     "duplicated",
     "restarted",
     "suspect",
+    "tool_call",
+    "tool_finished",
+    "hinted",
 )
 
 
@@ -654,6 +659,22 @@ class GenerationLedger:
             if record.status == _STATUS_INTERRUPTED
         ]
 
+    def resumable(self, fingerprint: str) -> Optional[GenerationRecord]:
+        """The newest interrupted record for this exact request that saved text.
+
+        Matched on the request fingerprint, never on prompt text: two
+        conversations can share a prompt, and continuing one from the other's
+        partial answer would splice two answers together. A record with no
+        saved output is skipped — there is nothing to continue from, and a
+        fresh run is the right answer for it.
+        """
+        if not fingerprint:
+            return None
+        for record in self.interrupted():
+            if record.fingerprint == fingerprint and record.output:
+                return record
+        return None
+
     def settle_running(
         self,
         message: str,
@@ -749,14 +770,93 @@ class GenerationLedger:
         from_model: str,
         to_model: str,
         resumed_chars: int,
+        reason: Optional[str] = None,
+        order: Optional[list[dict[str, Any]]] = None,
+        tool: Optional[dict[str, Any]] = None,
+        hinted: Optional[bool] = None,
     ) -> GenerationRecord:
-        """Record that a broken stream was resumed onto a fallback model."""
+        """Record that partial text was carried onto another run of a model.
+
+        ``reason`` distinguishes a mid-stream heal (the default, left unset)
+        from an automatic resume of an earlier interrupted request; both join
+        two outputs inside one answer and are audited the same way. ``order``
+        is the evidence-ranked candidate list the heal chose from, when
+        adaptive fallbacks were on, so the decision can be audited later.
+        """
+        data: dict[str, Any] = {
+            "from_model": from_model,
+            "to_model": to_model,
+            "resumed_chars": resumed_chars,
+        }
+        if reason:
+            data["reason"] = reason
+        if order:
+            data["order"] = order
+        if tool:
+            data["tool"] = tool
+        if hinted is not None:
+            data["hinted"] = bool(hinted)
+        self._append(record, EVENT_HEAL, data)
+        with self._lock:
+            self._save(record)
+        return record
+
+    def shadow(
+        self,
+        record: GenerationRecord,
+        *,
+        winner: str,
+        loser: Optional[str],
+        reason: str,
+        delay_seconds: float,
+        waited_ms: float,
+        loser_sent: bool = False,
+    ) -> GenerationRecord:
+        """Record a first-token race between the primary and a shadow fallback.
+
+        ``loser`` is None when the primary answered before the shadow was ever
+        opened; the event is still written so the delay setting can be judged
+        against how often it actually triggered a second call. ``loser_sent``
+        says whether the loser's request reached its provider, which is the
+        call that was billed for nothing.
+        """
         self._append(
             record,
-            EVENT_HEAL,
+            EVENT_SHADOW,
             {
-                "from_model": from_model,
-                "to_model": to_model,
+                "winner": winner,
+                "loser": loser,
+                "reason": reason,
+                "delay_seconds": delay_seconds,
+                "waited_ms": waited_ms,
+                "raced": loser is not None,
+                "loser_sent": bool(loser_sent),
+            },
+        )
+        with self._lock:
+            self._save(record)
+        return record
+
+    def handoff(
+        self,
+        record: GenerationRecord,
+        *,
+        source_generation: Optional[str],
+        source_model: Optional[str],
+        resumed_chars: int,
+    ) -> GenerationRecord:
+        """Record that this generation continues work handed off from another bridge.
+
+        The source record is not in this ledger, so the event carries what is
+        known about it: its id on the other bridge, the model that was running
+        it, and how much text was carried across.
+        """
+        self._append(
+            record,
+            EVENT_HANDOFF,
+            {
+                "source_generation": source_generation,
+                "source_model": source_model,
                 "resumed_chars": resumed_chars,
             },
         )
@@ -785,6 +885,7 @@ class GenerationLedger:
         )
         with self._lock:
             self._save(record)
+        self.invalidate_quality_cache()
         return record
 
     @staticmethod
@@ -873,6 +974,65 @@ class GenerationLedger:
                     os.fsync(handle.fileno())
         return found, len(fresh)
 
+    _QUALITY_CACHE_SECONDS = 30.0
+
+    def fallback_quality(
+        self, from_model: str, *, min_samples: int = 3
+    ) -> dict[str, dict[str, Any]]:
+        """How well each fallback has joined onto ``from_model``, from the digest.
+
+        Keyed by the upstream model that carried the continuation. Each entry
+        has ``samples``, ``suspect`` and ``suspect_rate``; a model with fewer
+        than ``min_samples`` seams is still listed but marked ``trusted=False``
+        so a caller never reorders a chain on one lucky join. The digest is the
+        source, not the records, so pruned history still counts.
+
+        The scan is cached for a short window: a heal runs on the request
+        thread while the client holds a broken stream, and re-reading the whole
+        digest plus every record on each one is work that cannot change the
+        answer within the same half minute.
+        """
+        now = time.monotonic()
+        cache = getattr(self, "_quality_cache", None)
+        if cache is not None and now - cache[0] < self._QUALITY_CACHE_SECONDS:
+            entries = cache[1]
+        else:
+            entries = self._seam_entries()
+            self._quality_cache = (now, entries)
+        quality: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if entry.get("from_model") != from_model:
+                continue
+            to_model = entry.get("to_model")
+            if not isinstance(to_model, str) or not to_model:
+                continue
+            bucket = quality.setdefault(to_model, {"samples": 0, "suspect": 0})
+            bucket["samples"] += 1
+            bucket["suspect"] += 1 if entry.get("suspect") else 0
+        for bucket in quality.values():
+            bucket["suspect_rate"] = round(bucket["suspect"] / bucket["samples"], 3)
+            bucket["trusted"] = bucket["samples"] >= min_samples
+        return quality
+
+    def invalidate_quality_cache(self) -> None:
+        """Drop the cached seam scan; called when a seam audit is written."""
+        self._quality_cache = None
+
+    def _seam_entries(self) -> list[dict[str, Any]]:
+        """Every seam audit known: the digest plus not-yet-consolidated records."""
+        entries = self.read_audit_digest(self.audit_digest_path)
+        # Records not yet consolidated still carry evidence; include them and
+        # dedupe on (generation_id, seq) exactly as consolidation would.
+        seen: set[tuple[Any, Any]] = {
+            (entry.get("generation_id"), entry.get("seq")) for entry in entries
+        }
+        for record in self.list(limit=None):
+            for event in record.events:
+                if event.type != EVENT_HEAL_SEAM or (record.id, event.seq) in seen:
+                    continue
+                entries.append({**event.data, "generation_id": record.id, "seq": event.seq})
+        return entries
+
     def consolidate(self) -> dict[str, Any]:
         """Copy seam audits out of records into the append-only digest.
 
@@ -945,6 +1105,7 @@ class GenerationLedger:
 
         digest = self.read_audit_digest(self.audit_digest_path)
         digest_suspect = sum(1 for entry in digest if entry.get("suspect"))
+        hint_effect = self.hint_effect()
         return {
             "object": "stats",
             "ledger": {"path": str(self.root), "records": len(records)},
@@ -974,8 +1135,42 @@ class GenerationLedger:
                     round(digest_suspect / len(digest), 3) if digest else None
                 ),
                 "unconsolidated": max(0, audit_events - len(digest)),
+                "hint_effect": hint_effect,
             },
         }
+
+    def hint_effect(self) -> dict[str, dict[str, Any]]:
+        """Restart rate per continuation model, with and without the heal hint.
+
+        Built from every seam audit known (digest plus unconsolidated records),
+        keyed by the model that wrote the continuation. Each side reports its
+        sample count and restart rate; ``delta`` is hinted minus un-hinted, so a
+        negative number means the hint reduced restarts for that model. Seams
+        from before the hint existed have no ``hinted`` field and count as
+        un-hinted, which is what they were. Tool-call heals are excluded: they
+        always carry an addendum, so they have no un-hinted side to compare.
+        """
+        effect: dict[str, dict[str, Any]] = {}
+        for entry in self._seam_entries():
+            if entry.get("tool_call"):
+                continue
+            to_model = entry.get("to_model")
+            if not isinstance(to_model, str) or not to_model:
+                continue
+            side = "hinted" if entry.get("hinted") else "unhinted"
+            bucket = effect.setdefault(
+                to_model,
+                {"hinted": {"samples": 0, "restarted": 0}, "unhinted": {"samples": 0, "restarted": 0}},
+            )
+            bucket[side]["samples"] += 1
+            bucket[side]["restarted"] += 1 if entry.get("restarted") else 0
+        for bucket in effect.values():
+            for side in ("hinted", "unhinted"):
+                n = bucket[side]["samples"]
+                bucket[side]["restart_rate"] = round(bucket[side]["restarted"] / n, 3) if n else None
+            a, b = bucket["hinted"]["restart_rate"], bucket["unhinted"]["restart_rate"]
+            bucket["delta"] = round(a - b, 3) if a is not None and b is not None else None
+        return effect
 
     def queued(self) -> list[GenerationRecord]:
         """Return queued generations, earliest retry first."""
