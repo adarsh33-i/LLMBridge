@@ -67,6 +67,12 @@ base_url = "http://127.0.0.1:8790/slow/v1"
 model = "stub-model"
 fallbacks = ["ok-stub"]
 
+# Fast primary with a fallback, so the shadow race can show when it does not fire.
+[models.ok-with-fallback]
+base_url = "http://127.0.0.1:8790/ok/v1"
+model = "stub-model"
+fallbacks = ["slow-stub"]
+
 [models.restart-stub]
 base_url = "http://127.0.0.1:8790/restart/v1"
 model = "stub-model"
