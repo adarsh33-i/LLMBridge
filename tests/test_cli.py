@@ -840,7 +840,13 @@ class HealSeamStatusTests(LedgerBackedCommandTests):
             "primary",
         )
         self.ledger.interrupt(record, "timed out", output="partial text")
-        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value"}):
+        with patch.dict(
+            os.environ,
+            {
+                "LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value",
+                "LLMBRIDGE_HANDOFF_CALLBACK_URL": "https://bridge-a.example",
+            },
+        ):
             code, rendered = self._run("handoff", record.id)
         self.assertEqual(code, 0)
         token = rendered.strip().splitlines()[0]
@@ -848,6 +854,15 @@ class HealSeamStatusTests(LedgerBackedCommandTests):
         from llmbridge.server import verify_handoff_token
         payload = verify_handoff_token(token, secret=b"shared-secret-value")
         self.assertEqual(payload["partial_output"], "partial text")
+        self.assertEqual(
+            payload["callback_url"],
+            "https://bridge-a.example/v1/handoffs/settle",
+        )
+        issued = [
+            event for event in self.ledger.load(record.id).events
+            if event.type == "handoff_issued"
+        ]
+        self.assertEqual(issued[-1].data["nonce"], payload["jti"])
 
     def test_handoff_refuses_without_a_secret_or_for_completed_work(self):
         record = self._completed()
@@ -911,6 +926,26 @@ class HealSeamStatusTests(LedgerBackedCommandTests):
         self.assertEqual(code, 0)
         self.assertIn("Heal hint (restart rate, hinted vs not):", rendered)
         self.assertIn("backup: 0% over 1 vs 50% over 2 (delta -50%)", rendered)
+
+    def test_stats_prints_adaptive_fallback_order_summary(self):
+        record = self._completed()
+        self.ledger.heal(
+            record,
+            from_model="primary",
+            to_model="backup",
+            resumed_chars=3,
+            order=[
+                {"model": "backup", "config_position": 1},
+                {"model": "steady", "config_position": 0},
+            ],
+        )
+        code, rendered = self._run("stats")
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "Adaptive fallback order (retained records): 1 of 1 heal(s) reordered",
+            rendered,
+        )
+        self.assertIn("first choices: backup=1", rendered)
 
     def test_status_counts_heals_and_lists_suspect_seams(self):
         clean = self._completed(prompt="clean prompt")
@@ -1254,6 +1289,31 @@ model = "solo-model"
         self.assertEqual(payload["ranking"][0]["model"], "steady")
         self.assertEqual(payload["ranking"][0]["faithful"], 1)
         self.assertEqual(payload["ranking"][0]["flagged"], 0)
+
+    def test_exports_private_suspect_corpus_and_replays_it(self):
+        record = self._suspect()
+        corpus = Path(self._tmp.name) / "suspect-seams.json"
+        code, rendered = self._run(
+            "failover", "--export-corpus", str(corpus), "--limit", "1"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Exported 1 suspect seam fixture", rendered)
+        self.assertEqual(corpus.stat().st_mode & 0o777, 0o600)
+        fixture = json.loads(corpus.read_text(encoding="utf-8"))
+        self.assertEqual(fixture["schema"], "llmbridge-suspect-seam-corpus-v1")
+        self.assertEqual(fixture["records"][0]["id"], record.id)
+        self.assertEqual(fixture["records"][0]["prompt"], "healed prompt")
+
+        with patch.object(
+            cli, "_replay_output", side_effect=self._answers(solo=self.ANSWERS["solo"])
+        ) as replay:
+            code, rendered = self._run(
+                "failover", "--corpus", str(corpus), "--models", "solo"
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(replay.call_count, 1)
+        self.assertIn(record.id, rendered)
+        self.assertIn("Best fallback on these seams: solo", rendered)
 
     def test_unknown_id_fails_cleanly(self):
         code, rendered = self._run("failover", "gen_deadbeef0000")

@@ -697,6 +697,18 @@ class QueueServerTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["type"], "not_found")
 
+    def test_cancel_rejects_a_generation_already_claimed_for_dispatch(self):
+        self.enable_queue()
+        generation_id = self._queue_due()
+        claimed = self.ledger.claim_queue(
+            generation_id, now=time.time(), lease_seconds=60
+        )
+        self.assertIsNotNone(claimed)
+        status, _, body = self._call("DELETE", f"/v1/queue/{generation_id}")
+        self.assertEqual(status, 409)
+        self.assertIn("already dispatching", body["error"]["message"])
+        self.assertEqual(self.ledger.load(generation_id).status, "dispatching")
+
     def _queue_due(self):
         _, _, body = self._post_with_quota_error()
         generation_id = body["generation_id"]
@@ -915,6 +927,26 @@ def _tool_continuation(name="bash", call_id="call_fb"):
         [
             _tool_delta(0, call_id=call_id, name=name, arguments='{"cmd": '),
             _tool_delta(0, arguments='"ls -la"}'),
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":6}}\n',
+        ]
+    )
+
+
+def _repeating_tool_continuation():
+    return _StreamScript(
+        [
+            _tool_delta(
+                0,
+                call_id="call_repeat",
+                name="read_file",
+                arguments='{"path":"a.txt"}',
+            ),
+            _tool_delta(
+                1,
+                call_id="call_bash",
+                name="bash",
+                arguments='{"cmd":"run"}',
+            ),
             b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":6}}\n',
         ]
     )
@@ -1159,6 +1191,29 @@ class HealServerTests(QueueServerTests):
         heal = next(e for e in record.events if e.type == "heal")
         self.assertEqual(heal.data["tool"]["issued"], [{"id": "call_1", "name": "read_file"}])
         self.assertEqual(heal.data["tool"]["cut"][0]["name"], "bash")
+
+    def test_healed_stream_suppresses_exact_repeats_of_released_tool_calls(self):
+        with patch(
+            "llmbridge.server.urlopen",
+            side_effect=[_two_tool_calls_second_cut(), _repeating_tool_continuation()],
+        ):
+            status, headers, payload = self._call(
+                "POST", "/v1/messages", self._message()
+            )
+        self.assertEqual(status, 200)
+        events = _sse_events(payload)
+        starts = [
+            event["content_block"]
+            for event in events
+            if event.get("type") == "content_block_start"
+            and event.get("content_block", {}).get("type") == "tool_use"
+        ]
+        self.assertEqual([block["name"] for block in starts], ["read_file", "bash"])
+        self.assertEqual([block["id"] for block in starts], ["call_1", "call_bash"])
+        record = self.ledger.load(self._generation_id(headers))
+        seam = next(event for event in record.events if event.type == "heal_seam")
+        self.assertEqual(seam.data["tool_deduplicated"], ["read_file"])
+        self.assertTrue(seam.data["tool_finished"])
 
     def test_tool_heal_flags_a_fallback_that_called_the_wrong_tool(self):
         with patch(

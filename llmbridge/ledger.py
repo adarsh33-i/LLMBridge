@@ -28,7 +28,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 if os.name == "nt":  # pragma: no cover - Windows-only lock implementation
     import msvcrt
@@ -156,15 +156,22 @@ EVENT_FORK = "fork"
 EVENT_HEAL = "heal"
 EVENT_HEAL_SEAM = "heal_seam"
 EVENT_QUEUED = "queue"
+EVENT_QUEUE_CLAIM = "queue_claim"
 EVENT_RESUME = "resume"
+EVENT_RESUME_CLAIM = "resume_claim"
+EVENT_RESUME_RELEASE = "resume_release"
 EVENT_SHADOW = "shadow"
 EVENT_HANDOFF = "handoff"
+EVENT_HANDOFF_ISSUED = "handoff_issued"
+EVENT_HANDOFF_COMPLETE = "handoff_complete"
 
 _STATUS_RUNNING = "running"
 _STATUS_COMPLETED = "completed"
 _STATUS_INTERRUPTED = "interrupted"
 _STATUS_FAILED = "failed"
 _STATUS_QUEUED = "queued"
+_STATUS_DISPATCHING = "dispatching"
+_STATUS_RESUMING = "resuming"
 # Set on an interrupted record once a later generation has finished that work.
 # It leaves the recoverable set without erasing the interruption itself.
 _STATUS_RESUMED = "resumed"
@@ -190,6 +197,7 @@ _AUDIT_FIELDS = (
     "suspect",
     "tool_call",
     "tool_finished",
+    "tool_deduplicated",
     "hinted",
 )
 
@@ -208,6 +216,15 @@ def _fingerprint(body: Any) -> str:
     except (TypeError, ValueError):
         canonical = str(body)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _model_independent_fingerprint(body: Any) -> str:
+    """Content address for the same request when only its model may change."""
+    if not isinstance(body, dict):
+        return _fingerprint(body)
+    identity = dict(body)
+    identity.pop("model", None)
+    return _fingerprint(identity)
 
 
 def _block_text(content: Any) -> str:
@@ -338,6 +355,7 @@ class GenerationRecord:
     status: str
     created_at: float
     updated_at: float
+    model_independent_fingerprint: Optional[str] = None
     request: dict[str, Any] = field(default_factory=dict)
     parent: Optional[str] = None
     fork_event_seq: Optional[int] = None
@@ -350,6 +368,7 @@ class GenerationRecord:
             "id": self.id,
             "object": "generation",
             "fingerprint": self.fingerprint,
+            "model_independent_fingerprint": self.model_independent_fingerprint,
             "model": self.model,
             "prompt": self.prompt,
             "system": self.system,
@@ -386,6 +405,11 @@ class GenerationRecord:
         return cls(
             id=str(value["id"]),
             fingerprint=str(value.get("fingerprint", "")),
+            model_independent_fingerprint=(
+                value.get("model_independent_fingerprint")
+                if isinstance(value.get("model_independent_fingerprint"), str)
+                else None
+            ),
             model=str(value.get("model", "")),
             prompt=value.get("prompt") if isinstance(value.get("prompt"), str) else "",
             system=value.get("system") if isinstance(value.get("system"), str) else None,
@@ -450,25 +474,71 @@ class GenerationLedger:
 
     def _save(self, record: GenerationRecord) -> None:
         path = self._path(record.id)
+        with self._lock, _exclusive_lock(self._lock_path(record.id)):
+            self._write_locked(path, record)
+
+    @staticmethod
+    def _write_locked(path: Path, record: GenerationRecord) -> None:
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
         )
         try:
             with os.fdopen(fd, "w") as handle:
-                with _exclusive_lock(self._lock_path(record.id)):
-                    json.dump(record.to_dict(), handle, indent=2)
-                    handle.flush()
-                    try:
-                        os.fsync(handle.fileno())
-                    except OSError:  # pragma: no cover - platform dependent
-                        logger.debug("fsync unavailable for %s; skipping", path)
-                    os.replace(tmp_path, path)
+                json.dump(record.to_dict(), handle, indent=2)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:  # pragma: no cover - platform dependent
+                    logger.debug("fsync unavailable for %s; skipping", path)
+                os.replace(tmp_path, path)
         except BaseException:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
             raise
+
+    def _read_locked(self, generation_id: str) -> Optional[GenerationRecord]:
+        path = self._path(generation_id)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                value = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError) as error:
+            logger.error("Failed to load generation %s: %s", generation_id, error)
+            return None
+        if not isinstance(value, dict) or "id" not in value:
+            logger.error("Ignoring malformed generation record at %s", path)
+            return None
+        try:
+            return GenerationRecord.from_dict(value)
+        except (KeyError, TypeError, ValueError) as error:
+            logger.error("Ignoring malformed generation record at %s: %s", path, error)
+            return None
+
+    def _update(
+        self,
+        record: GenerationRecord,
+        update: Callable[[GenerationRecord], bool],
+    ) -> Optional[GenerationRecord]:
+        """Apply one read-modify-write transaction under the record's file lock."""
+        with self._lock, _exclusive_lock(self._lock_path(record.id)):
+            current = self._read_locked(record.id)
+            if current is None or not update(current):
+                return None
+            self._write_locked(self._path(record.id), current)
+            record.__dict__.update(current.__dict__)
+            return record
+
+    def _append_update(
+        self, record: GenerationRecord, event_type: str, data: dict[str, Any]
+    ) -> Optional[GenerationRecord]:
+        def update(current: GenerationRecord) -> bool:
+            self._append(current, event_type, data)
+            return True
+
+        return self._update(record, update)
 
     def create(
         self,
@@ -478,6 +548,7 @@ class GenerationLedger:
         parent: Optional[str] = None,
         fork_event_seq: Optional[int] = None,
         fingerprint: Optional[str] = None,
+        model_independent_fingerprint: Optional[str] = None,
     ) -> GenerationRecord:
         """Open a new generation. Forked children get a ``fork`` event instead of ``start``.
 
@@ -494,6 +565,12 @@ class GenerationLedger:
                 fingerprint
                 if isinstance(fingerprint, str) and fingerprint
                 else _fingerprint(body)
+            ),
+            model_independent_fingerprint=(
+                model_independent_fingerprint
+                if isinstance(model_independent_fingerprint, str)
+                and model_independent_fingerprint
+                else _model_independent_fingerprint(body)
             ),
             model=model,
             prompt=prompt,
@@ -528,21 +605,28 @@ class GenerationLedger:
         record: GenerationRecord,
         output: str,
         output_tokens: Optional[int] = None,
+        *,
+        claim_id: Optional[str] = None,
     ) -> GenerationRecord:
-        record.output = output if isinstance(output, str) else ""
-        record.output_tokens = output_tokens if isinstance(output_tokens, int) else None
-        record.status = _STATUS_COMPLETED
-        self._append(
-            record,
-            EVENT_COMPLETE,
-            {
-                "output": record.output,
-                "output_tokens": record.output_tokens,
-                "chars": len(record.output),
-            },
-        )
-        with self._lock:
-            self._save(record)
+        def update(current: GenerationRecord) -> bool:
+            if claim_id is not None and not self._has_queue_claim(current, claim_id):
+                return False
+            current.output = output if isinstance(output, str) else ""
+            current.output_tokens = output_tokens if isinstance(output_tokens, int) else None
+            current.status = _STATUS_COMPLETED
+            self._append(
+                current,
+                EVENT_COMPLETE,
+                {
+                    "output": current.output,
+                    "output_tokens": current.output_tokens,
+                    "chars": len(current.output),
+                },
+            )
+            return True
+
+        if self._update(record, update) is None and claim_id is not None:
+            raise RuntimeError(f"Queue dispatch lease for {record.id} was lost")
         return record
 
     def interrupt(
@@ -553,22 +637,27 @@ class GenerationLedger:
         output: str = "",
         output_tokens: Optional[int] = None,
         progress: float = 0.0,
+        expected_status: Optional[str] = None,
     ) -> GenerationRecord:
-        record.output = output if isinstance(output, str) else ""
-        record.output_tokens = output_tokens if isinstance(output_tokens, int) else None
-        record.status = _STATUS_INTERRUPTED
-        self._append(
-            record,
-            EVENT_INTERRUPT,
-            {
-                "message": message,
-                "output": record.output,
-                "output_tokens": record.output_tokens,
-                "progress_percent": progress,
-            },
-        )
-        with self._lock:
-            self._save(record)
+        def update(current: GenerationRecord) -> bool:
+            if expected_status is not None and current.status != expected_status:
+                return False
+            current.output = output if isinstance(output, str) else ""
+            current.output_tokens = output_tokens if isinstance(output_tokens, int) else None
+            current.status = _STATUS_INTERRUPTED
+            self._append(
+                current,
+                EVENT_INTERRUPT,
+                {
+                    "message": message,
+                    "output": current.output,
+                    "output_tokens": current.output_tokens,
+                    "progress_percent": progress,
+                },
+            )
+            return True
+
+        self._update(record, update)
         return record
 
     def resume(
@@ -577,25 +666,41 @@ class GenerationLedger:
         *,
         by: Optional[str],
         model: str,
+        claim_id: Optional[str] = None,
     ) -> GenerationRecord:
         """Mark interrupted work as finished by a later generation.
 
         The record is kept rather than deleted: erasing it would remove the only
         evidence that this answer was interrupted and had to be re-run, which is
-        exactly what makes resume rates measurable. It leaves the ``interrupted``
-        status, so it is no longer offered for resumption.
+        exactly what makes resume rates measurable. It transitions the source
+        to ``resumed`` so it is no longer offered for resumption.
         """
-        record.status = _STATUS_RESUMED
-        self._append(record, EVENT_RESUME, {"resumed_by": by, "model": model})
-        with self._lock:
-            self._save(record)
+        def update(current: GenerationRecord) -> bool:
+            if claim_id is None:
+                if current.status != _STATUS_INTERRUPTED:
+                    return False
+            elif not self._has_resume_claim(current, claim_id):
+                return False
+            current.status = _STATUS_RESUMED
+            self._append(current, EVENT_RESUME, {"resumed_by": by, "model": model})
+            return True
+
+        if self._update(record, update) is None and claim_id is not None:
+            raise RuntimeError(f"Resume lease for {record.id} was lost")
         return record
 
-    def fail(self, record: GenerationRecord, message: str) -> GenerationRecord:
-        record.status = _STATUS_FAILED
-        self._append(record, EVENT_FAIL, {"message": message})
-        with self._lock:
-            self._save(record)
+    def fail(
+        self, record: GenerationRecord, message: str, *, claim_id: Optional[str] = None
+    ) -> GenerationRecord:
+        def update(current: GenerationRecord) -> bool:
+            if claim_id is not None and not self._has_queue_claim(current, claim_id):
+                return False
+            current.status = _STATUS_FAILED
+            self._append(current, EVENT_FAIL, {"message": message})
+            return True
+
+        if self._update(record, update) is None and claim_id is not None:
+            raise RuntimeError(f"Queue dispatch lease for {record.id} was lost")
         return record
 
     def load(self, generation_id: str) -> Optional[GenerationRecord]:
@@ -603,22 +708,11 @@ class GenerationLedger:
             path = self._path(generation_id)
         except ValueError:
             return None
-        if not path.exists():
-            return None
         try:
             with _exclusive_lock(self._lock_path(generation_id)):
-                with open(path, "r") as handle:
-                    value = json.load(handle)
-        except (json.JSONDecodeError, OSError) as error:
+                return self._read_locked(generation_id)
+        except OSError as error:
             logger.error("Failed to load generation %s: %s", generation_id, error)
-            return None
-        if not isinstance(value, dict) or "id" not in value:
-            logger.error("Ignoring malformed generation record at %s", path)
-            return None
-        try:
-            return GenerationRecord.from_dict(value)
-        except (KeyError, TypeError, ValueError) as error:
-            logger.error("Ignoring malformed generation record at %s: %s", path, error)
             return None
 
     def list(self, limit: int = 100) -> list[GenerationRecord]:
@@ -653,14 +747,19 @@ class GenerationLedger:
 
     def interrupted(self) -> list[GenerationRecord]:
         """Return interrupted generations, newest first."""
+        now = time.time()
         return [
             record
             for record in self.list(limit=None)
             if record.status == _STATUS_INTERRUPTED
+            or (
+                record.status == _STATUS_RESUMING
+                and self._resume_claim_until(record) <= now
+            )
         ]
 
     def resumable(self, fingerprint: str) -> Optional[GenerationRecord]:
-        """The newest interrupted record for this exact request that saved text.
+        """The newest interrupted or resuming record for this request with saved text.
 
         Matched on the request fingerprint, never on prompt text: two
         conversations can share a prompt, and continuing one from the other's
@@ -670,8 +769,35 @@ class GenerationLedger:
         """
         if not fingerprint:
             return None
-        for record in self.interrupted():
-            if record.fingerprint == fingerprint and record.output:
+        for record in self.list(limit=None):
+            if (
+                record.status in (_STATUS_INTERRUPTED, _STATUS_RESUMING)
+                and record.fingerprint == fingerprint
+                and record.output
+            ):
+                return record
+        return None
+
+    def resumable_for_model_switch(
+        self, fingerprint: str, model: str
+    ) -> Optional[GenerationRecord]:
+        """Find the newest interrupted request identical except for model."""
+        if not fingerprint or not model:
+            return None
+        for record in self.list(limit=None):
+            identity = record.model_independent_fingerprint
+            if identity is None and record.request:
+                # Older ledger entries did not persist this identity separately.
+                replay = dict(record.request)
+                replay.update(record.params)
+                replay["model"] = record.model
+                identity = _model_independent_fingerprint(replay)
+            if (
+                record.status in (_STATUS_INTERRUPTED, _STATUS_RESUMING)
+                and record.model != model
+                and identity == fingerprint
+                and record.output
+            ):
                 return record
         return None
 
@@ -700,13 +826,22 @@ class GenerationLedger:
                 continue
             if older_than is not None and timestamp - record.updated_at < older_than:
                 continue
-            settled.append(self.interrupt(record, message))
+            updated = self.interrupt(
+                record, message, expected_status=_STATUS_RUNNING
+            )
+            if updated.status == _STATUS_INTERRUPTED:
+                settled.append(updated)
         return settled
 
     @staticmethod
     def is_recoverable(record: GenerationRecord) -> bool:
         """Whether this record holds work that can still be finished or retried."""
-        return record.status in (_STATUS_INTERRUPTED, _STATUS_QUEUED)
+        return record.status in (
+            _STATUS_INTERRUPTED,
+            _STATUS_QUEUED,
+            _STATUS_DISPATCHING,
+            _STATUS_RESUMING,
+        )
 
     def children(self, generation_id: str) -> list[GenerationRecord]:
         """Return forks whose parent is ``generation_id``, newest first."""
@@ -745,22 +880,273 @@ class GenerationLedger:
             return float(retry_at)
         return 0.0
 
+    @staticmethod
+    def _queue_claim_until(record: GenerationRecord) -> float:
+        for event in reversed(record.events):
+            if event.type == EVENT_QUEUE_CLAIM:
+                lease_until = event.data.get("lease_until")
+                if isinstance(lease_until, (int, float)):
+                    return float(lease_until)
+                return 0.0
+        return 0.0
+
+    @staticmethod
+    def _queue_claim_id(record: GenerationRecord) -> Optional[str]:
+        for event in reversed(record.events):
+            if event.type == EVENT_QUEUE_CLAIM:
+                claim_id = event.data.get("claim_id")
+                return claim_id if isinstance(claim_id, str) else None
+        return None
+
+    @classmethod
+    def _has_queue_claim(cls, record: GenerationRecord, claim_id: str) -> bool:
+        return (
+            record.status == _STATUS_DISPATCHING
+            and cls._queue_claim_id(record) == claim_id
+        )
+
+    def renew_queue_claim(
+        self, record: GenerationRecord, claim_id: str, *, lease_seconds: float
+    ) -> bool:
+        def update(current: GenerationRecord) -> bool:
+            if not self._has_queue_claim(current, claim_id):
+                return False
+            self._append(
+                current,
+                EVENT_QUEUE_CLAIM,
+                {"claim_id": claim_id, "lease_until": time.time() + lease_seconds},
+            )
+            return True
+
+        return self._update(record, update) is not None
+
+    def dispatchable(self, now: Optional[float] = None) -> list[GenerationRecord]:
+        """Return queued work that is due, including dispatch claims whose lease expired."""
+        timestamp = time.time() if now is None else now
+        return sorted(
+            (
+                record
+                for record in self.list(limit=None)
+                if (
+                    record.status == _STATUS_QUEUED
+                    and self.queue_retry_at(record) <= timestamp
+                )
+                or (
+                    record.status == _STATUS_DISPATCHING
+                    and self._queue_claim_until(record) <= timestamp
+                )
+            ),
+            key=self.queue_retry_at,
+        )
+
+    def claim_queue(
+        self,
+        generation_id: str,
+        *,
+        now: Optional[float] = None,
+        lease_seconds: float,
+    ) -> Optional[GenerationRecord]:
+        """Atomically claim due queued work or reclaim an expired dispatch lease."""
+        timestamp = time.time() if now is None else now
+        token = uuid.uuid4().hex
+        record = GenerationRecord(
+            id=generation_id,
+            fingerprint="",
+            model="",
+            prompt="",
+            system=None,
+            params={},
+            status=_STATUS_QUEUED,
+            created_at=0,
+            updated_at=0,
+        )
+
+        def update(current: GenerationRecord) -> bool:
+            due_queued = (
+                current.status == _STATUS_QUEUED
+                and self.queue_retry_at(current) <= timestamp
+            )
+            expired_claim = (
+                current.status == _STATUS_DISPATCHING
+                and self._queue_claim_until(current) <= timestamp
+            )
+            if not due_queued and not expired_claim:
+                return False
+            current.status = _STATUS_DISPATCHING
+            self._append(
+                current,
+                EVENT_QUEUE_CLAIM,
+                {"claim_id": token, "lease_until": timestamp + lease_seconds},
+            )
+            return True
+
+        return self._update(record, update)
+
+    def cancel_queue(self, generation_id: str) -> Optional[GenerationRecord]:
+        """Atomically cancel only work that has not been claimed for dispatch."""
+        record = self.load(generation_id)
+        if record is None:
+            return None
+
+        def update(current: GenerationRecord) -> bool:
+            if current.status != _STATUS_QUEUED:
+                return False
+            current.status = _STATUS_FAILED
+            self._append(current, EVENT_FAIL, {"message": "cancelled from the queue"})
+            return True
+
+        return self._update(record, update)
+
+    @staticmethod
+    def _resume_claim_until(record: GenerationRecord) -> float:
+        for event in reversed(record.events):
+            if event.type == EVENT_RESUME_CLAIM:
+                lease_until = event.data.get("lease_until")
+                if isinstance(lease_until, (int, float)):
+                    return float(lease_until)
+                return 0.0
+        return 0.0
+
+    @staticmethod
+    def _resume_claim_id(record: GenerationRecord) -> Optional[str]:
+        for event in reversed(record.events):
+            if event.type == EVENT_RESUME_CLAIM:
+                claim_id = event.data.get("claim_id")
+                return claim_id if isinstance(claim_id, str) else None
+        return None
+
+    @classmethod
+    def _has_resume_claim(cls, record: GenerationRecord, claim_id: str) -> bool:
+        return record.status == _STATUS_RESUMING and cls._resume_claim_id(record) == claim_id
+
+    def claim_resume(
+        self,
+        generation_id: str,
+        *,
+        now: Optional[float] = None,
+        lease_seconds: float,
+    ) -> Optional[GenerationRecord]:
+        """Atomically claim interrupted work, reclaiming only expired claims."""
+        timestamp = time.time() if now is None else now
+        claim_id = uuid.uuid4().hex
+        record = GenerationRecord(
+            id=generation_id,
+            fingerprint="",
+            model="",
+            prompt="",
+            system=None,
+            params={},
+            status=_STATUS_INTERRUPTED,
+            created_at=0,
+            updated_at=0,
+        )
+
+        def update(current: GenerationRecord) -> bool:
+            if current.status != _STATUS_INTERRUPTED and not (
+                current.status == _STATUS_RESUMING
+                and self._resume_claim_until(current) <= timestamp
+            ):
+                return False
+            current.status = _STATUS_RESUMING
+            self._append(
+                current,
+                EVENT_RESUME_CLAIM,
+                {"claim_id": claim_id, "lease_until": timestamp + lease_seconds},
+            )
+            return True
+
+        return self._update(record, update)
+
+    def renew_resume_claim(
+        self, record: GenerationRecord, claim_id: str, *, lease_seconds: float
+    ) -> bool:
+        def update(current: GenerationRecord) -> bool:
+            if not self._has_resume_claim(current, claim_id):
+                return False
+            self._append(
+                current,
+                EVENT_RESUME_CLAIM,
+                {"claim_id": claim_id, "lease_until": time.time() + lease_seconds},
+            )
+            return True
+
+        return self._update(record, update) is not None
+
+    def release_resume_claim(self, record: GenerationRecord, claim_id: str) -> bool:
+        """Release a failed or abandoned resume attempt if it still owns the claim."""
+        def update(current: GenerationRecord) -> bool:
+            if not self._has_resume_claim(current, claim_id):
+                return False
+            current.status = _STATUS_INTERRUPTED
+            self._append(current, EVENT_RESUME_RELEASE, {"claim_id": claim_id})
+            return True
+
+        return self._update(record, update) is not None
+
+    def consume_handoff_nonce(
+        self, nonce: str, *, expires_at: float, now: Optional[float] = None
+    ) -> bool:
+        """Persist a token nonce once, with cross-process exclusion and expiry."""
+        timestamp = time.time() if now is None else now
+        if not nonce or expires_at <= timestamp:
+            return False
+        digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        directory = self.root / "consumed-handoffs"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / f"{digest}.json"
+        lock_path = _lock_path_for(path)
+        with self._lock, _exclusive_lock(lock_path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    prior = json.load(handle)
+                prior_expiry = prior.get("expires_at") if isinstance(prior, dict) else None
+                if isinstance(prior_expiry, (int, float)) and prior_expiry > timestamp:
+                    return False
+            except FileNotFoundError:
+                pass
+            except (json.JSONDecodeError, OSError) as error:
+                logger.error("Could not read consumed handoff record %s: %s", path, error)
+                raise
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(directory), prefix=f".{digest}.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"expires_at": expires_at}, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        return True
+
     def queue(
         self,
         record: GenerationRecord,
         message: str,
         retry_at: float,
         attempt: int,
+        *,
+        claim_id: Optional[str] = None,
     ) -> GenerationRecord:
         """Park a generation for an automatic retry after a quota failure."""
-        record.status = _STATUS_QUEUED
-        self._append(
-            record,
-            EVENT_QUEUED,
-            {"message": message, "retry_at": retry_at, "attempt": attempt},
-        )
-        with self._lock:
-            self._save(record)
+        def update(current: GenerationRecord) -> bool:
+            if claim_id is not None and not self._has_queue_claim(current, claim_id):
+                return False
+            current.status = _STATUS_QUEUED
+            self._append(
+                current,
+                EVENT_QUEUED,
+                {"message": message, "retry_at": retry_at, "attempt": attempt},
+            )
+            return True
+
+        if self._update(record, update) is None and claim_id is not None:
+            raise RuntimeError(f"Queue dispatch lease for {record.id} was lost")
         return record
 
     def heal(
@@ -796,9 +1182,7 @@ class GenerationLedger:
             data["tool"] = tool
         if hinted is not None:
             data["hinted"] = bool(hinted)
-        self._append(record, EVENT_HEAL, data)
-        with self._lock:
-            self._save(record)
+        self._append_update(record, EVENT_HEAL, data)
         return record
 
     def shadow(
@@ -820,7 +1204,7 @@ class GenerationLedger:
         says whether the loser's request reached its provider, which is the
         call that was billed for nothing.
         """
-        self._append(
+        self._append_update(
             record,
             EVENT_SHADOW,
             {
@@ -833,8 +1217,6 @@ class GenerationLedger:
                 "loser_sent": bool(loser_sent),
             },
         )
-        with self._lock:
-            self._save(record)
         return record
 
     def handoff(
@@ -851,7 +1233,7 @@ class GenerationLedger:
         known about it: its id on the other bridge, the model that was running
         it, and how much text was carried across.
         """
-        self._append(
+        self._append_update(
             record,
             EVENT_HANDOFF,
             {
@@ -860,9 +1242,82 @@ class GenerationLedger:
                 "resumed_chars": resumed_chars,
             },
         )
-        with self._lock:
-            self._save(record)
         return record
+
+    def issue_handoff(
+        self, record: GenerationRecord, *, nonce: str, expires_at: float
+    ) -> bool:
+        """Record a callback-capable token against its interrupted source."""
+        if not nonce or expires_at <= time.time():
+            return False
+
+        def update(current: GenerationRecord) -> bool:
+            if current.status != _STATUS_INTERRUPTED:
+                return False
+            self._append(
+                current,
+                EVENT_HANDOFF_ISSUED,
+                {"nonce": nonce, "expires_at": expires_at},
+            )
+            return True
+
+        return self._update(record, update) is not None
+
+    def settle_handoff(
+        self,
+        source_generation: str,
+        *,
+        nonce: str,
+        destination_generation: str,
+        model: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Settle an issued remote handoff once its destination completes."""
+        timestamp = time.time() if now is None else now
+        source = self.load(source_generation)
+        if source is None:
+            return False
+
+        def update(current: GenerationRecord) -> bool:
+            issued = next(
+                (
+                    event for event in reversed(current.events)
+                    if event.type == EVENT_HANDOFF_ISSUED
+                    and event.data.get("nonce") == nonce
+                ),
+                None,
+            )
+            if issued is None or issued.data.get("expires_at", 0) <= timestamp:
+                return False
+            if current.status == _STATUS_RESUMED:
+                return any(
+                    event.type == EVENT_HANDOFF_COMPLETE
+                    and event.data.get("nonce") == nonce
+                    and event.data.get("destination_generation") == destination_generation
+                    for event in current.events
+                )
+            if current.status != _STATUS_INTERRUPTED:
+                return False
+            current.status = _STATUS_RESUMED
+            data = {
+                "resumed_by": destination_generation,
+                "model": model,
+                "nonce": nonce,
+                "remote": True,
+            }
+            self._append(current, EVENT_RESUME, data)
+            self._append(
+                current,
+                EVENT_HANDOFF_COMPLETE,
+                {
+                    "nonce": nonce,
+                    "destination_generation": destination_generation,
+                    "model": model,
+                },
+            )
+            return True
+
+        return self._update(source, update) is not None
 
     def heal_seam(
         self,
@@ -878,13 +1333,11 @@ class GenerationLedger:
         The audit flags the boundary; it does not gate it. Absence of this event
         means the continuation never finished, so there was no seam to score.
         """
-        self._append(
+        self._append_update(
             record,
             EVENT_HEAL_SEAM,
             {**audit, "from_model": from_model, "to_model": to_model, "seam_at": seam_at},
         )
-        with self._lock:
-            self._save(record)
         self.invalidate_quality_cache()
         return record
 
@@ -1082,6 +1535,10 @@ class GenerationLedger:
         suspect = 0
         duplicated = 0
         restarted = 0
+        adaptive_decisions = 0
+        adaptive_reordered = 0
+        adaptive_candidate_moves = 0
+        adaptive_first_choice: dict[str, int] = {}
         for record in records:
             by_status[record.status] = by_status.get(record.status, 0) + 1
             if isinstance(record.output_tokens, int):
@@ -1089,6 +1546,34 @@ class GenerationLedger:
                 token_counts += 1
             if any(event.type == EVENT_HEAL for event in record.events):
                 healed += 1
+            for event in record.events:
+                order = event.data.get("order") if event.type == EVENT_HEAL else None
+                if not isinstance(order, list) or not order:
+                    continue
+                candidates = [
+                    item for item in order
+                    if isinstance(item, dict)
+                    and isinstance(item.get("model"), str)
+                    and isinstance(item.get("config_position"), int)
+                ]
+                if not candidates:
+                    continue
+                adaptive_decisions += 1
+                actual_models = [item["model"] for item in candidates]
+                config_models = [
+                    item["model"]
+                    for item in sorted(candidates, key=lambda item: item["config_position"])
+                ]
+                if actual_models != config_models:
+                    adaptive_reordered += 1
+                adaptive_candidate_moves += sum(
+                    1
+                    for position, item in enumerate(candidates)
+                    if position != item["config_position"]
+                )
+                adaptive_first_choice[actual_models[0]] = (
+                    adaptive_first_choice.get(actual_models[0], 0) + 1
+                )
             audit_events += sum(1 for event in record.events if event.type == EVENT_HEAL_SEAM)
             audit = self.heal_seam_audit(record)
             if audit is not None:
@@ -1136,6 +1621,13 @@ class GenerationLedger:
                 ),
                 "unconsolidated": max(0, audit_events - len(digest)),
                 "hint_effect": hint_effect,
+                "adaptive_order": {
+                    "scope": "retained_records",
+                    "decisions": adaptive_decisions,
+                    "reordered": adaptive_reordered,
+                    "candidate_moves": adaptive_candidate_moves,
+                    "first_choice_counts": adaptive_first_choice,
+                },
             },
         }
 
@@ -1178,7 +1670,7 @@ class GenerationLedger:
             (
                 record
                 for record in self.list(limit=None)
-                if record.status == _STATUS_QUEUED
+                if record.status in (_STATUS_QUEUED, _STATUS_DISPATCHING)
             ),
             key=self.queue_retry_at,
         )

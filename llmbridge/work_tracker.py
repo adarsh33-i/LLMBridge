@@ -383,9 +383,19 @@ class WorkTracker:
         resolved: Optional[str] = None
         for record in self.ledger.interrupted():
             if record.fingerprint == fingerprint and record.id != by:
-                self.ledger.resume(record, by=by, model=model)
-                resolved = record.id
-                break
+                claim_id = None
+                if record.status == "resuming":
+                    claimed = self.ledger.claim_resume(record.id, lease_seconds=60.0)
+                    if claimed is None:
+                        continue
+                    record = claimed
+                    claim_id = self.ledger._resume_claim_id(record)
+                self.ledger.resume(
+                    record, by=by, model=model, claim_id=claim_id
+                )
+                if record.status == "resumed":
+                    resolved = record.id
+                    break
         if resolved is not None:
             logger.info(
                 "Marked interrupted work %s resumed in %s (by %s)",

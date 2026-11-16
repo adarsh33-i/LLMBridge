@@ -178,6 +178,80 @@ class GenerationLedgerTests(unittest.TestCase):
         self.assertEqual(stats["heals"]["digest_suspect"], 0)
         self.assertEqual(stats["heals"]["unconsolidated"], 0)
 
+    def test_stats_summarizes_adaptive_fallback_reordering(self):
+        record = self.ledger.create(_request(), "nemotron")
+        self.ledger.heal(
+            record,
+            from_model="primary",
+            to_model="b",
+            resumed_chars=10,
+            order=[
+                {"model": "b", "config_position": 1},
+                {"model": "a", "config_position": 0},
+            ],
+        )
+        self.ledger.heal(
+            record,
+            from_model="primary",
+            to_model="c",
+            resumed_chars=10,
+            order=[
+                {"model": "c", "config_position": 0},
+                {"model": "d", "config_position": 1},
+            ],
+        )
+
+        adaptive = self.ledger.stats()["heals"]["adaptive_order"]
+        self.assertEqual(adaptive["decisions"], 2)
+        self.assertEqual(adaptive["reordered"], 1)
+        self.assertEqual(adaptive["candidate_moves"], 2)
+        self.assertEqual(adaptive["first_choice_counts"], {"b": 1, "c": 1})
+
+    def test_remote_handoff_settlement_is_authenticated_by_issued_nonce(self):
+        record = self.ledger.create(_request(), "nemotron")
+        self.ledger.interrupt(record, "stopped", output="partial")
+        self.assertTrue(
+            self.ledger.issue_handoff(
+                record, nonce="handoff-nonce", expires_at=time.time() + 60
+            )
+        )
+        self.assertFalse(
+            self.ledger.settle_handoff(
+                record.id,
+                nonce="wrong-nonce",
+                destination_generation="gen_remote000001",
+                model="fallback",
+            )
+        )
+        self.assertTrue(
+            self.ledger.settle_handoff(
+                record.id,
+                nonce="handoff-nonce",
+                destination_generation="gen_remote000001",
+                model="fallback",
+            )
+        )
+        self.assertTrue(
+            self.ledger.settle_handoff(
+                record.id,
+                nonce="handoff-nonce",
+                destination_generation="gen_remote000001",
+                model="fallback",
+            )
+        )
+        self.assertFalse(
+            self.ledger.settle_handoff(
+                record.id,
+                nonce="handoff-nonce",
+                destination_generation="gen_other000001",
+                model="fallback",
+            )
+        )
+        settled = self.ledger.load(record.id)
+        self.assertEqual(settled.status, "resumed")
+        completion = next(e for e in settled.events if e.type == "handoff_complete")
+        self.assertEqual(completion.data["destination_generation"], "gen_remote000001")
+
     def test_forked_child_records_parent_and_fork_event(self):
         parent = self.ledger.create(_request(), "nemotron")
         self.ledger.complete(parent, "partial", 3)
@@ -707,6 +781,44 @@ class LedgerCrossProcessTests(unittest.TestCase):
             self.assertIsNotNone(record, f"{path.name} failed to parse")
             self.assertEqual(record.id, path.stem)
 
+    def test_concurrent_updates_preserve_all_events_from_stale_snapshots(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name) / "transactional"
+        ledger = GenerationLedger(str(root))
+        record = ledger.create(
+            {"model": "m", "messages": [{"role": "user", "content": "p"}]}, "m"
+        )
+        snapshots = [GenerationLedger(str(root)).load(record.id) for _ in range(4)]
+        barrier = threading.Barrier(len(snapshots))
+
+        def append_events(snapshot, worker):
+            barrier.wait()
+            for index in range(10):
+                GenerationLedger(str(root)).heal(
+                    snapshot,
+                    from_model="m",
+                    to_model=f"worker-{worker}-{index}",
+                    resumed_chars=index,
+                )
+
+        threads = [
+            threading.Thread(target=append_events, args=(snapshot, worker))
+            for worker, snapshot in enumerate(snapshots)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        reloaded = ledger.load(record.id)
+        self.assertEqual(
+            sum(event.type == EVENT_HEAL for event in reloaded.events), 40
+        )
+        self.assertEqual(
+            [event.seq for event in reloaded.events], list(range(len(reloaded.events)))
+        )
+
 
 class LedgerTreeTests(unittest.TestCase):
     def setUp(self):
@@ -845,6 +957,83 @@ class LedgerQueueTests(unittest.TestCase):
         self.ledger.fail(record, "cancelled from the queue")
         self.assertEqual(record.status, "failed")
         self.assertEqual(self.ledger.queued(), [])
+
+    def test_queue_claim_is_atomic_and_expired_claims_are_reclaimable(self):
+        record = self._record()
+        self.ledger.queue(record, "quota", retry_at=1.0, attempt=1)
+        barrier = threading.Barrier(2)
+        claims = []
+
+        def claim():
+            ledger = GenerationLedger(str(self.ledger.root))
+            barrier.wait()
+            claims.append(ledger.claim_queue(record.id, now=10.0, lease_seconds=20.0))
+
+        workers = [threading.Thread(target=claim) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(sum(claim is not None for claim in claims), 1)
+        self.assertEqual(self.ledger.load(record.id).status, "dispatching")
+        self.assertIsNone(self.ledger.claim_queue(record.id, now=29.0, lease_seconds=20))
+        reclaimed = self.ledger.claim_queue(record.id, now=30.0, lease_seconds=20)
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed.status, "dispatching")
+
+    def test_queue_cancel_and_dispatch_claim_are_mutually_exclusive(self):
+        record = self._record()
+        self.ledger.queue(record, "quota", retry_at=1.0, attempt=1)
+        claimed = self.ledger.claim_queue(record.id, now=10, lease_seconds=20)
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(self.ledger.cancel_queue(record.id))
+        self.assertEqual(self.ledger.load(record.id).status, "dispatching")
+
+        other = self._record("other")
+        self.ledger.queue(other, "quota", retry_at=1.0, attempt=1)
+        cancelled = self.ledger.cancel_queue(other.id)
+        self.assertEqual(cancelled.status, "failed")
+        self.assertIsNone(self.ledger.claim_queue(other.id, now=10, lease_seconds=20))
+
+    def test_resume_claim_is_single_use_and_stale_owner_cannot_release_new_claim(self):
+        record = self._record()
+        self.ledger.interrupt(record, "timeout", output="partial")
+        first = self.ledger.claim_resume(record.id, now=10, lease_seconds=5)
+        self.assertIsNotNone(first)
+        first_id = GenerationLedger._resume_claim_id(first)
+        self.assertEqual(self.ledger.resumable(record.fingerprint).status, "resuming")
+        self.assertIsNone(self.ledger.claim_resume(record.id, now=14, lease_seconds=5))
+        second = self.ledger.claim_resume(record.id, now=15, lease_seconds=5)
+        self.assertIsNotNone(second)
+        second_id = GenerationLedger._resume_claim_id(second)
+        self.assertNotEqual(first_id, second_id)
+        self.assertFalse(self.ledger.release_resume_claim(first, first_id))
+        self.ledger.resume(second, by="child", model="m", claim_id=second_id)
+        self.assertEqual(self.ledger.load(record.id).status, "resumed")
+
+    def test_handoff_nonce_can_be_consumed_once_until_expiry(self):
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def consume():
+            ledger = GenerationLedger(str(self.ledger.root))
+            barrier.wait()
+            outcomes.append(
+                ledger.consume_handoff_nonce("nonce", expires_at=200, now=100)
+            )
+
+        workers = [threading.Thread(target=consume) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(outcomes.count(True), 1)
+        self.assertEqual(outcomes.count(False), 1)
+        self.assertTrue(
+            self.ledger.consume_handoff_nonce("nonce", expires_at=300, now=201)
+        )
 
     def test_heal_appends_event_without_changing_status(self):
         record = self._record()

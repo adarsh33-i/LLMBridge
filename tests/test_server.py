@@ -2,6 +2,7 @@ import io
 import json
 import os
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -1568,6 +1569,8 @@ class ResumeInterruptedTests(unittest.TestCase):
         record = self._interrupted_record()
         token = mint_handoff_token(record, secret=b"s" * 16, now=1000.0)
         self.assertNotIn("=", token)
+        self.assertNotIn("Continue this", token)
+        self.assertNotIn("half", token)
         payload = verify_handoff_token(token, secret=b"s" * 16, now=1001.0)
         self.assertEqual(payload["generation_id"], record.id)
         self.assertEqual(payload["partial_output"], "half")
@@ -1611,6 +1614,85 @@ class ResumeInterruptedTests(unittest.TestCase):
             with urlopen(self._url("/v1/interrupted")) as response:
                 self.assertNotIn("handoff_token", json.loads(response.read()))
 
+    def test_handoff_callback_settles_only_an_issued_token(self):
+        import hashlib
+        import hmac
+
+        self._use_ledger_backed_server()
+        record = self._interrupted_record()
+        nonce = "callback-nonce"
+        self.ledger.issue_handoff(
+            record, nonce=nonce, expires_at=time.time() + 60
+        )
+        body = json.dumps(
+            {
+                "source_generation": record.id,
+                "nonce": nonce,
+                "destination_generation": "gen_remote000001",
+                "model": "other-model",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        secret = b"shared-secret-value"
+        signature = hmac.new(
+            secret, b"LLMBridge handoff settlement v1\0" + body, hashlib.sha256
+        ).hexdigest()
+        request = Request(
+            self._url("/v1/handoffs/settle"),
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-LLMBridge-Handoff-Signature": signature,
+            },
+            method="POST",
+        )
+        with patch.dict(os.environ, {"LLMBRIDGE_HANDOFF_SECRET": secret.decode()}):
+            invalid_request = Request(
+                self._url("/v1/handoffs/settle"),
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-LLMBridge-Handoff-Signature": "invalid",
+                },
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as invalid:
+                urlopen(invalid_request)
+            self.assertEqual(invalid.exception.code, 401)
+            invalid.exception.close()
+            self.assertEqual(self.ledger.load(record.id).status, "interrupted")
+            with urlopen(request) as response:
+                self.assertEqual(response.status, 200)
+                self.assertTrue(json.loads(response.read())["settled"])
+            with urlopen(request) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(self.ledger.load(record.id).status, "resumed")
+
+    def test_get_interrupted_registers_callback_capable_handoff(self):
+        self._use_ledger_backed_server()
+        record = self._interrupted_record()
+        env = {
+            "LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value",
+            "LLMBRIDGE_HANDOFF_CALLBACK_URL": "https://bridge-a.example",
+        }
+        with patch.dict(os.environ, env):
+            with urlopen(self._url("/v1/interrupted")) as response:
+                state = json.loads(response.read())
+        from llmbridge.server import verify_handoff_token
+        payload = verify_handoff_token(
+            state["handoff_token"], secret=b"shared-secret-value"
+        )
+        self.assertEqual(
+            payload["callback_url"],
+            "https://bridge-a.example/v1/handoffs/settle",
+        )
+        issued = [
+            event for event in self.ledger.load(record.id).events
+            if event.type == "handoff_issued"
+        ]
+        self.assertEqual(issued[-1].data["nonce"], payload["jti"])
+
     def test_resume_accepts_a_handoff_token_from_another_bridge(self):
         # Bridge A minted the token; this bridge (B) has never seen gen_remote.
         self._use_ledger_backed_server()
@@ -1651,6 +1733,77 @@ class ResumeInterruptedTests(unittest.TestCase):
         self.assertEqual(handoff.data["source_model"], "claude-sonnet-4-5")
         self.assertEqual(handoff.data["resumed_chars"], 4)
         self.assertEqual(self.ledger.interrupted(), [])  # nothing local was touched
+        with patch.dict(os.environ, env):
+            with self.assertRaises(HTTPError) as replay:
+                urlopen(self._resume({"handoff_token": token, "model": "other"}))
+        self.assertEqual(replay.exception.code, 409)
+        self.assertIn("already been used", replay.exception.read().decode())
+        replay.exception.close()
+
+    def test_completed_remote_handoff_sends_signed_source_callback(self):
+        import hashlib
+        import hmac
+        import time as _time
+
+        self._use_ledger_backed_server()
+        from llmbridge.ledger import GenerationRecord
+        from llmbridge.server import mint_handoff_token
+        remote = GenerationRecord(
+            id="gen_remote000002", fingerprint="fp-remote", model="source-model",
+            prompt="Continue this", system=None, params={"max_tokens": 64},
+            status="interrupted", created_at=_time.time(), updated_at=_time.time(),
+            request={"messages": [{"role": "user", "content": "Continue this"}]},
+            output="half",
+        )
+        token = mint_handoff_token(
+            remote,
+            secret=b"shared-secret-value",
+            callback_url="https://bridge-a.example/v1/handoffs/settle",
+        )
+        env = {
+            "LLMBRIDGE_HANDOFF_SECRET": "shared-secret-value",
+            "LLMBRIDGE_TEST_API_KEY": "k",
+        }
+        callback_called = threading.Event()
+        calls = []
+
+        def fake_urlopen(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 2:
+                callback_called.set()
+            return self._ok_response()
+
+        with patch.dict(os.environ, env):
+            with patch(
+                "llmbridge.server.urlopen",
+                side_effect=fake_urlopen,
+            ):
+                with urlopen(
+                    self._resume({"handoff_token": token, "model": "other"})
+                ) as response:
+                    self.assertEqual(response.status, 200)
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+                self.assertTrue(callback_called.wait(timeout=1))
+        self.assertEqual(self.ledger.load(child_id).status, "completed")
+        self.assertEqual(len(calls), 2)
+        callback = calls[1][0][0]
+        self.assertEqual(
+            callback.full_url,
+            "https://bridge-a.example/v1/handoffs/settle",
+        )
+        body = json.loads(callback.data)
+        self.assertEqual(body["source_generation"], remote.id)
+        signature = next(
+            value for name, value in callback.header_items()
+            if name.lower() == "x-llmbridge-handoff-signature"
+        )
+        expected = hmac.new(
+            b"shared-secret-value",
+            b"LLMBridge handoff settlement v1\0"
+            + json.dumps(body, separators=(",", ":"), sort_keys=True).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(signature, expected)
 
     def test_resume_with_token_but_no_secret_is_a_clear_400(self):
         from llmbridge.server import mint_handoff_token
@@ -1667,7 +1820,13 @@ class ResumeInterruptedTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as error:
                 urlopen(self._resume({"handoff_token": token}))
         self.assertEqual(error.exception.code, 400)
-        self.assertIn("signature", error.exception.read().decode())
+        self.assertIn("authentication", error.exception.read().decode())
+        error.exception.close()
+        with patch.dict(os.environ, {"LLMBRIDGE_API_KEY": "api-key-only-no-handoff-secret"}):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(self._resume({"handoff_token": token}))
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("LLMBRIDGE_HANDOFF_SECRET", error.exception.read().decode())
         error.exception.close()
 
     def test_resume_reissues_partial_output_as_assistant_turn(self):
@@ -1928,6 +2087,27 @@ class AutoResumeTests(unittest.TestCase):
         self.assertEqual(heal.data["resumed_chars"], 5)
         self.assertEqual(self.ledger.load(source.id).status, "resumed")
         self.assertEqual(self.ledger.interrupted(), [])
+
+    def test_changing_only_model_auto_resumes_without_general_auto_resume(self):
+        source = self._interrupt(self.BODY)
+        switched = {**self.BODY, "model": "other"}
+        with patch.dict(os.environ, {"LLMBRIDGE_AUTO_RESUME": ""}):
+            with patch("llmbridge.server.urlopen", return_value=self._ok(" world")) as call:
+                with urlopen(self._post(switched)) as response:
+                    result = json.loads(response.read())
+                    child_id = response.headers.get("X-LLMBridge-Generation")
+                    resumed = response.headers.get("X-LLMBridge-Resumed")
+
+        self.assertEqual(result["content"][0]["text"], "Hello world")
+        self.assertEqual(resumed, source.id)
+        sent = json.loads(call.call_args.args[0].data)
+        self.assertEqual(sent["model"], "other-model")
+        self.assertEqual(sent["messages"][-1], {"role": "assistant", "content": "Hello"})
+        child = self.ledger.load(child_id)
+        self.assertEqual(child.model, "other")
+        self.assertEqual(child.parent, source.id)
+        self.assertEqual(child.model_independent_fingerprint, source.model_independent_fingerprint)
+        self.assertEqual(self.ledger.load(source.id).status, "resumed")
 
     def test_stream_resume_replays_prefix_then_continuation(self):
         body = {**self.BODY, "stream": True}
@@ -2198,6 +2378,12 @@ class ResumeLineageTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 502)
         error.exception.close()
 
+        deadline = time.monotonic() + 1
+        while (
+            self.ledger.load(state["generation_id"]).status != "interrupted"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         self.assertEqual(self.ledger.load(state["generation_id"]).status, "interrupted")
         pending = self.ledger.interrupted()
         self.assertEqual(len(pending), 2)

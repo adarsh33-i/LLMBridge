@@ -1568,6 +1568,55 @@ class ProtocolTests(unittest.TestCase):
                         }
                     )
 
+    @unittest.skipUnless(
+        hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd,
+        "requires descriptor-relative no-follow opens",
+    )
+    def test_local_document_open_rejects_symlink_swap_after_path_validation(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, "secret.txt")
+            path = os.path.join(allowed, "document.txt")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("Private file content")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("Safe file content")
+
+            real_open = os.open
+            swapped = False
+
+            def swap_before_open(name, flags, *args, **kwargs):
+                nonlocal swapped
+                if name == "document.txt" and kwargs.get("dir_fd") is not None and not swapped:
+                    os.unlink(path)
+                    os.symlink(target, path)
+                    swapped = True
+                return real_open(name, flags, *args, **kwargs)
+
+            with patch.dict(os.environ, {"LLMBRIDGE_DOCUMENT_ROOTS": allowed}):
+                with patch("llmbridge.protocol.os.open", side_effect=swap_before_open):
+                    with self.assertRaisesRegex(ProtocolError, "safely open"):
+                        anthropic_to_openai(
+                            {
+                                "model": "client-model",
+                                "max_tokens": 100,
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "document",
+                                                "source": {
+                                                    "type": "file",
+                                                    "file_id": path,
+                                                },
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        )
+            self.assertTrue(swapped)
+
     def test_local_document_read_errors_are_protocol_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             missing = os.path.join(directory, "missing.txt")

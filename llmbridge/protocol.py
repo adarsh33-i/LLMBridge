@@ -12,6 +12,7 @@ import os
 import re
 import ssl
 import socket
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -32,6 +33,9 @@ class ProtocolError(ValueError):
 
 
 _LOGGER = logging.getLogger(__name__)
+_HAS_DESCRIPTOR_SAFE_OPEN = (
+    hasattr(os, "O_NOFOLLOW") and os.open in getattr(os, "supports_dir_fd", set())
+)
 
 
 def _env_enabled(name: str) -> bool:
@@ -684,10 +688,14 @@ def _resolve_document_source(source: dict[str, Any]) -> tuple[bytes, str]:
             resolved_path = path.expanduser().resolve(strict=True)
         except OSError as error:
             raise ProtocolError("Could not resolve the local document path") from error
-        if not any(
-            resolved_path == root or root in resolved_path.parents
-            for root in allowed_roots
-        ):
+        allowed_root = next(
+            (
+                root for root in allowed_roots
+                if resolved_path == root or root in resolved_path.parents
+            ),
+            None,
+        )
+        if allowed_root is None:
             raise ProtocolError(
                 "Local document path is outside the configured document roots"
             )
@@ -695,17 +703,52 @@ def _resolve_document_source(source: dict[str, Any]) -> tuple[bytes, str]:
             guessed_type = mimetypes.guess_type(str(resolved_path))[0]
             if guessed_type:
                 media_type = guessed_type
+        if not _HAS_DESCRIPTOR_SAFE_OPEN:
+            raise ProtocolError(
+                "Safe local document opening is unavailable on this platform"
+            )
+        relative_path = resolved_path.relative_to(allowed_root)
+        if not relative_path.parts:
+            raise ProtocolError("Local documents must be regular files")
+        directory_fd: int | None = None
+        file_fd: int | None = None
         try:
-            if not resolved_path.is_file() or resolved_path.stat().st_size > _MAX_REMOTE_DOCUMENT_BYTES:
+            directory_fd = os.open(
+                allowed_root.anchor,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+            )
+            for component in (*allowed_root.parts[1:], *relative_path.parts[:-1]):
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(
+                relative_path.parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > _MAX_REMOTE_DOCUMENT_BYTES:
                 raise ProtocolError(
                     "Local documents must be regular files no larger than 10 MiB"
                 )
-            with resolved_path.open("rb") as document:
+            with os.fdopen(file_fd, "rb") as document:
+                file_fd = None
                 data = document.read(_MAX_REMOTE_DOCUMENT_BYTES + 1)
         except ProtocolError:
             raise
         except OSError as error:
-            raise ProtocolError("Could not read the local document") from error
+            raise ProtocolError("Could not safely open the local document") from error
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
         if len(data) > _MAX_REMOTE_DOCUMENT_BYTES:
             raise ProtocolError("Local document exceeds the 10 MiB size limit")
         return data, media_type

@@ -19,10 +19,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from .ledger import (
     GenerationLedger,
     GenerationRecord,
     _fingerprint,
+    _model_independent_fingerprint,
     append_assistant_turn,
     request_replay,
 )
@@ -161,6 +165,47 @@ def _queue_max_attempts() -> int:
     except ValueError:
         return _DEFAULT_QUEUE_MAX_ATTEMPTS
     return value if value >= 1 else _DEFAULT_QUEUE_MAX_ATTEMPTS
+
+
+def _start_lease_heartbeat(
+    ledger: GenerationLedger,
+    record: GenerationRecord,
+    claim_id: str,
+    *,
+    lease_seconds: float,
+    resume: bool = False,
+) -> threading.Event:
+    stopped = threading.Event()
+
+    def renew() -> None:
+        interval = max(1.0, min(30.0, lease_seconds / 3.0))
+        while not stopped.wait(interval):
+            try:
+                renewed = (
+                    ledger.renew_resume_claim(
+                        record, claim_id, lease_seconds=lease_seconds
+                    )
+                    if resume
+                    else ledger.renew_queue_claim(
+                        record, claim_id, lease_seconds=lease_seconds
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Could not renew %s lease for %s",
+                    "resume" if resume else "queue",
+                    record.id,
+                )
+                return
+            if not renewed:
+                return
+
+    threading.Thread(
+        target=renew,
+        name=f"llmbridge-{'resume' if resume else 'queue'}-lease-{record.id}",
+        daemon=True,
+    ).start()
+    return stopped
 
 
 def _self_heal_enabled() -> bool:
@@ -554,18 +599,18 @@ def _generation_recovery_hint(record: GenerationRecord | None) -> str:
     )
 
 
-_HANDOFF_VERSION = 1
+_HANDOFF_VERSION = 2
 _HANDOFF_MAX_BYTES = 2 * 1024 * 1024
 _DEFAULT_HANDOFF_TTL_SECONDS = 24 * 3600.0
 
 
 def _handoff_secret() -> bytes | None:
-    """Key that signs handoff tokens: ``LLMBRIDGE_HANDOFF_SECRET`` or the API key.
+    """Dedicated key that encrypts and authenticates handoff tokens.
 
     None means no secret is configured, so tokens cannot be minted or accepted.
-    Two bridges that should hand work to each other share one of these values.
+    Two bridges that should hand work to each other share this value.
     """
-    secret = os.environ.get("LLMBRIDGE_HANDOFF_SECRET") or os.environ.get("LLMBRIDGE_API_KEY")
+    secret = os.environ.get("LLMBRIDGE_HANDOFF_SECRET")
     if not secret or len(secret) < 16:
         return None
     return secret.encode("utf-8")
@@ -575,17 +620,37 @@ def _handoff_ttl_seconds() -> float:
     return _env_positive_number("LLMBRIDGE_HANDOFF_TTL_SECONDS", _DEFAULT_HANDOFF_TTL_SECONDS)
 
 
-def mint_handoff_token(record: GenerationRecord, *, secret: bytes, now: float | None = None) -> str:
-    """Pack an interrupted record into a compact signed blob another bridge can resume.
+def _handoff_callback_url() -> str | None:
+    """Build the settlement endpoint from an explicitly configured public base URL."""
+    base_url = os.environ.get("LLMBRIDGE_HANDOFF_CALLBACK_URL", "").strip()
+    if not base_url:
+        return None
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("LLMBRIDGE_HANDOFF_CALLBACK_URL must be an http(s) base URL")
+    return base_url.rstrip("/") + "/v1/handoffs/settle"
 
-    The payload is the replayable request, the partial text, the source model,
-    the fingerprint, and the source bridge's generation id, so the receiving
-    bridge records lineage back to it. Signed with HMAC-SHA256; the signature
-    covers the exact payload bytes.
-    """
+
+def mint_handoff_token(
+    record: GenerationRecord,
+    *,
+    secret: bytes,
+    now: float | None = None,
+    nonce: str | None = None,
+    callback_url: str | None = None,
+) -> str:
+    """Encrypt an interrupted record into a one-use bearer token."""
     payload = {
         "v": _HANDOFF_VERSION,
         "iat": now if now is not None else time.time(),
+        "jti": nonce or uuid.uuid4().hex,
         "generation_id": record.id,
         "fingerprint": record.fingerprint,
         "model": record.model,
@@ -596,12 +661,37 @@ def mint_handoff_token(record: GenerationRecord, *, secret: bytes, now: float | 
         "partial_output": record.output or "",
         "output_tokens": record.output_tokens,
     }
+    if callback_url:
+        payload["callback_url"] = callback_url
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    sig = hmac.new(secret, raw, hashlib.sha256).digest()
+    key = hmac.new(secret, b"LLMBridge handoff encryption v2", hashlib.sha256).digest()
+    nonce = os.urandom(12)
+    encrypted = AESGCM(key).encrypt(nonce, raw, b"llmbridge-handoff-v2")
     return (
-        base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        base64.urlsafe_b64encode(nonce).decode("ascii").rstrip("=")
         + "."
-        + base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+        + base64.urlsafe_b64encode(encrypted).decode("ascii").rstrip("=")
+    )
+
+
+def _mint_record_handoff_token(
+    ledger: GenerationLedger, record: GenerationRecord, secret: bytes
+) -> str:
+    callback_url = _handoff_callback_url()
+    nonce = uuid.uuid4().hex
+    issued_at = time.time()
+    if callback_url and not ledger.issue_handoff(
+        record,
+        nonce=nonce,
+        expires_at=issued_at + _handoff_ttl_seconds(),
+    ):
+        raise RuntimeError("source generation is no longer interrupted")
+    return mint_handoff_token(
+        record,
+        secret=secret,
+        now=issued_at,
+        nonce=nonce,
+        callback_url=callback_url,
     )
 
 
@@ -610,7 +700,7 @@ def _b64decode(part: str) -> bytes:
 
 
 def verify_handoff_token(token: str, *, secret: bytes, now: float | None = None) -> dict[str, Any]:
-    """Check a handoff token's signature, age and shape; return its payload.
+    """Decrypt a handoff token and check its age and shape.
 
     Raises ``ValueError`` with a reason safe to show the caller.
     """
@@ -618,15 +708,19 @@ def verify_handoff_token(token: str, *, secret: bytes, now: float | None = None)
         raise ValueError("handoff token is malformed")
     if len(token) > _HANDOFF_MAX_BYTES:
         raise ValueError("handoff token is too large")
-    raw_part, sig_part = token.split(".", 1)
+    nonce_part, encrypted_part = token.split(".", 1)
     try:
-        raw = _b64decode(raw_part)
-        sig = _b64decode(sig_part)
+        nonce = _b64decode(nonce_part)
+        encrypted = _b64decode(encrypted_part)
+        if len(nonce) != 12:
+            raise ValueError("invalid nonce")
     except (ValueError, TypeError) as error:
         raise ValueError("handoff token is malformed") from error
-    expected = hmac.new(secret, raw, hashlib.sha256).digest()
-    if not hmac.compare_digest(sig, expected):
-        raise ValueError("handoff token signature does not match this bridge's secret")
+    key = hmac.new(secret, b"LLMBridge handoff encryption v2", hashlib.sha256).digest()
+    try:
+        raw = AESGCM(key).decrypt(nonce, encrypted, b"llmbridge-handoff-v2")
+    except InvalidTag as error:
+        raise ValueError("handoff token authentication failed") from error
     try:
         payload = json.loads(raw)
     except ValueError as error:
@@ -643,6 +737,23 @@ def verify_handoff_token(token: str, *, secret: bytes, now: float | None = None)
         raise ValueError("handoff token has no partial output")
     if not isinstance(payload.get("prompt"), str) or not payload["prompt"]:
         raise ValueError("handoff token has no prompt")
+    if not isinstance(payload.get("jti"), str) or not payload["jti"]:
+        raise ValueError("handoff token has no nonce")
+    callback_url = payload.get("callback_url")
+    if callback_url is not None:
+        if not isinstance(callback_url, str):
+            raise ValueError("handoff callback URL is invalid")
+        callback = urlsplit(callback_url)
+        if (
+            callback.scheme not in ("http", "https")
+            or not callback.hostname
+            or callback.username is not None
+            or callback.password is not None
+            or callback.query
+            or callback.fragment
+            or not callback.path.endswith("/v1/handoffs/settle")
+        ):
+            raise ValueError("handoff callback URL is invalid")
     return payload
 
 
@@ -660,6 +771,8 @@ def _state_from_handoff(payload: dict[str, Any]) -> dict[str, Any]:
         "fingerprint": payload.get("fingerprint"),
         "output_tokens": payload.get("output_tokens"),
         "handoff": True,
+        "handoff_jti": payload["jti"],
+        "handoff_iat": payload["iat"],
     }
 
 
@@ -917,6 +1030,21 @@ def _heal_tool_calls_enabled() -> bool:
 
 def _new_tool_state() -> dict[str, Any]:
     return {"held": {}, "order": []}
+
+
+def _tool_call_signature(name: str, arguments: Any) -> tuple[str, str]:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            pass
+    try:
+        normalized = json.dumps(
+            arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    except (TypeError, ValueError):
+        normalized = repr(arguments)
+    return name, normalized
 
 
 def _hold_tool_event(event: bytes, tool_state: dict[str, Any]) -> bool:
@@ -1298,22 +1426,49 @@ class LLMBridgeServer(ThreadingHTTPServer):
         if ledger is None:
             return
         now = time.time()
-        for record in ledger.queued():
-            if GenerationLedger.queue_retry_at(record) > now:
-                continue
-            self._run_queued_generation(record)
+        lease_seconds = max(
+            60.0,
+            _upstream_timeout_seconds()
+            * max(1, len(self.model_routes))
+            * _route_attempts()
+            + 30.0,
+        )
+        for candidate in ledger.dispatchable(now):
+            record = ledger.claim_queue(
+                candidate.id, now=now, lease_seconds=lease_seconds
+            )
+            if record is not None:
+                claim_id = ledger._queue_claim_id(record)
+                if claim_id is None:
+                    logger.error("Queue claim for %s has no claim id", record.id)
+                    continue
+                stopped = _start_lease_heartbeat(
+                    ledger, record, claim_id, lease_seconds=lease_seconds
+                )
+                try:
+                    self._run_queued_generation(record)
+                finally:
+                    stopped.set()
 
     def _run_queued_generation(self, record: GenerationRecord) -> None:
         """Re-send one queued generation, following its fallbacks, and finalize it."""
         ledger = self.ledger
-        if ledger is None or record.status != "queued":
+        if ledger is None or record.status != "dispatching":
+            return
+        claim_id = GenerationLedger._queue_claim_id(record)
+        if claim_id is None:
+            logger.error("Refusing to dispatch %s without a queue claim", record.id)
             return
         try:
             route, upstream_model = resolve_model_route(
                 record.model, self.model_routes
             )
         except RoutingError as error:
-            ledger.fail(record, f"queued model is no longer configured: {error}")
+            ledger.fail(
+                record,
+                f"queued model is no longer configured: {error}",
+                claim_id=claim_id,
+            )
             return
         attempt = GenerationLedger.queue_attempt(record)
         body: dict[str, Any] = dict(record.request)
@@ -1340,7 +1495,11 @@ class LLMBridgeServer(ThreadingHTTPServer):
                 # The saved request can no longer be translated (or the route's
                 # key is gone). Another poll cannot fix that, so fail once
                 # instead of retrying every second forever.
-                ledger.fail(record, f"queued request can no longer be sent: {error}")
+                ledger.fail(
+                    record,
+                    f"queued request can no longer be sent: {error}",
+                    claim_id=claim_id,
+                )
                 return
             try:
                 with urlopen(request, timeout=_upstream_timeout_seconds()) as upstream:
@@ -1394,7 +1553,12 @@ class LLMBridgeServer(ThreadingHTTPServer):
                 )
                 continue
             output = _anthropic_text(anthropic_response)
-            ledger.complete(record, output, _upstream_output_tokens(reply))
+            ledger.complete(
+                record,
+                output,
+                _upstream_output_tokens(reply),
+                claim_id=claim_id,
+            )
             # Only after the work is finished: a failure between the two writes
             # must leave it recoverable, never marked resumed but incomplete.
             tracker = self.work_tracker
@@ -1418,10 +1582,15 @@ class LLMBridgeServer(ThreadingHTTPServer):
             quota_failure
             or failure
             or ("invalid", "no usable model route is configured", None),
+            claim_id,
         )
 
     def _requeue_or_fail(
-        self, record: GenerationRecord, attempt: int, failure: _Failure
+        self,
+        record: GenerationRecord,
+        attempt: int,
+        failure: _Failure,
+        claim_id: str,
     ) -> None:
         """After a failed retry, park it again or give up for good."""
         ledger = self.ledger
@@ -1430,9 +1599,15 @@ class LLMBridgeServer(ThreadingHTTPServer):
         _, message, _ = failure
         if _queue_retryable(failure) and attempt < _queue_max_attempts():
             retry_after = _queue_retry_seconds() * (attempt + 1)
-            ledger.queue(record, message, time.time() + retry_after, attempt + 1)
+            ledger.queue(
+                record,
+                message,
+                time.time() + retry_after,
+                attempt + 1,
+                claim_id=claim_id,
+            )
             return
-        ledger.fail(record, message)
+        ledger.fail(record, message, claim_id=claim_id)
 
 
 class LLMBridgeHandler(BaseHTTPRequestHandler):
@@ -1548,7 +1723,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         newest = next((r for r in pending if r.id == state.get("generation_id")), None)
         if secret is not None and newest is not None:
             # Another bridge sharing the secret can resume this without the ledger.
-            state["handoff_token"] = mint_handoff_token(newest, secret=secret)
+            try:
+                state["handoff_token"] = _mint_record_handoff_token(
+                    tracker.ledger, newest, secret
+                )
+            except (OSError, ValueError, RuntimeError) as error:
+                self.log_error("Could not mint handoff token: %s", error)
+                self._send_error(500, "internal_error", "Could not mint handoff token")
+                return
         self._send_json(200, state)
 
     def _ledger(self) -> GenerationLedger | None:
@@ -1601,7 +1783,14 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         payload = record.to_dict()
         secret = _handoff_secret()
         if secret is not None and record.status == "interrupted" and record.output:
-            payload["handoff_token"] = mint_handoff_token(record, secret=secret)
+            try:
+                payload["handoff_token"] = _mint_record_handoff_token(
+                    ledger, record, secret
+                )
+            except (OSError, ValueError, RuntimeError) as error:
+                self.log_error("Could not mint handoff token: %s", error)
+                self._send_error(500, "internal_error", "Could not mint handoff token")
+                return
         self._send_json(200, payload)
 
     def _generation_tree(self, path: str) -> None:
@@ -1648,11 +1837,17 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         if ledger is None:
             return
         generation_id = self._queue_id_from_path(path)
-        record = ledger.load(generation_id) if generation_id else None
-        if record is None or record.status != "queued":
+        record = ledger.cancel_queue(generation_id) if generation_id else None
+        if record is None:
+            current = ledger.load(generation_id) if generation_id else None
+            if current is not None and current.status == "dispatching":
+                self._send_error(
+                    409, "conflict_error",
+                    "Generation is already dispatching and can no longer be cancelled",
+                )
+                return
             self._send_error(404, "not_found", "No queued generation with that id")
             return
-        ledger.fail(record, "cancelled from the queue")
         self._send_json(200, {"cancelled": True, "id": record.id})
 
     def _delete_generation(self, path: str) -> None:
@@ -1764,18 +1959,19 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             )
             return
         token = body.get("handoff_token")
+        handoff_payload: dict[str, Any] | None = None
         state: dict[str, Any] | None
         if token is not None:
             secret = _handoff_secret()
             if secret is None:
                 self._send_error(
                     400, "invalid_request_error",
-                    "This bridge has no LLMBRIDGE_HANDOFF_SECRET (or LLMBRIDGE_API_KEY) "
-                    "to verify handoff tokens with",
+                    "This bridge has no LLMBRIDGE_HANDOFF_SECRET to verify handoff tokens with",
                 )
                 return
             try:
-                state = _state_from_handoff(verify_handoff_token(token, secret=secret))
+                handoff_payload = verify_handoff_token(token, secret=secret)
+                state = _state_from_handoff(handoff_payload)
             except ValueError as error:
                 self._send_error(400, "invalid_request_error", str(error))
                 return
@@ -1822,6 +2018,12 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         ledger = self.server.ledger
         handed_off = bool(state.get("handoff"))
         if ledger is None:
+            if handed_off:
+                self._send_error(
+                    503, "service_unavailable",
+                    "Handoff tokens require a ledger for one-time consumption",
+                )
+                return
             # Without a generation ledger there is no lineage to attach the
             # second run to, so keep the earlier contract: replay the work and
             # drop the record it came from.
@@ -1829,9 +2031,56 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 tracker.clear_state()
             self._handle_messages(resume_body, model, route, upstream_model)
             return
+        if handoff_payload is not None:
+            issued = handoff_payload.get("iat")
+            nonce = handoff_payload.get("jti")
+            if (
+                not isinstance(issued, (int, float))
+                or not isinstance(nonce, str)
+                or not ledger.consume_handoff_nonce(
+                    nonce,
+                    expires_at=float(issued) + _handoff_ttl_seconds(),
+                )
+            ):
+                self._send_error(
+                    409, "conflict_error",
+                    "Handoff token has already been used",
+                )
+                return
         source = ledger.load(state["generation_id"]) if state.get("generation_id") else None
+        claim_id: str | None = None
+        heartbeat: threading.Event | None = None
         child: GenerationRecord | None = None
         if source is not None:
+            lease_seconds = max(
+                60.0,
+                _upstream_timeout_seconds()
+                * max(1, len(self.server.model_routes))
+                * _route_attempts()
+                + 30.0,
+            )
+            claimed_source = ledger.claim_resume(
+                source.id, lease_seconds=lease_seconds
+            )
+            if claimed_source is None:
+                self._send_error(
+                    409, "conflict_error",
+                    "Interrupted generation is already being resumed or is no longer available",
+                )
+                return
+            source = claimed_source
+            claim_id = ledger._resume_claim_id(source)
+            heartbeat = (
+                _start_lease_heartbeat(
+                    ledger,
+                    source,
+                    claim_id,
+                    lease_seconds=lease_seconds,
+                    resume=True,
+                )
+                if claim_id is not None
+                else None
+            )
             child = ledger.create(
                 resume_body,
                 model,
@@ -1859,14 +2108,114 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         # Settling the interruption happens inside the run: deleting the source
         # would erase the only evidence that this answer needed a second try,
         # which is what keeps resume outcomes measurable.
-        self._handle_messages(
-            resume_body, model, route, upstream_model, record=child, resolves=source
+        self._resolves_claim_id = claim_id
+        try:
+            self._handle_messages(
+                resume_body, model, route, upstream_model, record=child, resolves=source
+            )
+            if handoff_payload is not None and child is not None:
+                finished = ledger.load(child.id)
+                if finished is not None and finished.status == "completed":
+                    self._notify_handoff_source(handoff_payload, finished)
+        finally:
+            if heartbeat is not None:
+                heartbeat.set()
+            if source is not None and claim_id is not None:
+                ledger.release_resume_claim(source, claim_id)
+
+    def _notify_handoff_source(
+        self, payload: dict[str, Any], child: GenerationRecord
+    ) -> None:
+        callback_url = payload.get("callback_url")
+        secret = _handoff_secret()
+        if not isinstance(callback_url, str) or secret is None:
+            return
+        data = {
+            "source_generation": payload.get("generation_id"),
+            "nonce": payload.get("jti"),
+            "destination_generation": child.id,
+            "model": child.model,
+        }
+        body = json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        signature = hmac.new(
+            secret, b"LLMBridge handoff settlement v1\0" + body, hashlib.sha256
+        ).hexdigest()
+        request = Request(
+            callback_url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-LLMBridge-Handoff-Signature": signature,
+            },
+            method="POST",
         )
+        try:
+            with urlopen(request, timeout=3.0) as response:
+                response.read(64 * 1024)
+        except (OSError, TimeoutError, ValueError) as error:
+            self.log_error(
+                "Could not settle remote handoff %s on its source bridge: %s",
+                payload.get("generation_id"),
+                error,
+            )
+
+    def _settle_handoff_callback(self) -> None:
+        secret = _handoff_secret()
+        if secret is None:
+            self._send_error(503, "service_unavailable", "Handoff secret is not configured")
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size < 1 or size > 64 * 1024:
+                raise ValueError("Settlement body must be between 1 byte and 64 KiB")
+            body = self.rfile.read(size)
+        except (ValueError, OSError) as error:
+            self._send_error(400, "invalid_request_error", str(error))
+            return
+        signature = self.headers.get("X-LLMBridge-Handoff-Signature", "")
+        expected = hmac.new(
+            secret, b"LLMBridge handoff settlement v1\0" + body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            self._send_error(401, "authentication_error", "Invalid handoff settlement signature")
+            return
+        try:
+            data = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_error(400, "invalid_request_error", "Settlement body must be JSON")
+            return
+        if (
+            not isinstance(data, dict)
+            or not all(
+                isinstance(data.get(key), str) and data[key]
+                for key in ("source_generation", "nonce", "destination_generation", "model")
+            )
+        ):
+            self._send_error(400, "invalid_request_error", "Settlement fields are invalid")
+            return
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        settled = ledger.settle_handoff(
+            data["source_generation"],
+            nonce=data["nonce"],
+            destination_generation=data["destination_generation"],
+            model=data["model"],
+        )
+        if not settled:
+            self._send_error(
+                409, "conflict_error", "Handoff is unknown, expired, or already settled"
+            )
+            return
+        self._send_json(200, {"settled": True, "id": data["source_generation"]})
 
     def do_POST(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/v1/handoffs/settle":
+            self._settle_handoff_callback()
+            return
         if not self._authenticate_client():
             return
-        path = urlsplit(self.path).path
         if path == "/v1/messages/count_tokens":
             self._count_tokens()
             return
@@ -1919,23 +2268,23 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         primary_route: ModelRoute,
         primary_model: str,
     ) -> bool:
-        """Continue an interrupted run of this exact request instead of redoing it.
+        """Resume an exact retry or explicit model switch from saved work.
 
-        Only when ``LLMBRIDGE_AUTO_RESUME`` is on. The match is the request
-        fingerprint, so a byte-identical re-send (a client timeout retry, an
-        agent loop, or a second bridge sharing the ledger) picks up where the
-        earlier run stopped: the saved text is replayed to the client first,
-        then the continuation is appended. The upstream is opened before any
-        byte is sent, so when no route answers this returns False and the
-        ordinary request path runs and reports the failure the usual way.
+        Same-model retries remain opt-in. Changing only the model is treated as
+        an explicit request to continue the identical conversation on that
+        model, so it can resume without enabling general auto-resume.
         """
-        if not _auto_resume_enabled() or not isinstance(body, dict):
+        if not isinstance(body, dict):
             return False
         ledger = self.server.ledger
         if ledger is None:
             return False
         fingerprint = _fingerprint(body)
-        source = ledger.resumable(fingerprint)
+        source = ledger.resumable(fingerprint) if _auto_resume_enabled() else None
+        if source is None:
+            source = ledger.resumable_for_model_switch(
+                _model_independent_fingerprint(body), model
+            )
         if source is None:
             return False
         partial_output = source.output
@@ -1952,6 +2301,38 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         served, inflight = self._coalesce_or_lead(body, fingerprint)
         if served:
             return True
+        lease_seconds = max(
+            60.0,
+            _upstream_timeout_seconds()
+            * max(1, len(self.server.model_routes))
+            * _route_attempts()
+            + 30.0,
+        )
+        claimed_source = ledger.claim_resume(source.id, lease_seconds=lease_seconds)
+        if claimed_source is None:
+            self._send_error(
+                409,
+                "conflict_error",
+                "Matching interrupted work is already being resumed or is no longer available",
+            )
+            if inflight is not None:
+                self.server.finish_inflight(
+                    fingerprint, inflight, self._last_response
+                )
+            return True
+        source = claimed_source
+        claim_id = ledger._resume_claim_id(source)
+        heartbeat = (
+            _start_lease_heartbeat(
+                ledger,
+                source,
+                claim_id,
+                lease_seconds=lease_seconds,
+                resume=True,
+            )
+            if claim_id is not None
+            else None
+        )
         self._request_fingerprint = fingerprint
         self._last_response = None
         try:
@@ -1961,6 +2342,10 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 max_tokens, stream, fingerprint,
             )
         finally:
+            if heartbeat is not None:
+                heartbeat.set()
+            if claim_id is not None:
+                ledger.release_resume_claim(source, claim_id)
             if inflight is not None:
                 self.server.finish_inflight(fingerprint, inflight, self._last_response)
 
@@ -2005,11 +2390,13 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             parent=source.id,
             fork_event_seq=source.events[-1].seq if source.events else None,
             fingerprint=fingerprint,
+            model_independent_fingerprint=_model_independent_fingerprint(body),
         )
         # The same handler state _handle_messages would have set, so the
         # completion settles ``source`` by id and any failure is recorded
         # against ``child`` under the original request's identity.
         self._resolves = source
+        self._resolves_claim_id = ledger._resume_claim_id(source)
         self._generation_id = child.id
         try:
             ledger.heal(
@@ -2794,7 +3181,11 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             if ledger is None:
                 return
             try:
-                ledger.resume(source, by=record.id, model=model)
+                claim_id = getattr(self, "_resolves_claim_id", None)
+                if isinstance(claim_id, str):
+                    ledger.resume(source, by=record.id, model=model, claim_id=claim_id)
+                else:
+                    ledger.resume(source, by=record.id, model=model)
             except Exception as error:
                 self.log_error("Could not mark interrupted work resumed: %s", error)
             return
@@ -3408,7 +3799,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             self._relay_healed_tool_stream(
                 upstream, upstream_model, partial_chunks, reported_tokens, model,
                 record, tracker, prompt, system, max_tokens, body, block_state,
-                expected_names=[c["name"] for c in cut_calls],
+                expected_names=[c["name"] for c in cut_calls], issued=issued,
             )
         return True
 
@@ -3427,6 +3818,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         body: Any,
         block_state: dict[str, Any],
         expected_names: list[str | None],
+        issued: list[dict[str, Any]],
     ) -> None:
         """Relay a fallback's tool-call continuation into the client's open message.
 
@@ -3444,6 +3836,12 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         open_indices: list[int] = sorted(block_state["open"])
         index_map: dict[int, int] = {}
         issued_names: list[str] = []
+        released_signatures = {
+            _tool_call_signature(str(call["name"]), call["input"])
+            for call in issued
+        }
+        deduplicated_names: list[str] = []
+        pending_tools: dict[int, dict[str, Any]] = {}
         healed_tokens: int | None = None
         stop_reason = "end_turn"
         events = iter(stream_events(upstream, upstream_model))
@@ -3480,7 +3878,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                     return
                 audit = self._audit_tool_seam(
                     record, partial_chunks, seam_at, model, upstream_model,
-                    expected_names, issued_names,
+                    expected_names, issued_names, deduplicated_names,
                 )
                 self._emit_seam_event(record, audit, model, upstream_model, seam_at)
                 self._finalize_generation(
@@ -3526,6 +3924,20 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                         index_map[index] = text_index  # append onto the open text block
                         continue
                     text_index = next_index
+                elif block.get("type") == "tool_use":
+                    target = next_index
+                    next_index += 1
+                    index_map[index] = target
+                    pending_tools[index] = {
+                        "start": _sse_bytes(
+                            "content_block_start",
+                            {**data, "index": target},
+                        ),
+                        "deltas": [],
+                        "name": str(block.get("name") or ""),
+                        "arguments": [],
+                    }
+                    continue
                 else:
                     issued_names.append(str(block.get("name") or ""))
                 index_map[index] = next_index
@@ -3540,9 +3952,33 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
                 delta = data.get("delta") or {}
                 if delta.get("type") == "text_delta":
                     _collect_text_delta(event, partial_chunks)
-                if not write(_sse_bytes("content_block_delta", {**data, "index": target})):
+                forwarded = _sse_bytes("content_block_delta", {**data, "index": target})
+                pending = pending_tools.get(index)
+                if pending is not None:
+                    pending["deltas"].append(forwarded)
+                    json_part = delta.get("partial_json")
+                    if isinstance(json_part, str):
+                        pending["arguments"].append(json_part)
+                    continue
+                if not write(forwarded):
                     return
             elif kind == "content_block_stop":
+                pending = pending_tools.pop(index, None) if isinstance(index, int) else None
+                if pending is not None:
+                    signature = _tool_call_signature(
+                        pending["name"], "".join(pending["arguments"])
+                    )
+                    if signature in released_signatures:
+                        deduplicated_names.append(pending["name"])
+                        continue
+                    released_signatures.add(signature)
+                    issued_names.append(pending["name"])
+                    open_indices.append(index_map[index])
+                    if not write(pending["start"]):
+                        return
+                    for chunk in pending["deltas"]:
+                        if not write(chunk):
+                            return
                 # Closed in one place, at the end, so every index is stopped once.
                 continue
             elif kind == "message_delta":
@@ -3584,6 +4020,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
         to_model: str,
         expected_names: list[str | None],
         issued_names: list[str],
+        deduplicated_names: list[str],
     ) -> dict[str, Any] | None:
         """Score a tool-call heal: did the fallback finish the call it was asked to?
 
@@ -3614,6 +4051,7 @@ class LLMBridgeHandler(BaseHTTPRequestHandler):
             "tool_call": True,
             "tool_expected": wanted,
             "tool_issued": issued_names,
+            "tool_deduplicated": deduplicated_names,
             "tool_finished": finished,
             "suspect": bool(audit["suspect"]) or not finished,
         })

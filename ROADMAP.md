@@ -12,7 +12,7 @@ not yet committed. Items under *To implement* are not started unless marked DONE
 | # | Capability | Status | Where |
 |---|-----------|--------|-------|
 | A | Failover inside the answer: partial text handed to the fallback as a prefill, continuation appended to the same stream, one `message_start` | have | `server._heal_stream`, `_relay_healed_stream` |
-| B | Scored handoffs: every heal gets a `heal_seam` verdict (duplicated / restarted / suspect) | have | `server.score_seam`, `_audit_seam` |
+| B | Scored seams: every heal gets a `heal_seam` verdict (duplicated / restarted / suspect) | have | `server.score_seam`, `_audit_seam` |
 | C | Digest that outlives the records: verdicts copied to `heal_audit.jsonl` before prune and on shutdown | have | `ledger.consolidate_audits` |
 | D | Retention with stated exemptions: suspect seams and unfinished work survive the window under their own budgets | have | `ledger._prune_locked` |
 | E | Rehearsed failovers: `dream` cuts a real answer and scores a model's continuation; `failover` ranks every fallback on recorded seams | have | `cli._dream`, `cli._failover` |
@@ -26,26 +26,29 @@ not yet committed. Items under *To implement* are not started unless marked DONE
 | M | Heal hint with measured effect: opt-in system addendum on heal requests, `hinted` on every seam, restart rate per model split by hinted in `stats` | have, uncommitted | `server._HEAL_HINT`, `ledger.hint_effect` |
 | N | Seam verdict to the client: `llmbridge_seam` SSE event after `message_stop` (opt-in), `X-LLMBridge-Seam` header on non-stream resume | have, uncommitted | `server._emit_seam_event` |
 
-Action for the chart and article: add a **Scored handoffs** row. It exists, it is
-measured, and no competitor has it. Zero code.
+The comparison page already has a **Scored seams** row. Keep that wording aligned
+with the measured feature; "handoff" here means a continuation seam, not only a
+cross-bridge transfer.
 
 ## To implement
 
 ### 1. Resume across gateways (handoff token) — DONE (see row L)
 
-`LLMBRIDGE_HANDOFF_SECRET` (or `LLMBRIDGE_API_KEY`, 16+ chars) enables it. With a
-secret set, `GET /v1/interrupted` and `GET /v1/generations/{id}` carry a
-`handoff_token` for interrupted work with saved text: replayable request,
-partial output, source model, fingerprint, source generation id; HMAC-SHA256,
-24 h TTL (`LLMBRIDGE_HANDOFF_TTL_SECONDS`), 2 MiB cap. `POST /v1/interrupted/resume`
-on any bridge with the same secret accepts `{"handoff_token": ...}`, records the
+`LLMBRIDGE_HANDOFF_SECRET` (16+ chars) enables it. With a secret set,
+`GET /v1/interrupted` and `GET /v1/generations/{id}` carry an encrypted,
+authenticated, one-use `handoff_token` for interrupted work with saved text:
+replayable request, partial output, source model, fingerprint, source generation
+id; AES-GCM, 24 h TTL (`LLMBRIDGE_HANDOFF_TTL_SECONDS`), 2 MiB cap.
+`POST /v1/interrupted/resume` on any bridge with the same secret atomically consumes
+the nonce in its ledger and accepts `{"handoff_token": ...}`, records the
 child under the original fingerprint with a `handoff` event naming the remote
 source, and runs it. `llmbridge handoff <id> [--to <url> --model <alias>]` prints
-or sends the token.
+or sends the token. If bridge A sets `LLMBRIDGE_HANDOFF_CALLBACK_URL` to its
+reachable base URL, B sends a signed completion callback; A verifies the issued
+nonce and marks the source `resumed`. Callback failure is logged and leaves the
+source interrupted for operator review.
 
 - Chart row: *Work moves between machines* — competitors: no.
-- Still open: the source on bridge A stays `interrupted` until settled there;
-  B does not call back to A.
 
 ### 2. Fallback order learned from evidence — DONE (see row J)
 
@@ -62,8 +65,8 @@ records, cached 30 s and invalidated on every new seam audit.
 - Verified 2026-11-04 by unit tests: a two-fallback chain heals onto the
   cleaner-scored route; stays in config order below the sample minimum and
   when the flag is off.
-- Still open: `stats` does not yet summarise reorderings; the evidence is in
-  each heal event.
+- `stats` summarizes retained decisions, actual reorders, moved candidate
+  positions, and first-choice counts from the recorded heal events.
 
 ### 3. Prefill-aware heal prompting — DONE (see row M)
 
@@ -142,13 +145,14 @@ rather than returning an error. Requests still complete on cheaper models and
 - Size: two days. Spend is already recorded per generation.
 - The article lists a budget guard as a direction; this is the non-blocking form.
 
-### 9. Suspect seams as a test corpus
+### 9. Suspect seams as a test corpus — DONE
 
-Export suspect-seam records as fixtures and run them through `dream` against
-any new model before adding it as a fallback. The bridge generates its own
-continuation benchmark from production traffic.
+`llmbridge failover --export-corpus PATH` exports suspect-seam records as
+private fixtures. `llmbridge failover --corpus PATH --models ...` replays the
+fixtures through the same continuation request and seam scoring used by
+`dream`/`failover`, before adding a candidate as a fallback.
 
-- Size: one day. Mostly CLI plumbing around existing `dream`.
+- Corpus files contain production prompts and outputs; keep them private.
 
 ### 10. Exact-fingerprint answer reuse
 
@@ -165,21 +169,25 @@ A semantic cache or a cost dashboard. LiteLLM has both; adding them creates
 chart rows where LLMBridge ties or loses and pulls the project away from its
 one clear idea.
 
-## Chart honesty fix
+## Reliability and security hardening — DONE
 
-Change the LiteLLM cell under *Quota queue* from "limits only" to "retries and
-cooldowns". The row still favours LLMBridge (the queue survives a restart
-because it is the ledger), and readers who know LiteLLM will trust the rest of
-the chart more.
+Queue dispatch now atomically claims due records with expiring leases; cancellation
+is atomic against an unclaimed queue entry. Auto-resume claims interrupted sources
+with expiring leases, handoff tokens are encrypted and consumed once, tool-call
+healing suppresses exact repeats of already released calls, ledger event updates
+are read-modify-write transactions under the record lock, and local documents are
+opened through no-follow directory descriptors. See the README for delivery and
+idempotency limits.
 
 ## Suggested order
 
-Done: 1, 2, 3, 4, 5, 6 (rows G and I–N). Remaining:
+Done: 1, 2, 3, 4, 5, 6 (rows G and I–N), 9, plus the reliability and security hardening above. Remaining:
 
-1. **9. Suspect seams as a test corpus** — build once the digest holds real suspect seams.
-2. **7. Route-pair drift** — only if someone asks; overlaps with `replay`.
-3. **8. Budget guard** and **10. exact-fingerprint cache** — not recommended; both
+1. **7. Route-pair drift** — only if someone asks; overlaps with `replay`.
+2. **8. Budget guard** and **10. exact-fingerprint cache** — not recommended; both
    invite comparison on LiteLLM's home ground.
 
-The project's gap is now visibility, not features: add the *Scored handoffs* chart
-row, fix the LiteLLM quota-cell wording, and show tool-call healing in the article.
+The remaining gap is primarily evidence: report real-world heal-hint results
+once enough traffic exists on both the hinted and unhinted sides. `stats` now
+exposes the sample counts and delta when that comparison is available; no
+production result should be claimed before those samples exist.

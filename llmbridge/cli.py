@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from . import server
-from .ledger import GenerationLedger
+from .ledger import GenerationLedger, GenerationRecord
 from .routing import (
     RoutingError,
     config_search_paths,
@@ -132,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     handoff = subparsers.add_parser(
         "handoff",
-        help="Print a signed token that lets another bridge resume an interrupted generation",
+        help="Print a one-use encrypted token for resuming an interrupted generation on another bridge",
     )
     handoff.add_argument("id", help="Interrupted generation id, e.g. gen_1a2b3c4d5e6f")
     handoff.add_argument("--ledger", help="Path to the generation ledger directory")
@@ -246,6 +246,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     failover.add_argument("--config", help="Path to llmbridge.toml")
     failover.add_argument("--ledger", help="Path to the generation ledger directory")
+    failover.add_argument(
+        "--export-corpus",
+        metavar="PATH",
+        help="Export suspect seam fixtures to a local JSON corpus without calling models",
+    )
+    failover.add_argument(
+        "--corpus",
+        metavar="PATH",
+        help="Evaluate a previously exported suspect seam corpus",
+    )
+    failover.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow --export-corpus to replace an existing file",
+    )
     failover.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     setup = subparsers.add_parser(
@@ -408,6 +423,19 @@ def _stats(args: argparse.Namespace) -> int:
             f"  {heals['unconsolidated']} audit(s) not yet consolidated: "
             "run `llmbridge audit`"
         )
+    adaptive = heals["adaptive_order"]
+    if adaptive["decisions"]:
+        print(
+            f"Adaptive fallback order (retained records): {adaptive['reordered']} of "
+            f"{adaptive['decisions']} heal(s) reordered; "
+            f"{adaptive['candidate_moves']} candidate position change(s)"
+        )
+        if adaptive["first_choice_counts"]:
+            choices = ", ".join(
+                f"{model}={count}"
+                for model, count in sorted(adaptive["first_choice_counts"].items())
+            )
+            print(f"  first choices: {choices}")
     effect = heals.get("hint_effect") or {}
     rows = [
         (model, sides) for model, sides in sorted(effect.items())
@@ -538,7 +566,7 @@ def _describe(record) -> str:
 
 
 def _handoff(args: argparse.Namespace) -> int:
-    from .server import _handoff_secret, mint_handoff_token
+    from .server import _handoff_secret, _mint_record_handoff_token
 
     ledger = GenerationLedger(getattr(args, "ledger", None))
     record = ledger.load(args.id)
@@ -555,12 +583,16 @@ def _handoff(args: argparse.Namespace) -> int:
     secret = _handoff_secret()
     if secret is None:
         print(
-            "error: set LLMBRIDGE_HANDOFF_SECRET (or LLMBRIDGE_API_KEY, 16+ chars) to sign "
+            "error: set a dedicated LLMBRIDGE_HANDOFF_SECRET (16+ chars) to encrypt "
             "handoff tokens; the receiving bridge must use the same value",
             file=sys.stderr,
         )
         return 1
-    token = mint_handoff_token(record, secret=secret)
+    try:
+        token = _mint_record_handoff_token(ledger, record, secret)
+    except (RuntimeError, ValueError) as error:
+        print(f"error: could not mint handoff token: {error}", file=sys.stderr)
+        return 1
     if not args.to:
         print(token)
         print(
@@ -907,6 +939,35 @@ def _failover_samples(
     ledger: GenerationLedger, args: argparse.Namespace
 ) -> tuple[list, list[str]]:
     """The records to replay: explicit ids, else the newest suspect heals."""
+    corpus_path = getattr(args, "corpus", None)
+    if corpus_path:
+        if args.ids:
+            return [], ["--corpus cannot be combined with generation ids"]
+        try:
+            path = Path(corpus_path)
+            if path.stat().st_size > 50 * 1024 * 1024:
+                return [], ["corpus file exceeds the 50 MiB limit"]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != "llmbridge-suspect-seam-corpus-v1"
+                or not isinstance(payload.get("records"), list)
+            ):
+                return [], ["corpus schema is not supported"]
+            records = [
+                GenerationRecord.from_dict(value)
+                for value in payload["records"]
+                if isinstance(value, dict)
+            ]
+            if len(records) != len(payload["records"]):
+                return [], ["corpus contains an invalid generation record"]
+            if any(not GenerationLedger.heal_seam_suspect(record) for record in records):
+                return [], ["corpus contains a generation without a suspect seam"]
+            return records[: max(args.limit, 0)], []
+        except (
+            OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError
+        ) as error:
+            return [], [f"could not read corpus: {error}"]
     if args.ids:
         records = []
         for generation_id in args.ids:
@@ -921,6 +982,40 @@ def _failover_samples(
         if GenerationLedger.heal_seam_suspect(record)
     ]
     return suspects[: max(args.limit, 0)], []
+
+
+def _export_suspect_corpus(path_value: str, records: list, *, force: bool) -> str | None:
+    """Write complete local seam fixtures, including private prompts and outputs."""
+    path = Path(path_value)
+    if path.exists() and not force:
+        return f"{path} already exists (use --force to replace it)"
+    selected = [
+        record for record in records
+        if GenerationLedger.heal_seam_suspect(record)
+        and isinstance(record.output, str)
+        and len(record.output) >= 2
+    ]
+    if not selected:
+        return "No suspect seams with stored output are available to export"
+    payload = {
+        "schema": "llmbridge-suspect-seam-corpus-v1",
+        "records": [record.to_dict() for record in selected],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as error:
+        return f"could not write corpus: {error}"
+    return None
 
 
 def _failover_models(samples: list, routes: dict, requested: str | None) -> list[str]:
@@ -955,10 +1050,33 @@ def _failover_cut(record, requested_at: int | None) -> int:
 
 def _failover(args: argparse.Namespace) -> int:
     ledger = GenerationLedger(getattr(args, "ledger", None))
+    if getattr(args, "corpus", None) and getattr(args, "export_corpus", None):
+        print("error: --corpus and --export-corpus cannot be combined", file=sys.stderr)
+        return 1
     samples, missing = _failover_samples(ledger, args)
     if missing:
-        print(f"error: generation {missing[0]} not found", file=sys.stderr)
+        if getattr(args, "corpus", None):
+            print(f"error: {missing[0]}", file=sys.stderr)
+        else:
+            print(f"error: generation {missing[0]} not found", file=sys.stderr)
         return 1
+    if getattr(args, "export_corpus", None):
+        error = _export_suspect_corpus(
+            args.export_corpus, samples, force=getattr(args, "force", False)
+        )
+        if error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        exported = sum(
+            1
+            for record in samples
+            if GenerationLedger.heal_seam_suspect(record)
+            and isinstance(record.output, str)
+            and len(record.output) >= 2
+        )
+        print(f"Exported {exported} suspect seam fixture(s) to {args.export_corpus}")
+        print("The corpus contains prompts and model outputs; keep it private.")
+        return 0
     usable = [
         record
         for record in samples

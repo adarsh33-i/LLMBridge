@@ -9,7 +9,7 @@ description = "A local Anthropic-to-OpenAI-compatible LLM gateway"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
-dependencies = ["pypdf>=5"]
+dependencies = ["cryptography>=42", "pypdf>=5"]
 
 [project.optional-dependencies]
 ocr = ["PyMuPDF>=1.24"]
